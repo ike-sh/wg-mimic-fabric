@@ -116,6 +116,26 @@ test_group() {
     echo "GROUP OK"
 }
 
+test_pool() {
+    seed_transit   # rule-main=40000, rule-game=40001
+    set_or_append_kv "$(profile_env_path ix-nat)" TRANSIT_PORT_POOL "40000-40002,40005"
+    local exp; exp="$(expand_port_pool "40000-40002,40005" | tr '\n' ' ')"
+    [[ "$exp" == "40000 40001 40002 40005 " ]] || fail "expand_port_pool: $exp"
+    validate_port_pool "40000-40002" || fail "validate good pool"
+    ! validate_port_pool "nope" || fail "validate bad pool accepted"
+    # 40000 & 40001 used by seed → next free in pool = 40002
+    local got; got="$(pool_alloc_port ix-nat "40000-40002,40005")"
+    [[ "$got" == "40002" ]] || fail "pool_alloc next free: $got"
+    pool_contains "40000-40002,40005" 40005 || fail "pool_contains 40005"
+    ! pool_contains "40000-40002,40005" 40009 || fail "pool_contains 40009 should be false"
+    transit_port_in_use ix-nat 40000 || fail "40000 should be in use"
+    ! transit_port_in_use ix-nat 40000 rule-main || fail "exclude self failed"
+    ! transit_port_in_use ix-nat 49999 || fail "49999 should be free"
+    ! pool_alloc_port ix-nat "40000-40001" || fail "exhausted pool should fail"
+    [[ "$(pool_stats ix-nat "40000-40002,40005")" == "4 2 2" ]] || fail "pool_stats: $(pool_stats ix-nat "40000-40002,40005")"
+    echo "POOL OK"
+}
+
 case "${1:-all}" in
     rule) test_rule ;;
     code) test_code ;;
@@ -123,7 +143,8 @@ case "${1:-all}" in
     nft) test_nft ;;
     ipv6) test_ipv6 ;;
     group) test_group ;;
-    nopy) test_rule; test_wgconf; test_nft; test_ipv6; test_group; echo "NOPY OK" ;;
-    all) test_rule; test_code; test_wgconf; test_nft; test_ipv6; test_group; echo "ALL OK" ;;
-    *) echo "usage: smoke.sh [rule|code|wgconf|nft|ipv6|group|nopy|all]"; exit 1 ;;
+    pool) test_pool ;;
+    nopy) test_rule; test_wgconf; test_nft; test_ipv6; test_group; test_pool; echo "NOPY OK" ;;
+    all) test_rule; test_code; test_wgconf; test_nft; test_ipv6; test_group; test_pool; echo "ALL OK" ;;
+    *) echo "usage: smoke.sh [rule|code|wgconf|nft|ipv6|group|pool|nopy|all]"; exit 1 ;;
 esac

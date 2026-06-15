@@ -2,7 +2,7 @@
 # wg-mimic-fabric — WireGuard + Mimic tunnel orchestrator (MVP)
 set -Eeuo pipefail
 
-SCRIPT_VERSION="0.6.2"
+SCRIPT_VERSION="0.6.3"
 MIMIC_UPSTREAM_TAG="${MIMIC_UPSTREAM_TAG:-v0.7.0}"
 APP_NAME="wg-mimic-fabric"
 WMF_PROJECT_REPO="${WMF_REPO:-ike-sh/wg-mimic-fabric}"
@@ -258,6 +258,82 @@ generate_unique_rule_id() {
         n=$((n + 1)); rid="${base}-${n}"
     done
     printf '%s' "$rid"
+}
+
+# ── 商家端口池（IX 端口有限 → 每规则从池中分配一个 transit 端口）──────────────
+
+# Expand a pool spec ("40000-40010,40020,40030-40031") into one port per line.
+expand_port_pool() {
+    local spec="$1" part lo hi p _parts
+    IFS=',' read -ra _parts <<<"$spec"
+    for part in "${_parts[@]}"; do
+        part="$(trim "$part")"
+        [[ -z "$part" ]] && continue
+        if [[ "$part" == *-* ]]; then
+            lo="${part%-*}"; hi="${part#*-}"
+            [[ "$lo" =~ ^[0-9]+$ && "$hi" =~ ^[0-9]+$ ]] || continue
+            (( lo >= 1 && hi <= 65535 && lo <= hi )) || continue
+            for ((p = lo; p <= hi; p++)); do printf '%s\n' "$p"; done
+        elif [[ "$part" =~ ^[0-9]+$ ]] && (( part >= 1 && part <= 65535 )); then
+            printf '%s\n' "$part"
+        fi
+    done
+}
+
+validate_port_pool() {
+    local n; n="$(expand_port_pool "$1" | awk 'NF{c++} END{print c+0}')"
+    (( n >= 1 ))
+}
+
+# Ports already taken by this profile's rules (their TRANSIT_PORT = merchant port).
+pool_used_ports() {
+    local pid="$1" rid
+    for rid in $(list_rule_ids "$pid"); do
+        (
+            load_rule "$pid" "$rid" || exit 0
+            [[ -n "${TRANSIT_PORT:-}" ]] && printf '%s\n' "$TRANSIT_PORT"
+        )
+    done
+}
+
+# First pool port not yet used by a rule; non-zero exit when pool exhausted.
+pool_alloc_port() {
+    local pid="$1" spec="$2" used p
+    used="$(pool_used_ports "$pid" | sort -u)"
+    while IFS= read -r p; do
+        [[ -n "$p" ]] || continue
+        grep -qxF "$p" <<<"$used" && continue
+        printf '%s' "$p"; return 0
+    done < <(expand_port_pool "$spec")
+    return 1
+}
+
+# True when PORT belongs to the expanded pool SPEC.
+pool_contains() {
+    local spec="$1" port="$2"
+    expand_port_pool "$spec" | grep -qxF "$port"
+}
+
+# How many pool ports are left for this profile (echoes total/used/free counts).
+pool_stats() {
+    local pid="$1" spec="$2" total used
+    total="$(expand_port_pool "$spec" | awk 'NF{c++} END{print c+0}')"
+    used="$(pool_used_ports "$pid" | sort -u | awk 'NF{c++} END{print c+0}')"
+    printf '%s %s %s' "$total" "$used" "$(( total - used ))"
+}
+
+# True when PORT is already a rule's TRANSIT_PORT in this profile (optionally
+# excluding one rule id, e.g. the rule being edited).
+transit_port_in_use() {
+    local pid="$1" port="$2" exclude="${3:-}" rid
+    for rid in $(list_rule_ids "$pid"); do
+        [[ "$rid" == "$exclude" ]] && continue
+        (
+            load_rule "$pid" "$rid" || exit 1
+            [[ "${TRANSIT_PORT:-}" == "$port" ]]
+        ) && return 0
+    done
+    return 1
 }
 
 rules_to_tsv() {
@@ -1100,6 +1176,7 @@ create_transit_interactive() {
 
     local profile_id endpoint_host wg_port wg_mtu ix_public_ip wan_iface
     local subnet ix_ip ingress_ip transit_port landing_host landing_port proto ip_version
+    local transit_pool="" tp_default="40000"
     prompt profile_id "IX 中转线路 ID" "ix-nat"
     profile_id="$(sanitize_id "$profile_id")"
     [[ ! -f "$(profile_env_path "$profile_id")" ]] || die "线路已存在：$profile_id"
@@ -1130,8 +1207,17 @@ create_transit_interactive() {
         prompt ingress_ip6 "公网入口虚拟 IPv6" "fd88:6d6d::1"
     fi
 
+    prompt transit_pool "中转端口池（如 40000-40010,40050；留空=每条规则手动指定）" ""
+    if [[ -n "$transit_pool" ]]; then
+        validate_port_pool "$transit_pool" || die "端口池格式非法：$transit_pool"
+        tp_default="$(pool_alloc_port "$profile_id" "$transit_pool")" || die "端口池为空"
+    fi
+
     info "首条转发规则（落地可填 IPv6）："
-    prompt_port transit_port "中转端口（IX 虚拟IP 上的端口）" "40000"
+    prompt_port transit_port "中转端口（IX 虚拟IP 上的端口）" "$tp_default"
+    if [[ -n "$transit_pool" ]]; then
+        pool_contains "$transit_pool" "$transit_port" || die "端口 ${transit_port} 不在端口池 ${transit_pool} 内"
+    fi
     prompt landing_host "落地 IP/域名"
     [[ -n "$landing_host" ]] || die "落地地址不能为空"
     prompt_port landing_port "落地端口"
@@ -1165,6 +1251,7 @@ create_transit_interactive() {
         "WG_PEER_PUBLIC_KEY=${ing_pub}" \
         "INGRESS_PRIVKEY_B64=${ing_priv_b64}" \
         "FORWARD_PROTO=${proto}" \
+        "TRANSIT_PORT_POOL=${transit_pool}" \
         "MIMIC_KEEPALIVE=300:::" \
         "MIMIC_XDP_MODE=" \
         "FW_OPEN_PORT=true"
@@ -1306,6 +1393,9 @@ list_rules() {
     load_profile "$id"
     local rid
     printf '线路 %s (%s) 规则：\n' "$PROFILE_ID" "${ROLE:-}"
+    if [[ "${ROLE:-}" == "nat-transit" && -n "${TRANSIT_PORT_POOL:-}" ]]; then
+        printf '  端口池: %s（共/已用/剩 = %s）\n' "$TRANSIT_PORT_POOL" "$(pool_stats "$PROFILE_ID" "$TRANSIT_PORT_POOL")"
+    fi
     [[ -n "$(list_rule_ids "$PROFILE_ID")" ]] || { printf '  (无规则)\n'; return; }
     for rid in $(list_rule_ids "$PROFILE_ID"); do
         (
@@ -1328,9 +1418,20 @@ add_rule() {
     require_root
     load_profile "$id"
     local rid note transit_port landing_host landing_port proto client_port
+    local tp_default="40001"
     rid="$(generate_unique_rule_id "$PROFILE_ID" "rule")"
     prompt note "规则备注" "$rid"
-    prompt_port transit_port "中转端口（IX 虚拟IP）" "40001"
+    if [[ -n "${TRANSIT_PORT_POOL:-}" ]]; then
+        tp_default="$(pool_alloc_port "$PROFILE_ID" "$TRANSIT_PORT_POOL")" \
+            || die "端口池 ${TRANSIT_PORT_POOL} 已用尽，请 wm set-pool 扩充或清空后手动指定"
+    fi
+    prompt_port transit_port "中转端口（IX 虚拟IP）" "$tp_default"
+    if [[ -n "${TRANSIT_PORT_POOL:-}" ]]; then
+        pool_contains "$TRANSIT_PORT_POOL" "$transit_port" \
+            || die "端口 ${transit_port} 不在端口池 ${TRANSIT_PORT_POOL} 内"
+    fi
+    ! transit_port_in_use "$PROFILE_ID" "$transit_port" \
+        || die "中转端口 ${transit_port} 已被本线路其它规则占用"
     prompt landing_host "落地 IP/域名"
     [[ -n "$landing_host" ]] || die "落地地址不能为空"
     prompt_port landing_port "落地端口"
@@ -1358,6 +1459,12 @@ edit_rule() {
     local note transit_port landing_host landing_port proto client_port
     prompt note "规则备注" "${RULE_NOTE:-$rid}"
     prompt_port transit_port "中转端口" "${TRANSIT_PORT}"
+    if [[ -n "${TRANSIT_PORT_POOL:-}" ]]; then
+        pool_contains "$TRANSIT_PORT_POOL" "$transit_port" \
+            || die "端口 ${transit_port} 不在端口池 ${TRANSIT_PORT_POOL} 内"
+    fi
+    ! transit_port_in_use "$PROFILE_ID" "$transit_port" "$rid" \
+        || die "中转端口 ${transit_port} 已被本线路其它规则占用"
     prompt landing_host "落地 IP/域名" "${LANDING_HOST}"
     prompt_port landing_port "落地端口" "${LANDING_PORT}"
     prompt proto "协议 tcp/udp/both" "${FORWARD_PROTO:-both}"
@@ -1591,6 +1698,22 @@ set_profile_xdp_mode() {
     apply_profile_configs
     restart_profile "$id"
     ok "XDP 模式已更新：${mode:-auto}"
+}
+
+set_transit_pool() {
+    local id pool; id="$(resolve_profile_id "${1:-}")"; pool="${2:-}"
+    require_root
+    load_profile "$id"
+    [[ "${ROLE:-}" == "nat-transit" ]] || die "端口池仅用于 IX（nat-transit）线路"
+    if [[ -n "$pool" ]]; then
+        validate_port_pool "$pool" || die "端口池格式非法：$pool（示例 40000-40010,40050）"
+    fi
+    set_or_append_kv "$(profile_env_path "$PROFILE_ID")" TRANSIT_PORT_POOL "$pool"
+    if [[ -n "$pool" ]]; then
+        ok "端口池已设为 ${pool}（共/已用/剩 = $(pool_stats "$PROFILE_ID" "$pool")）"
+    else
+        ok "已清除端口池（恢复每条规则手动指定中转端口）"
+    fi
 }
 
 restart_profile() {
@@ -2045,6 +2168,7 @@ wg-mimic-fabric ${SCRIPT_VERSION} — 公网入口 ⇄ IX WireGuard 组网 + Mim
   wm delete-rule <ID> <规则ID>
   wm enable-rule|disable-rule <ID> <规则ID>
   wm apply-rules [ID]             重建 nft 规则
+  wm set-pool <ID> [端口池]        IX 中转端口池(如 40000-40010,40050；留空=清除，规则自动分配)
   wm health [ID] / wm diagnose [ID] / wm health-all
   wm ddns-enable|ddns-disable|ddns-status|ddns-refresh   域名 IP 变化自动刷新(每3分钟)
   wm set-group <ID> <组名> [primary|backup|standalone] [优先级]
@@ -2107,10 +2231,11 @@ MENU
             10)
                 read -r -p "线路 ID（回车=唯一）: " id </dev/tty; id="$(trim "$id")"
                 list_rules "$id"
-                read -r -p "操作 add/del/skip: " rid </dev/tty
+                read -r -p "操作 add/del/pool/skip: " rid </dev/tty
                 case "$(trim "$rid")" in
                     add) add_rule "$id" ;;
                     del) read -r -p "规则 ID: " rid </dev/tty; delete_rule "$id" "$(trim "$rid")" ;;
+                    pool) read -r -p "端口池(如 40000-40010；留空=清除): " rid </dev/tty; set_transit_pool "$id" "$(trim "$rid")" ;;
                 esac
                 ;;
             11) upgrade_script ;;
@@ -2158,6 +2283,7 @@ main() {
         switch-line) switch_line "${2:-}" "${3:-}" ;;
         primary-backup-check) primary_backup_check "${2:-}" ;;
         health-all) health_all ;;
+        set-pool) set_transit_pool "${2:-}" "${3:-}" ;;
         set-mtu) set_profile_mtu "${2:-}" "${3:-}" ;;
         set-xdp-mode) set_profile_xdp_mode "${2:-}" "${3:-}" ;;
         apply-nft-all) require_root; apply_nft_all; ok "nft 规则已重建" ;;

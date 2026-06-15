@@ -97,8 +97,19 @@ wm add-rule <ID>
 wm edit-rule <ID> <规则ID>
 wm delete-rule <ID> <规则ID>
 wm enable-rule|disable-rule <ID> <规则ID>
+wm set-pool <ID> [端口池]  # 设置/清除 IX 中转端口池(如 40000-40010,40050)
 wm refresh-code <ID>     # IX 改规则后刷新接入码（公网入口需重新 import-code）
 wm apply-rules <ID>      # 重建 nft
+```
+
+### 商家中转端口池（可选）
+
+商家给的 IX 端口通常是有限的几个/几段。给 IX 线路设置 **中转端口池** 后，`create-transit` 与 `add-rule` 会自动从池中取下一个空闲端口作为默认 `transit_port`（可手动覆盖），并强制所选端口落在池内、禁止与同线路其它规则重复；池用尽时报错提示。端口池仅是 IX 侧分配状态，**不进入接入码、不影响公网入口**；留空即恢复手动指定。
+
+```bash
+wm set-pool ix-nat 40000-40010,40050   # 设置端口池
+wm set-pool ix-nat                     # 留空=清除，恢复手动指定
+wm list-rules ix-nat                    # 顶部显示「端口池: …（共/已用/剩）」
 ```
 
 接入码（`code_schema=5`）含组网密钥与落地信息，**请勿公开**；泄露后 `wm refresh-code` 会轮换入口密钥并刷新接入码，再重新导入即可。
@@ -157,6 +168,7 @@ wm health-all
 | `wm show-port-map [ID]` | 端口地图 |
 | `wm show-code [ID]` / `refresh-code [ID]` | 显示 / 刷新接入码（IX） |
 | `wm list-rules\|add-rule\|edit-rule\|delete-rule\|enable-rule\|disable-rule\|apply-rules` | 规则管理 |
+| `wm set-pool <ID> [端口池]` | IX 中转端口池(如 40000-40010；留空=清除，规则自动分配) |
 | `wm ddns-enable\|ddns-disable\|ddns-status\|ddns-refresh` | DDNS |
 | `wm set-group\|list-groups\|switch-line\|primary-backup-check\|health-all` | 主备 |
 | `wm health [ID]` / `diagnose [ID]` | 健康检查 / 诊断 |
