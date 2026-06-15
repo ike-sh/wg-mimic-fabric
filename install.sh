@@ -2,7 +2,7 @@
 # wg-mimic-fabric — WireGuard + Mimic tunnel orchestrator (MVP)
 set -Eeuo pipefail
 
-SCRIPT_VERSION="1.0.0"
+SCRIPT_VERSION="1.0.1"
 MIMIC_UPSTREAM_TAG="${MIMIC_UPSTREAM_TAG:-v0.7.0}"
 APP_NAME="wg-mimic-fabric"
 WMF_PROJECT_REPO="${WMF_REPO:-ike-sh/wg-mimic-fabric}"
@@ -2407,6 +2407,51 @@ install_mimic_packages() {
     ok "mimic 安装流程完成"
 }
 
+# Force-upgrade mimic (unlike install_mimic_packages it does NOT早退 when present).
+# `wm update-mimic` → apt 仓库最新；`wm update-mimic <版本>` → 指定版本(GitHub .deb/源码)。
+# 升级后卸载/重载内核模块并重启之前启用的线路，让新版本生效。
+update_mimic() {
+    require_root
+    local want="${1:-}"
+    [[ -n "$want" ]] && { [[ "$want" == v* ]] || want="v${want}"; export MIMIC_UPSTREAM_TAG="$want"; }
+    kernel_ge_61 || die "内核 $(uname -r) < 6.1，Mimic 无法运行"
+    local id before; id="$(detect_os_id)"
+    before="$(mimic --version 2>/dev/null || echo 未装)"
+    info "升级 mimic（当前 ${before}；目标 ${want:-apt仓库最新}）..."
+    # 记录当前启用的线路，升级后重启
+    local lines=() pid p
+    while IFS= read -r pid; do [[ -n "$pid" ]] && lines+=("$pid"); done < <(
+        for p in "$PROFILES_DIR"/*.env; do
+            [[ -f "$p" ]] || continue
+            # shellcheck disable=SC1090
+            ( source "$p"; [[ "${ENABLED:-true}" == "true" ]] && printf '%s\n' "$PROFILE_ID" )
+        done)
+    case "$id" in
+        debian|ubuntu)
+            ensure_debian_kernel_headers || warn "内核头文件未就绪，DKMS 可能无法编译"
+            apt-get update -qq 2>/dev/null || true
+            if [[ -z "$want" ]] && apt-cache show mimic >/dev/null 2>&1; then
+                DEBIAN_FRONTEND=noninteractive apt-get install -y --only-upgrade mimic mimic-dkms 2>/dev/null \
+                    || DEBIAN_FRONTEND=noninteractive apt-get install -y mimic mimic-dkms 2>/dev/null \
+                    || install_mimic_github_deb || die "mimic 升级失败"
+            else
+                install_mimic_github_deb || install_mimic_from_source kfunc || die "mimic 升级失败"
+            fi
+            ;;
+        arch)   install_mimic_arch || install_mimic_from_source kfunc || die "mimic 升级失败" ;;
+        alpine) install_mimic_from_source kprobe || die "mimic 升级失败" ;;
+        *)      install_mimic_from_source kfunc || die "mimic 升级失败" ;;
+    esac
+    # 停服务 → 卸旧模块 → 载新模块（XDP 占用时必须先停服务才能 modprobe -r）
+    stop_mimic_services
+    modprobe -r mimic 2>/dev/null || true
+    ensure_mimic_kmod_loaded || warn "新模块未能加载，可能需 reboot 后 wm start <线路>"
+    # 重启之前启用的线路，让新 CLI/模块生效
+    for pid in "${lines[@]}"; do start_profile "$pid" >/dev/null 2>&1 || true; done
+    local after; after="$(mimic --version 2>/dev/null || echo 未知)"
+    ok "mimic 升级完成：${before} → ${after}"
+}
+
 install_all() {
     require_root
     install_wm_cli
@@ -2620,6 +2665,7 @@ wg-mimic-fabric ${SCRIPT_VERSION} — 公网入口 ⇄ IX WireGuard 组网 + Mim
   wm list-groups / switch-line <组名> <目标ID> / primary-backup-check <组名>
   wm set-mtu <ID> <MTU> / wm set-xdp-mode <ID> [skb|native]
   wm install-all|install-mimic|install-deps|compat
+  wm update-mimic [版本]           升级 mimic 到 apt 最新或指定版本（重载模块+重启线路）
   wm upgrade-script / wm uninstall / wm purge
 
 架构: 客户端 → 公网入口:client_port → WG(Mimic 伪TCP) → IX 虚拟IP:transit_port → 落地
@@ -2720,6 +2766,7 @@ main() {
         --help|-h|help) usage; exit 0 ;;
         install-wm-cli) install_wm_cli ;;
         install-mimic) install_mimic_packages ;;
+        update-mimic) update_mimic "${2:-}" ;;
         install-all) install_all ;;
         install-deps) install_deps ;;
         compat) compat_os_report ;;

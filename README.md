@@ -269,7 +269,8 @@ wm health-all
 | `wm health [ID]` / `diagnose [ID]` | 健康检查 / 诊断 |
 | `wm set-mtu <ID> <MTU>` / `set-xdp-mode <ID> [skb\|native]` | 调参 |
 | `wm install-all\|install-mimic\|install-deps\|compat` | 安装 / 兼容性 |
-| `wm upgrade-script` / `uninstall` / `purge` | 维护 |
+| `wm update-mimic [版本]` | 升级 mimic 到 apt 最新或指定版本（重载模块 + 重启线路） |
+| `wm upgrade-script` / `uninstall` / `purge` | 维护（`upgrade-script` 只更新 wm 脚本，不动 mimic） |
 
 ---
 
