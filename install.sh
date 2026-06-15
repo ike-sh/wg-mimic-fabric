@@ -2,7 +2,7 @@
 # wg-mimic-fabric — WireGuard + Mimic tunnel orchestrator (MVP)
 set -Eeuo pipefail
 
-SCRIPT_VERSION="0.6.7"
+SCRIPT_VERSION="0.6.8"
 MIMIC_UPSTREAM_TAG="${MIMIC_UPSTREAM_TAG:-v0.7.0}"
 APP_NAME="wg-mimic-fabric"
 WMF_PROJECT_REPO="${WMF_REPO:-ike-sh/wg-mimic-fabric}"
@@ -1065,8 +1065,25 @@ apply_nft_all() {
 
 # ── systemd ────────────────────────────────────────────────────────────────
 
+# Resolve a binary to an absolute path (PATH first, then common dirs).
+resolve_bin() {
+    local name="$1" def="$2" p c
+    p="$(command -v "$name" 2>/dev/null || true)"
+    if [[ -z "$p" ]]; then
+        for c in "/usr/sbin/$name" "/usr/bin/$name" "/usr/local/sbin/$name" "/usr/local/bin/$name" "/sbin/$name" "/bin/$name"; do
+            [[ -x "$c" ]] && { p="$c"; break; }
+        done
+    fi
+    printf '%s' "${p:-$def}"
+}
+
 install_systemd_units() {
-    local tmp
+    local tmp mimic_bin wgquick_bin modprobe_bin
+    # mimic/wg-quick paths vary by distro (Debian ships mimic under /usr/sbin),
+    # so never hardcode /usr/bin — a wrong path makes the unit fail 203/EXEC.
+    mimic_bin="$(resolve_bin mimic /usr/bin/mimic)"
+    wgquick_bin="$(resolve_bin wg-quick /usr/bin/wg-quick)"
+    modprobe_bin="$(resolve_bin modprobe /sbin/modprobe)"
     tmp="$(mktemp)"
     cat >"$tmp" <<EOF
 [Unit]
@@ -1075,9 +1092,9 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-Type=notify
-ExecStartPre=/sbin/modprobe mimic
-ExecStart=/usr/bin/mimic run %i -F /etc/mimic/%i.conf
+Type=simple
+ExecStartPre=-${modprobe_bin} mimic
+ExecStart=${mimic_bin} run %i -F /etc/mimic/%i.conf
 Restart=on-failure
 RestartSec=3
 
@@ -1086,7 +1103,7 @@ WantedBy=multi-user.target
 EOF
     install -m 644 "$tmp" "$SYSTEMD_MIMIC_TEMPLATE"
 
-    cat >"$tmp" <<'EOF'
+    cat >"$tmp" <<EOF
 [Unit]
 Description=wg-mimic-fabric WireGuard tunnel %i
 After=network-online.target
@@ -1095,8 +1112,8 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=/usr/bin/wg-quick up /etc/wireguard/wm-%i.conf
-ExecStop=/usr/bin/wg-quick down /etc/wireguard/wm-%i.conf
+ExecStart=${wgquick_bin} up /etc/wireguard/wm-%i.conf
+ExecStop=${wgquick_bin} down /etc/wireguard/wm-%i.conf
 
 [Install]
 WantedBy=multi-user.target
@@ -1131,6 +1148,29 @@ remove_tunnel_mimic_dropin() {
     rm -rf "/etc/systemd/system/wg-mimic-tunnel@${profile_id}.service.d" 2>/dev/null || true
 }
 
+# Start mimic@<iface> and verify it actually came up. On failure (e.g. XDP native
+# rejected on virtio_net + GRO), force skb mode for that nic's profiles and retry.
+ensure_mimic_service_up() {
+    local iface="$1" p
+    systemctl enable --now "wg-mimic-mimic@${iface}.service" 2>/dev/null || true
+    sleep 1
+    systemctl is-active --quiet "wg-mimic-mimic@${iface}.service" && return 0
+    warn "mimic@${iface} 未起来，改用 XDP skb 模式重试..."
+    for p in "$PROFILES_DIR"/*.env; do
+        [[ -f "$p" ]] || continue
+        grep -q "^WAN_IFACE=${iface}\$" "$p" 2>/dev/null && set_or_append_kv "$p" MIMIC_XDP_MODE skb
+    done
+    apply_mimic_conf_iface "$iface"
+    systemctl restart "wg-mimic-mimic@${iface}.service" 2>/dev/null || true
+    sleep 1
+    if systemctl is-active --quiet "wg-mimic-mimic@${iface}.service"; then
+        ok "mimic@${iface} 已用 skb 模式启动"
+        return 0
+    fi
+    warn "mimic@${iface} 仍未启动 — 排查：journalctl -xeu wg-mimic-mimic@${iface}.service"
+    return 1
+}
+
 start_profile() {
     require_root
     load_profile "$1"
@@ -1141,10 +1181,11 @@ start_profile() {
         offer_reboot "start ${PROFILE_ID}"
     fi
     ensure_mimic
+    install_systemd_units
     apply_profile_configs
     apply_nft_all
     ensure_ip_forward
-    systemctl enable --now "wg-mimic-mimic@${WAN_IFACE}.service"
+    ensure_mimic_service_up "$WAN_IFACE"
     systemctl enable --now "wg-mimic-tunnel@${PROFILE_ID}.service"
     ok "已启动线路：${PROFILE_ID} (${ROLE:-})"
     if [[ "${ROLE:-}" == "nat-ingress" ]]; then

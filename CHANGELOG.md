@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.6.8] - 2026-06-15
+
+### Fixed
+
+- **隧道从未启动的真凶**：systemd 单元 `ExecStart=/usr/bin/mimic` 把路径写死，但部分发行版（如 Debian）mimic 装在 `/usr/sbin/mimic` → 服务 `203/EXEC` 失败、`journalctl` 报 `Unable to locate executable '/usr/bin/mimic'`，mimic 根本没跑（手动 `mimic run` 却完全正常）。改为**自动探测 mimic / wg-quick / modprobe 的真实绝对路径**（新增 `resolve_bin`：PATH + 常见目录），不再写死
+- mimic 单元 `Type=notify` → **`Type=simple`**（不依赖 mimic 的 sd_notify 支持）
+- `wm start` 现在每次**重新生成 systemd 单元**（让此修复对已装机器在 start 时即生效，无需完整重装），并**校验 mimic 服务真的 active**；若 native XDP 挂载失败（如 virtio_net + GRO），**自动回退 skb 重试**，仍失败则提示用 `journalctl` 排查
+
+### Note
+
+- 真机定位过程：0.6.7 已修正"IX filter 用网卡真实 IP"（mimic 精确匹配）；本版补上 systemd 单元路径这一**真正阻塞点**——之前所有"不通"都源于 mimic 服务 203/EXEC 从未启动
+
 ## [0.6.7] - 2026-06-15
 
 ### Fixed
