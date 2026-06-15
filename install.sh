@@ -2,7 +2,8 @@
 # wg-mimic-fabric — WireGuard + Mimic tunnel orchestrator (MVP)
 set -Eeuo pipefail
 
-SCRIPT_VERSION="0.3.1"
+SCRIPT_VERSION="0.3.2"
+MIMIC_UPSTREAM_TAG="${MIMIC_UPSTREAM_TAG:-v0.7.0}"
 APP_NAME="wg-mimic-fabric"
 WMF_PROJECT_REPO="${WMF_REPO:-ike-sh/wg-mimic-fabric}"
 
@@ -1037,45 +1038,196 @@ stop_mimic_services() {
     done
 }
 
+install_base_packages() {
+    local id; id="$(detect_os_id)"
+    info "安装基础依赖（wireguard-tools 等）..."
+    case "$id" in
+        debian|ubuntu)
+            DEBIAN_FRONTEND=noninteractive apt-get install -y \
+                wireguard-tools python3 nftables curl git ca-certificates \
+                build-essential pkg-config libbpf-dev libffi-dev \
+                linux-headers-"$(uname -r)" clang llvm bpftool pahole \
+                2>/dev/null || DEBIAN_FRONTEND=noninteractive apt-get install -y \
+                wireguard-tools python3 nftables curl git ca-certificates
+            ;;
+        arch)
+            pacman -Sy --noconfirm --needed wireguard-tools python3 nftables curl git \
+                base-devel clang llvm bpftool libbpf libffi linux-headers 2>/dev/null \
+                || pacman -Sy --noconfirm wireguard-tools python3 nftables
+            ;;
+        fedora)
+            dnf install -y wireguard-tools python3 nftables curl git \
+                gcc make clang llvm bpftool libbpf-devel libffi-devel \
+                kernel-devel kernel-headers 2>/dev/null \
+                || dnf install -y wireguard-tools python3 curl git
+            ;;
+        alpine)
+            apk add --no-cache wireguard-tools python3 nftables curl git \
+                build-base clang llvm bpftool-dev libbpf-dev libffi-dev linux-headers
+            ;;
+        rhel|centos|rocky|almalinux|ol)
+            dnf install -y epel-release 2>/dev/null || true
+            dnf install -y wireguard-tools python3 curl git gcc make \
+                clang llvm libbpf-devel libffi-devel kernel-devel 2>/dev/null \
+                || dnf install -y wireguard-tools python3 curl git
+            ;;
+        opensuse-leap|opensuse-tumbleweed|opensuse|sles)
+            zypper -n install wireguard-tools python3 nftables curl git \
+                gcc make clang llvm bpftool libbpf-devel libffi-devel kernel-devel 2>/dev/null \
+                || zypper -n install wireguard-tools python3 curl git
+            ;;
+        *)
+            warn "未识别 OS，跳过基础包批量安装"
+            ;;
+    esac
+}
+
+install_mimic_github_deb() {
+    # shellcheck disable=SC1091
+    [[ -f /etc/os-release ]] && source /etc/os-release
+    local codename="${VERSION_CODENAME:-}"
+    [[ -n "$codename" ]] || return 1
+    command_exists apt-get || return 1
+    local arch tmpd mimic_deb dkms_deb url
+    arch="$(dpkg --print-architecture 2>/dev/null || echo amd64)"
+    tmpd="$(mktemp -d)"
+    info "尝试从 GitHub Releases 下载 ${codename} .deb (${MIMIC_UPSTREAM_TAG})..."
+    mapfile -t urls < <(python3 - "$MIMIC_UPSTREAM_TAG" "$codename" <<'PY'
+import json, sys, urllib.request
+tag, codename = sys.argv[1], sys.argv[2]
+api = f"https://api.github.com/repos/hack3ric/mimic/releases/tags/{tag}"
+with urllib.request.urlopen(api, timeout=60) as r:
+    data = json.load(r)
+for a in data.get("assets", []):
+    n = a["name"]
+    if codename not in n or not n.endswith(".deb"):
+        continue
+    if "dbgsym" in n or "ddeb" in n:
+        continue
+    if "_mimic-dkms_" in n or n.endswith("_mimic-dkms.deb") or "mimic-dkms" in n:
+        print("DKMS", a["browser_download_url"])
+    elif "_mimic_" in n:
+        print("MIMIC", a["browser_download_url"])
+PY
+)
+    mimic_deb=""; dkms_deb=""
+    local line kind u
+    for line in "${urls[@]}"; do
+        kind="${line%% *}"; u="${line#* }"
+        [[ "$kind" == "MIMIC" ]] && mimic_deb="$u"
+        [[ "$kind" == "DKMS" ]] && dkms_deb="$u"
+    done
+    [[ -n "$mimic_deb" && -n "$dkms_deb" ]] || { rm -rf "$tmpd"; return 1; }
+    curl -fsSL -o "$tmpd/mimic.deb" "$mimic_deb" || { rm -rf "$tmpd"; return 1; }
+    curl -fsSL -o "$tmpd/mimic-dkms.deb" "$dkms_deb" || { rm -rf "$tmpd"; return 1; }
+    DEBIAN_FRONTEND=noninteractive apt-get install -y "$tmpd/mimic.deb" "$tmpd/mimic-dkms.deb" \
+        || { rm -rf "$tmpd"; return 1; }
+    rm -rf "$tmpd"
+    ok "已通过 GitHub .deb 安装 mimic"
+    return 0
+}
+
+install_mimic_from_source() {
+    local hack="${1:-kfunc}"
+    local dir tag="${MIMIC_UPSTREAM_TAG}"
+    [[ "$(detect_os_id)" == "alpine" ]] && hack="kprobe"
+    kernel_ge_61 || warn "内核 < 6.1，源码编译的 mimic 可能无法运行"
+    install_base_packages || true
+    dir="$(mktemp -d /tmp/mimic-src.XXXXXX)"
+    info "源码编译 mimic (${tag}, CHECKSUM_HACK=${hack})..."
+    if command_exists git; then
+        git clone --depth 1 --branch "$tag" https://github.com/hack3ric/mimic.git "$dir" 2>/dev/null \
+            || curl -fsSL "https://github.com/hack3ric/mimic/archive/refs/tags/${tag}.tar.gz" \
+                | tar xz -C "$dir" --strip-components=1
+    else
+        curl -fsSL "https://github.com/hack3ric/mimic/archive/refs/tags/${tag}.tar.gz" \
+            | tar xz -C "$dir" --strip-components=1
+    fi
+    [[ -f "$dir/Makefile" ]] || { rm -rf "$dir"; return 1; }
+    make -C "$dir" CHECKSUM_HACK="$hack" build-cli build-kmod 2>/dev/null \
+        || make -C "$dir" CHECKSUM_HACK="$hack" 2>/dev/null \
+        || { rm -rf "$dir"; return 1; }
+    [[ -x "$dir/out/mimic" ]] || { rm -rf "$dir"; return 1; }
+    install -m 755 "$dir/out/mimic" /usr/local/bin/mimic
+    if [[ -f "$dir/kmod/mimic.ko" ]]; then
+        install -D -m 644 "$dir/kmod/mimic.ko" "/lib/modules/$(uname -r)/extra/mimic.ko" 2>/dev/null \
+            || insmod "$dir/kmod/mimic.ko" 2>/dev/null || true
+        depmod -a 2>/dev/null || true
+    fi
+    rm -rf "$dir"
+    ok "mimic 已从源码安装到 /usr/local/bin/mimic"
+    return 0
+}
+
+install_mimic_arch() {
+    if pacman -Sy --noconfirm --needed mimic-bpf 2>/dev/null; then
+        pacman -Sy --noconfirm --needed mimic-bpf-dkms 2>/dev/null || true
+        return 0
+    fi
+    if command -v yay >/dev/null; then
+        yay -S --noconfirm --needed mimic-bpf mimic-bpf-dkms && return 0
+    fi
+    if command -v paru >/dev/null; then
+        paru -S --noconfirm --needed mimic-bpf mimic-bpf-dkms && return 0
+    fi
+    return 1
+}
+
 install_mimic_packages() {
     require_root
     local id; id="$(detect_os_id)"
     if command_exists mimic; then
         ok "mimic 已安装：$(mimic --version 2>/dev/null || command -v mimic)"
-        modprobe mimic 2>/dev/null || warn "mimic 内核模块未加载，请确认 mimic-dkms"
+        modprobe mimic 2>/dev/null || insmod /lib/modules/"$(uname -r)"/extra/mimic.ko 2>/dev/null \
+            || warn "mimic 内核模块未加载"
         return 0
     fi
-    info "安装 mimic 及依赖（OS: ${id}）..."
+    if ! kernel_ge_61; then
+        die "内核 $(uname -r) < 6.1，Mimic 无法运行。请升级内核（如 elrepo kernel-ml）或换 Debian/Ubuntu VPS"
+    fi
+    info "自动安装 mimic（OS: ${id}）..."
     case "$id" in
         debian|ubuntu)
-            command_exists apt-get || die "需要 apt-get"
-            apt-get update -qq || warn "apt update 失败，继续尝试安装..."
-            if apt-cache show mimic &>/dev/null; then
+            apt-get update -qq || true
+            if apt-cache show mimic &>/dev/null 2>&1; then
                 DEBIAN_FRONTEND=noninteractive apt-get install -y \
                     wireguard-tools python3 nftables mimic mimic-dkms \
-                    || die "apt 安装 mimic 失败"
-            else
-                warn "当前 apt 源无 mimic 包"
-                cat <<'EOF' >&2
-  Debian 13 / Ubuntu 24.04+：确认已启用官方源后重试
-  Debian 12：从 GitHub 安装 .deb
-    https://github.com/hack3ric/mimic/releases
-    apt install ./bookworm_mimic_*_amd64.deb ./bookworm_mimic-dkms_*_amd64.deb
-EOF
-                die "无法通过 apt 自动安装 mimic"
+                    && { modprobe mimic 2>/dev/null || true; ok "apt 安装 mimic 完成"; return 0; }
             fi
+            install_mimic_github_deb && { modprobe mimic 2>/dev/null || true; return 0; }
+            warn "apt/GitHub .deb 失败，尝试源码编译..."
+            install_mimic_from_source kfunc || die "mimic 安装失败"
             ;;
         arch)
-            die "Arch 请手动安装：yay -S mimic-bpf mimic-bpf-dkms wireguard-tools"
+            install_base_packages || true
+            install_mimic_arch && { modprobe mimic 2>/dev/null || true; ok "Arch 包安装完成"; return 0; }
+            warn "AUR 不可用，尝试源码编译..."
+            install_mimic_from_source kfunc || die "mimic 安装失败"
+            ;;
+        fedora)
+            install_mimic_from_source kfunc || die "mimic 源码安装失败"
+            ;;
+        alpine)
+            install_mimic_from_source kprobe || die "mimic 源码安装失败（Alpine 用 kprobe）"
+            ;;
+        rhel|centos|rocky|almalinux|ol)
+            install_mimic_from_source kfunc || die "mimic 源码安装失败"
+            ;;
+        opensuse-leap|opensuse-tumbleweed|opensuse|sles)
+            install_mimic_from_source kfunc || die "mimic 源码安装失败"
             ;;
         *)
-            install_deps
-            die "当前 OS 无自动安装 mimic，请按上方指引手动安装"
+            install_base_packages || true
+            install_mimic_from_source kfunc || {
+                install_deps
+                die "自动安装 mimic 失败，请按 install-deps 指引手动处理"
+            }
             ;;
     esac
-    modprobe mimic 2>/dev/null || warn "modprobe mimic 失败，请检查 mimic-dkms"
+    modprobe mimic 2>/dev/null || insmod /lib/modules/"$(uname -r)"/extra/mimic.ko 2>/dev/null \
+        || warn "modprobe mimic 失败，请检查内核模块"
     command_exists wg || warn "wireguard-tools 未就绪"
-    ok "mimic 及依赖安装完成"
+    ok "mimic 安装流程完成"
 }
 
 install_all() {
@@ -1281,7 +1433,7 @@ wg-mimic-fabric ${SCRIPT_VERSION} — WireGuard + Mimic 隧道编排
   wm diagnose [ID]
 
 环境变量:
-  WMF_TAG=v0.3.0                  安装/升级时指定版本
+  WMF_TAG=v0.3.1                  安装/升级时指定版本
   WMF_REPO=ike-sh/wg-mimic-fabric   GitHub 仓库
   WMF_UPGRADE_YES=1               升级跳过确认
   WMF_PURGE_YES=1                 purge 跳过确认

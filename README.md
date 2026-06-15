@@ -1,6 +1,6 @@
 # wg-mimic-fabric
 
-**当前版本**：[`v0.3.1`](https://github.com/ike-sh/wg-mimic-fabric/releases/tag/v0.3.1)  
+**当前版本**：[`v0.3.2`](https://github.com/ike-sh/wg-mimic-fabric/releases/tag/v0.3.2)  
 **仓库**：https://github.com/ike-sh/wg-mimic-fabric  
 **定位**：WireGuard + [Mimic](https://github.com/hack3ric/mimic) 伪 TCP 隧道编排器，对标 [ix-transit-fabric](https://github.com/ike-sh/ix-transit-fabric) 的运维体验。
 
@@ -26,12 +26,24 @@
 - `python3`（配对码编解码）
 - `systemd`
 
-```bash
-# Debian / Ubuntu — bootstrap 会自动 apt 安装 mimic + mimic-dkms + wireguard-tools
-curl -fsSL https://raw.githubusercontent.com/ike-sh/wg-mimic-fabric/main/scripts/bootstrap.sh | sudo bash
+`bootstrap` / `install-all` 会**自动安装 mimic**，策略因发行版而异：
 
+| 发行版 | 安装方式 |
+|--------|----------|
+| Debian 13 / Ubuntu 24.04 | `apt install mimic mimic-dkms` |
+| Debian 12 等 | GitHub Releases `.deb` → 失败则源码 |
+| Arch | `pacman` / `yay` AUR → 失败则源码 |
+| Fedora / RHEL / Rocky / openSUSE | 源码编译 |
+| Alpine | 源码编译（kprobe 模式） |
+
+硬性要求：**内核 ≥ 6.1**。RHEL 9 默认 5.14 需先升内核。
+
+```bash
 # 跳过 mimic 自动安装
 WMF_SKIP_MIMIC=1 curl -fsSL .../bootstrap.sh | sudo bash
+
+# 指定 mimic 版本
+MIMIC_UPSTREAM_TAG=v0.7.0 wm install-mimic
 ```
 
 ---

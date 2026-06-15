@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.3.2] - 2026-06-15
+
+### Changed
+
+- **多发行版 mimic 自动安装**（三级回退）：
+  1. 包管理器（apt / pacman / AUR）
+  2. GitHub Releases `.deb`（Debian/Ubuntu 无 apt 包时）
+  3. 源码编译（Fedora / RHEL / Alpine / openSUSE 等）
+- 自动安装基础构建依赖（wireguard-tools、clang、libbpf 等）
+- 环境变量 `MIMIC_UPSTREAM_TAG`（默认 `v0.7.0`）
+
 ## [0.3.1] - 2026-06-15
 
 ### Added
