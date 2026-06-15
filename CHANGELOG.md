@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.1.0-beta.13] - 2026-06-15
+
+### Fixed（`wm test` 对 relay 线路假通过：ping 的是自己而非对端 B）
+
+- **`peer_mesh_ip` 修复 relay 角色**：此前只有 `nat-ingress` 返回对端 IX/出口 IP（`WG_IX_IP`），其余角色一律返回 `WG_INGRESS_IP`。但 **relay（A 网关全局出口）自身 mesh 地址正是 `WG_INGRESS_IP`**，于是 `wm test <relay>` ping 的是 A 自己（`10.x.0.1`，延迟 0.0xx ms、0% 丢包），看似「线路质量良好」实为白测，根本没验证 A↔B 隧道。现把 relay 与 nat-ingress 同等对待（拨号侧对端 = `WG_IX_IP`），`wm test` 改为真正 ping 对端 B（`10.x.0.2`），能如实暴露 swgp 端口不通等问题。
+
 ## [1.1.0-beta.12] - 2026-06-15
 
 ### Changed（交互菜单所有 ID 列表改为「阿拉伯数字」选择）

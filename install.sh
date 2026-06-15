@@ -2,7 +2,7 @@
 # wg-mimic-fabric — WireGuard + Mimic tunnel orchestrator (MVP)
 set -Eeuo pipefail
 
-SCRIPT_VERSION="1.1.0-beta.12"
+SCRIPT_VERSION="1.1.0-beta.13"
 MIMIC_UPSTREAM_TAG="${MIMIC_UPSTREAM_TAG:-v0.7.0}"
 APP_NAME="wg-mimic-fabric"
 WMF_PROJECT_REPO="${WMF_REPO:-ike-sh/wg-mimic-fabric}"
@@ -2543,7 +2543,8 @@ rotate_keys() {
 
 # The OTHER end's mesh IP — what we ping to measure tunnel quality end-to-end.
 peer_mesh_ip() {
-    if [[ "${ROLE:-}" == "nat-ingress" ]]; then printf '%s' "${WG_IX_IP:-}"; else printf '%s' "${WG_INGRESS_IP:-}"; fi
+    # 拨号侧(nat-ingress / relay)对端是 IX/出口(WG_IX_IP)；监听侧(nat-transit / exit)对端是入口(WG_INGRESS_IP)。
+    if [[ "${ROLE:-}" == "nat-ingress" || "${ROLE:-}" == "relay" ]]; then printf '%s' "${WG_IX_IP:-}"; else printf '%s' "${WG_INGRESS_IP:-}"; fi
 }
 
 # Ping the peer over the tunnel; echo integer loss%% (0-100). Empty target → 100.
