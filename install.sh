@@ -2,7 +2,7 @@
 # wg-mimic-fabric — WireGuard + Mimic tunnel orchestrator (MVP)
 set -Eeuo pipefail
 
-SCRIPT_VERSION="1.1.0"
+SCRIPT_VERSION="1.1.1"
 MIMIC_UPSTREAM_TAG="${MIMIC_UPSTREAM_TAG:-v0.7.0}"
 APP_NAME="wg-mimic-fabric"
 WMF_PROJECT_REPO="${WMF_REPO:-ike-sh/wg-mimic-fabric}"
@@ -1962,7 +1962,7 @@ create_transit_interactive() {
     local profile_id endpoint_host wg_port wg_mtu wan_iface
     local subnet ix_ip ingress_ip transit_port landing_host landing_port proto ip_version
     local transit_pool="" tp_default="40000"
-    prompt profile_id "IX 中转线路 ID" "ix-nat"
+    prompt profile_id "IX 中转线路 ID" "ix"
     profile_id="$(sanitize_id "$profile_id")"
     [[ ! -f "$(profile_env_path "$profile_id")" ]] || die "线路已存在：$profile_id"
 

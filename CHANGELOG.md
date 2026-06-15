@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.1.1] - 2026-06-16
+
+### Changed
+
+- **更优雅的默认线路名**：`create-transit` 默认线路 ID 由 `ix-nat` 改为 `ix`（派生入口名随之由 `ix-nat-ingress` 变 `ix-ingress`，更简洁）；`create-exit` 维持 `exit`（派生 `exit-relay`）。仅影响新建线路的默认提示值，不影响已有线路。
+
+### Verified（复核 mode2 全局出口的 MTU / MSS 行为，确认无需修复）
+
+- **MTU 自动计算**：`create-exit` 按混淆方式自动给隧道 MTU 默认值（`direct`=1420 / `swgp+mimic`=1400 / `paranoid`=1360）；A 端 `import-exit-code` 经接入码继承该 MTU；`wm automtu` 可自适应探测；MSS 钳制用 `rt mtu` 自动跟随 `WG_MTU`，无需手算。
+- **MSS 钳制对「仅 mode2 全局出口」也自动生成**：`render_nft_all` 的 forward 链**无条件**输出 `tcp flags syn tcp option maxseg size set rt mtu`，且 `start_profile` / `create-exit` / `import-exit-code` 均调用 `apply_nft_all`——故只用全局出口（relay/exit、无任何中转规则）时 MSS 钳制照常生成。新增 `smoke mss` 用例（用独立 profiles 目录隔离出 mode2-only）作为永久回归守卫。
+- 验证：`bash -n` 通过；`smoke nopy` 全 11 项通过（含新增 MSS）。
+
 ## [1.1.0] - 2026-06-16
 
 首个稳定版：在 `1.0.0`（IX 中转组网）基础上新增「**混淆全局出口**」整条能力线，并在真机（国内网关 A ⇄ 国外出口 B）完整验证（`swgp+mimic` 全局出口 `wm test` 0% 丢包 / ~28–32ms、手机扫码全局出网正常）。聚合 `beta.8`–`beta.16` 全部变更。

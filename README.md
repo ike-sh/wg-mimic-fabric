@@ -1,6 +1,6 @@
 # wg-mimic-fabric
 
-**版本**：`v1.1.0` ·
+**版本**：`v1.1.1` ·
 **仓库**：https://github.com/ike-sh/wg-mimic-fabric ·
 **许可**：MIT
 
@@ -246,8 +246,8 @@ wm apply-rules <ID>              # 重建 nft
 商家给的 IX 端口往往有限。给 IX 线路设 **中转端口池** 后，`create-transit` / `add-rule` 自动从池中取下一个空闲端口作默认中转端口，并强制端口落在池内、禁止重复；池用尽时报错。端口池仅 IX 侧分配状态，**不进入接入码、不影响公网入口**。
 
 ```bash
-wm set-pool ix-nat 18300-18399    # 设置端口池
-wm set-pool ix-nat                # 留空=清除，恢复手动指定
+wm set-pool ix 18300-18399        # 设置端口池
+wm set-pool ix                    # 留空=清除，恢复手动指定
 ```
 
 ---
@@ -384,7 +384,7 @@ wm health-all
 
 | 变量 | 说明 |
 |------|------|
-| `WMF_TAG=v1.1.0` | 安装/升级时指定版本 |
+| `WMF_TAG=v1.1.1` | 安装/升级时指定版本 |
 | `WMF_REPO` | GitHub 仓库（默认 `ike-sh/wg-mimic-fabric`） |
 | `WMF_SKIP_MIMIC=1` | 跳过 mimic 自动安装 |
 | `WMF_AUTO_MIMIC=0` | `install-wm-cli` 时不自动装 mimic |

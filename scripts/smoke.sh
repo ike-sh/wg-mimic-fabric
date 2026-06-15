@@ -230,6 +230,22 @@ test_obfs() {
     echo "OBFS OK"
 }
 
+test_mss() {
+    # MSS 钳制必须无条件出现在 forward 链——即便「仅全局出口(mode2)、无任何中转 DNAT 规则」也要
+    # 自动生成，否则 swgp+mimic 全局出口大包黑洞/网页卡半截。用独立 profiles 目录隔离出 mode2-only。
+    local save="$PROFILES_DIR"
+    PROFILES_DIR="$TMP/mss-only"; install -d -m 700 "$PROFILES_DIR"
+    write_profile_kv "$(profile_env_path exonly)" \
+        "PROFILE_ID=exonly" "ROLE=exit" "ENABLED=true" "WAN_IFACE=eth0" \
+        "WG_MESH_SUBNET=10.90.0.0/24" "WG_IX_IP=10.90.0.2" "WG_INGRESS_IP=10.90.0.1" \
+        "WG_PORT=51820" "WG_MTU=1400" "OBFS_MODE=swgp+mimic" "SWGP_PORT=18310" "EXIT_MODE=global"
+    local out; out="$(render_nft_all)"
+    PROFILES_DIR="$save"
+    grep -q 'tcp flags syn tcp option maxseg size set rt mtu' <<<"$out" || fail "mss clamp missing for mode2-only (relay/exit)"
+    grep -q 'ip saddr 10.90.0.0/24 oifname "eth0" counter masquerade' <<<"$out" || fail "exit masq missing: $out"
+    echo "MSS OK"
+}
+
 test_client() {
     write_profile_kv "$(profile_env_path gw)" \
         "PROFILE_ID=gw" "ROLE=relay" "ENABLED=true" "WAN_IFACE=eth0" \
@@ -274,8 +290,9 @@ case "${1:-all}" in
     swgp) test_swgp ;;
     code6) test_code6 ;;
     obfs) test_obfs ;;
+    mss) test_mss ;;
     client) test_client ;;
-    nopy) test_rule; test_wgconf; test_nft; test_ipv6; test_group; test_pool; test_mimic; test_iface; test_obfs; test_client; echo "NOPY OK" ;;
-    all) test_rule; test_code; test_code6; test_swgp; test_obfs; test_client; test_wgconf; test_nft; test_ipv6; test_group; test_pool; test_mimic; test_iface; echo "ALL OK" ;;
-    *) echo "usage: smoke.sh [rule|code|code6|swgp|obfs|client|wgconf|nft|ipv6|group|pool|mimic|iface|nopy|all]"; exit 1 ;;
+    nopy) test_rule; test_wgconf; test_nft; test_ipv6; test_group; test_pool; test_mimic; test_iface; test_obfs; test_mss; test_client; echo "NOPY OK" ;;
+    all) test_rule; test_code; test_code6; test_swgp; test_obfs; test_mss; test_client; test_wgconf; test_nft; test_ipv6; test_group; test_pool; test_mimic; test_iface; echo "ALL OK" ;;
+    *) echo "usage: smoke.sh [rule|code|code6|swgp|obfs|mss|client|wgconf|nft|ipv6|group|pool|mimic|iface|nopy|all]"; exit 1 ;;
 esac
