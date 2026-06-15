@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.3] - 2026-06-15
+
+### Fixed
+
+- 修复 `create-server` 在 `set -u` 下 `iface: unbound variable`（`apply_mimic_conf_iface` 同行 local 声明）
+- Debian/Ubuntu 安装 mimic-dkms 前自动安装 `linux-headers-$(uname -r)` 并触发 `dkms autoinstall`
+
 ## [0.3.2] - 2026-06-15
 
 ### Changed

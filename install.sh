@@ -2,7 +2,7 @@
 # wg-mimic-fabric — WireGuard + Mimic tunnel orchestrator (MVP)
 set -Eeuo pipefail
 
-SCRIPT_VERSION="0.3.2"
+SCRIPT_VERSION="0.3.3"
 MIMIC_UPSTREAM_TAG="${MIMIC_UPSTREAM_TAG:-v0.7.0}"
 APP_NAME="wg-mimic-fabric"
 WMF_PROJECT_REPO="${WMF_REPO:-ike-sh/wg-mimic-fabric}"
@@ -381,7 +381,9 @@ render_mimic_conf_iface() {
 }
 
 apply_mimic_conf_iface() {
-    local iface="$1" path="${MIMIC_CONF_DIR}/${iface}.conf"
+    local iface="${1:-}"
+    [[ -n "$iface" ]] || die "WAN_IFACE 不能为空"
+    local path="${MIMIC_CONF_DIR}/${iface}.conf"
     backup_file "$path"
     render_mimic_conf_iface "$iface" >"$path"
     chmod 644 "$path"
@@ -424,6 +426,7 @@ EOF
 }
 
 apply_profile_configs() {
+    [[ -n "${WAN_IFACE:-}" ]] || die "配置缺少 WAN_IFACE（Mimic 绑定网卡）"
     apply_mimic_conf_iface "$WAN_IFACE"
     [[ "${ROLE:-}" == "forwarder" ]] && return 0
 
@@ -1043,10 +1046,11 @@ install_base_packages() {
     info "安装基础依赖（wireguard-tools 等）..."
     case "$id" in
         debian|ubuntu)
+            ensure_debian_kernel_headers || true
             DEBIAN_FRONTEND=noninteractive apt-get install -y \
                 wireguard-tools python3 nftables curl git ca-certificates \
                 build-essential pkg-config libbpf-dev libffi-dev \
-                linux-headers-"$(uname -r)" clang llvm bpftool pahole \
+                clang llvm bpftool pahole \
                 2>/dev/null || DEBIAN_FRONTEND=noninteractive apt-get install -y \
                 wireguard-tools python3 nftables curl git ca-certificates
             ;;
@@ -1080,6 +1084,36 @@ install_base_packages() {
             warn "未识别 OS，跳过基础包批量安装"
             ;;
     esac
+}
+
+ensure_debian_kernel_headers() {
+    local kver pkg
+    command_exists apt-get || return 1
+    kver="$(uname -r)"
+    [[ -d "/lib/modules/${kver}/build" ]] && return 0
+    pkg="linux-headers-${kver}"
+    info "安装内核头文件：${pkg} ..."
+    if DEBIAN_FRONTEND=noninteractive apt-get install -y "$pkg" 2>/dev/null; then
+        return 0
+    fi
+    warn "精确头文件 ${pkg} 不可用，尝试 linux-headers-$(dpkg --print-architecture) ..."
+    DEBIAN_FRONTEND=noninteractive apt-get install -y \
+        "linux-headers-$(dpkg --print-architecture 2>/dev/null || echo amd64)" \
+        || return 1
+}
+
+ensure_mimic_kmod_loaded() {
+    if modprobe mimic 2>/dev/null; then
+        ok "mimic 内核模块已加载"
+        return 0
+    fi
+    if command_exists dkms; then
+        info "尝试 dkms 编译 mimic 内核模块..."
+        dkms autoinstall 2>/dev/null || true
+        modprobe mimic 2>/dev/null && { ok "mimic 内核模块已加载"; return 0; }
+    fi
+    warn "mimic 内核模块未加载。请运行：apt install linux-headers-\$(uname -r) && dkms autoinstall && modprobe mimic"
+    return 1
 }
 
 install_mimic_github_deb() {
@@ -1188,13 +1222,14 @@ install_mimic_packages() {
     info "自动安装 mimic（OS: ${id}）..."
     case "$id" in
         debian|ubuntu)
+            ensure_debian_kernel_headers || warn "内核头文件未就绪，mimic-dkms 可能无法编译"
             apt-get update -qq || true
             if apt-cache show mimic &>/dev/null 2>&1; then
                 DEBIAN_FRONTEND=noninteractive apt-get install -y \
                     wireguard-tools python3 nftables mimic mimic-dkms \
-                    && { modprobe mimic 2>/dev/null || true; ok "apt 安装 mimic 完成"; return 0; }
+                    && { ensure_mimic_kmod_loaded || true; ok "apt 安装 mimic 完成"; return 0; }
             fi
-            install_mimic_github_deb && { modprobe mimic 2>/dev/null || true; return 0; }
+            install_mimic_github_deb && { ensure_mimic_kmod_loaded || true; return 0; }
             warn "apt/GitHub .deb 失败，尝试源码编译..."
             install_mimic_from_source kfunc || die "mimic 安装失败"
             ;;
