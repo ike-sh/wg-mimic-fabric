@@ -465,13 +465,50 @@ generate_code() {
     render_code_json | base64url_encode | sed 's/^/WMGF1:/'
 }
 
+# 出口接入码（code_schema=6, nat-exit-code）：A↔B 混淆组网 + 全局出口用。
+# 复用 transit 的 WG 字段，去掉 rules，加 obfs/swgp/exit_mode。
+render_exit_code_json() {
+    [[ "${ROLE:-}" == "exit" ]] || die "仅 exit 线路可生成出口接入码"
+    local created; created="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    python3 - "$PROFILE_ID" "${PROFILE_NAME:-$PROFILE_ID}" "$WG_MESH_SUBNET" \
+        "$WG_IX_IP" "$WG_INGRESS_IP" "$WG_PUBLIC_KEY" "$INGRESS_PRIVKEY_B64" \
+        "$IX_ENDPOINT_HOST" "$WG_PORT" "$WG_MTU" "${MIMIC_KEEPALIVE:-300:::}" \
+        "${OBFS_MODE:-swgp+mimic}" "${SWGP_MODE:-zero-overhead-2026}" "${SWGP_PSK:-}" "${SWGP_PORT:-0}" \
+        "${EXIT_MODE:-global}" "$created" \
+        "${IP_VERSION:-4}" "${WG_MESH_SUBNET6:-}" "${WG_IX_IP6:-}" "${WG_INGRESS_IP6:-}" <<'PY'
+import json, sys
+( pid, pname, subnet, ix_ip, ing_ip, ix_pub, ing_priv_b64, endpoint, wg_port, wg_mtu,
+  keepalive, obfs, swgp_mode, swgp_psk, swgp_port, exit_mode, created,
+  ip_version, subnet6, ix_ip6, ing_ip6 ) = sys.argv[1:22]
+obj = {
+    "version": 1, "code_schema": 6, "project": "wg-mimic-fabric",
+    "role": "nat-exit-code", "profile_id": pid, "profile_name": pname,
+    "ip_version": ip_version or "4",
+    "wg_mesh_subnet": subnet, "ix_wg_ip": ix_ip, "ingress_wg_ip": ing_ip,
+    "ix_wg_pubkey": ix_pub, "ingress_wg_privkey_b64": ing_priv_b64,
+    "ix_endpoint_host": endpoint, "wg_port": int(wg_port), "wg_mtu": int(wg_mtu),
+    "mimic_keepalive": keepalive, "obfs_mode": obfs, "swgp_mode": swgp_mode,
+    "swgp_psk": swgp_psk, "swgp_port": int(swgp_port), "exit_mode": exit_mode,
+    "created_at": created,
+}
+if subnet6:
+    obj["wg_mesh_subnet6"] = subnet6
+    obj["ix_wg_ip6"] = ix_ip6
+    obj["ingress_wg_ip6"] = ing_ip6
+print(json.dumps(obj, separators=(",", ":")))
+PY
+}
+
+generate_exit_code() {
+    render_exit_code_json | base64url_encode | sed 's/^/WMGF1:/'
+}
+
 parse_code() {
     local code="$1" json schema role
     json="$(parse_wmgf_code "$code")"
     schema="$(json_get "$json" code_schema)"
     role="$(json_get "$json" role)"
-    [[ "$schema" == "5" && "$role" == "nat-transit-code" ]] \
-        || die "不是有效的 v0.6 接入码（需 code_schema=5 nat-transit-code）"
+    # 公共 WG 字段（transit-code 与 exit-code 都有）
     CODE_PROFILE_ID="$(json_get "$json" profile_id)"
     CODE_WG_MESH_SUBNET="$(json_get "$json" wg_mesh_subnet)"
     CODE_IX_WG_IP="$(json_get "$json" ix_wg_ip)"
@@ -482,12 +519,24 @@ parse_code() {
     CODE_WG_PORT="$(json_get "$json" wg_port)"
     CODE_WG_MTU="$(json_get "$json" wg_mtu)"
     CODE_MIMIC_KEEPALIVE="$(json_get "$json" mimic_keepalive)"
-    CODE_FORWARD_PROTO="$(json_get "$json" forward_proto)"
     CODE_IP_VERSION="$(json_get "$json" ip_version)"
     CODE_WG_MESH_SUBNET6="$(json_get "$json" wg_mesh_subnet6)"
     CODE_IX_WG_IP6="$(json_get "$json" ix_wg_ip6)"
     CODE_INGRESS_WG_IP6="$(json_get "$json" ingress_wg_ip6)"
-    CODE_RULES_TSV="$(json_get "$json" rules_b64 | base64url_decode)"
+    if [[ "$role" == "nat-transit-code" && "$schema" == "5" ]]; then
+        CODE_KIND="transit"
+        CODE_FORWARD_PROTO="$(json_get "$json" forward_proto)"
+        CODE_RULES_TSV="$(json_get "$json" rules_b64 | base64url_decode)"
+    elif [[ "$role" == "nat-exit-code" && "$schema" == "6" ]]; then
+        CODE_KIND="exit"
+        CODE_OBFS_MODE="$(json_get "$json" obfs_mode)"
+        CODE_SWGP_MODE="$(json_get "$json" swgp_mode)"
+        CODE_SWGP_PSK="$(json_get "$json" swgp_psk)"
+        CODE_SWGP_PORT="$(json_get "$json" swgp_port)"
+        CODE_EXIT_MODE="$(json_get "$json" exit_mode)"
+    else
+        die "不是有效的接入码（需 nat-transit-code/schema5 或 nat-exit-code/schema6）"
+    fi
 }
 
 ensure_mimic() {
@@ -1510,6 +1559,8 @@ import_code_interactive() {
     read -r code </dev/tty
     code="$(trim "$code")"
     parse_code "$code"
+    [[ "${CODE_KIND:-transit}" == "transit" ]] \
+        || die "这是出口接入码（nat-exit-code），请用 wm import-exit-code 导入"
 
     ingress_id="${CODE_PROFILE_ID}-ingress"
     if [[ -f "$(profile_env_path "$ingress_id")" ]]; then

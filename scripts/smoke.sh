@@ -164,6 +164,37 @@ test_iface() {
     echo "IFACE OK"
 }
 
+seed_exit() {
+    write_profile_kv "$(profile_env_path ex)" \
+        "PROFILE_ID=ex" "PROFILE_NAME=ex" "ROLE=exit" "ENABLED=true" "WAN_IFACE=eth0" \
+        "WG_MESH_SUBNET=10.88.0.0/24" "WG_IX_IP=10.88.0.2" "WG_INGRESS_IP=10.88.0.1" \
+        "IP_VERSION=4" "WG_PORT=51820" "WG_MTU=1420" "IX_ENDPOINT_HOST=b.example" \
+        "WG_PRIVATE_KEY=k" "WG_PUBLIC_KEY=BPUB" "WG_PEER_PUBLIC_KEY=APUB" \
+        "INGRESS_PRIVKEY_B64=YQ" "MIMIC_KEEPALIVE=300:::" \
+        "OBFS_MODE=swgp+mimic" "SWGP_MODE=zero-overhead-2026" "SWGP_PSK=PSKB64" "SWGP_PORT=18443" \
+        "EXIT_MODE=global" "FW_OPEN_PORT=true"
+}
+
+test_code6() {
+    seed_exit
+    load_profile ex
+    local code; code="$(generate_exit_code)"
+    [[ "$code" == WMGF1:* ]] || fail "exit code prefix"
+    parse_code "$code"
+    [[ "$CODE_KIND" == "exit" ]] || fail "code kind=$CODE_KIND"
+    [[ "$CODE_OBFS_MODE" == "swgp+mimic" ]] || fail "obfs=$CODE_OBFS_MODE"
+    [[ "$CODE_SWGP_MODE" == "zero-overhead-2026" ]] || fail "swgp mode"
+    [[ "$CODE_SWGP_PSK" == "PSKB64" ]] || fail "swgp psk"
+    [[ "$CODE_SWGP_PORT" == "18443" ]] || fail "swgp port=$CODE_SWGP_PORT"
+    [[ "$CODE_EXIT_MODE" == "global" ]] || fail "exit mode"
+    [[ "$CODE_IX_WG_PUBKEY" == "BPUB" ]] || fail "ix pubkey"
+    # 旧 schema-5 transit 码仍可解析（向后兼容）
+    seed_transit; load_profile ix-nat
+    parse_code "$(generate_code)"
+    [[ "$CODE_KIND" == "transit" ]] || fail "transit kind regressed"
+    echo "CODE6 OK"
+}
+
 test_swgp() {
     local s c
     s="$(render_swgp_conf server 18443 127.0.0.1:51820 zero-overhead-2026 PSKBASE64)"
@@ -188,7 +219,8 @@ case "${1:-all}" in
     mimic) test_mimic ;;
     iface) test_iface ;;
     swgp) test_swgp ;;
+    code6) test_code6 ;;
     nopy) test_rule; test_wgconf; test_nft; test_ipv6; test_group; test_pool; test_mimic; test_iface; echo "NOPY OK" ;;
-    all) test_rule; test_code; test_swgp; test_wgconf; test_nft; test_ipv6; test_group; test_pool; test_mimic; test_iface; echo "ALL OK" ;;
-    *) echo "usage: smoke.sh [rule|code|swgp|wgconf|nft|ipv6|group|pool|mimic|iface|nopy|all]"; exit 1 ;;
+    all) test_rule; test_code; test_code6; test_swgp; test_wgconf; test_nft; test_ipv6; test_group; test_pool; test_mimic; test_iface; echo "ALL OK" ;;
+    *) echo "usage: smoke.sh [rule|code|code6|swgp|wgconf|nft|ipv6|group|pool|mimic|iface|nopy|all]"; exit 1 ;;
 esac
