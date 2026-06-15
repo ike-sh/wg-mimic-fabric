@@ -1,6 +1,7 @@
 # wg-mimic-fabric
 
-**当前版本**：`v0.3.0`  
+**当前版本**：[`v0.3.0`](https://github.com/ike-sh/wg-mimic-fabric/releases/tag/v0.3.0)  
+**仓库**：https://github.com/ike-sh/wg-mimic-fabric  
 **定位**：WireGuard + [Mimic](https://github.com/hack3ric/mimic) 伪 TCP 隧道编排器，对标 [ix-transit-fabric](https://github.com/ike-sh/ix-transit-fabric) 的运维体验。
 
 管理 **WireGuard 隧道 + Mimic UDP→TCP 混淆**：服务端生成配对码，客户端导入即可组网，自动处理 MTU、Mimic filter、systemd 生命周期。

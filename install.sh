@@ -1225,7 +1225,7 @@ wg-mimic-fabric ${SCRIPT_VERSION} — WireGuard + Mimic 隧道编排
 
 环境变量:
   WMF_TAG=v0.3.0                  安装/升级时指定版本
-  WMF_REPO=user/wg-mimic-fabric   GitHub 仓库
+  WMF_REPO=ike-sh/wg-mimic-fabric   GitHub 仓库
   WMF_UPGRADE_YES=1               升级跳过确认
   WMF_PURGE_YES=1                 purge 跳过确认
   WMF_UNINSTALL_YES=1             uninstall 跳过确认
