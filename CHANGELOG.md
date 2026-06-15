@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.6.6] - 2026-06-15
+
+### Fixed
+
+- **连通性根因**：IX(`nat-transit`) 的 Mimic filter 之前用 `local=<公网IP>:端口`，在 NAT / 浮动IP 机器上网卡只有内网 IP，XDP/TC 永远匹配不到该公网 IP → 隧道不通。改为 **`local=0.0.0.0:端口`（通配本机 IP，NAT 安全）** 并加 **`handshake=0`** 让 IX 侧被动（由公网入口主动发起 fake-TCP 握手，对齐 mimic 官方 WireGuard server 范例）；公网入口仍 `remote=<IX公网IP>:端口` 主动
+- 移除 `create-transit` 中已无意义且误导的「IX 本机公网 IP（Mimic local 绑定）」提示（Mimic 改用 `0.0.0.0` 通配，不再需要单独绑定 IP）
+- `create-transit` / `import-code` 公网地址默认值改回 **curl 出网 IP**（NAT 云机网卡多为内网 IP 不可作公网地址），网卡 IP 仅作辅助提示；浮动公网 IP 仍需手填
+
+### Note
+
+- Mimic 在**两端都运行**、各自双向 encode(TC) + decode(XDP)，是正常设计而非配置错误
+
 ## [0.6.5] - 2026-06-15
 
 ### Fixed

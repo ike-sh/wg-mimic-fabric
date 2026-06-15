@@ -136,6 +136,20 @@ test_pool() {
     echo "POOL OK"
 }
 
+test_mimic() {
+    seed_transit   # nat-transit, WG_PORT=51820, IX_ENDPOINT_HOST=nat.example
+    load_profile ix-nat
+    local out; out="$(render_mimic_conf_for_profile)"
+    grep -qxF 'filter = local=0.0.0.0:51820,handshake=0' <<<"$out" || fail "transit mimic filter: $out"
+    write_profile_kv "$(profile_env_path ing)" \
+        "PROFILE_ID=ing" "ROLE=nat-ingress" "ENABLED=true" "WAN_IFACE=eth0" \
+        "WG_PORT=51820" "IX_ENDPOINT_HOST=203.0.113.5" "WG_IX_IP=10.88.0.2" "WG_INGRESS_IP=10.88.0.1"
+    load_profile ing
+    out="$(render_mimic_conf_for_profile)"
+    grep -qxF 'filter = remote=203.0.113.5:51820' <<<"$out" || fail "ingress mimic filter: $out"
+    echo "MIMIC OK"
+}
+
 case "${1:-all}" in
     rule) test_rule ;;
     code) test_code ;;
@@ -144,7 +158,8 @@ case "${1:-all}" in
     ipv6) test_ipv6 ;;
     group) test_group ;;
     pool) test_pool ;;
-    nopy) test_rule; test_wgconf; test_nft; test_ipv6; test_group; test_pool; echo "NOPY OK" ;;
-    all) test_rule; test_code; test_wgconf; test_nft; test_ipv6; test_group; test_pool; echo "ALL OK" ;;
-    *) echo "usage: smoke.sh [rule|code|wgconf|nft|ipv6|group|pool|nopy|all]"; exit 1 ;;
+    mimic) test_mimic ;;
+    nopy) test_rule; test_wgconf; test_nft; test_ipv6; test_group; test_pool; test_mimic; echo "NOPY OK" ;;
+    all) test_rule; test_code; test_wgconf; test_nft; test_ipv6; test_group; test_pool; test_mimic; echo "ALL OK" ;;
+    *) echo "usage: smoke.sh [rule|code|wgconf|nft|ipv6|group|pool|mimic|nopy|all]"; exit 1 ;;
 esac

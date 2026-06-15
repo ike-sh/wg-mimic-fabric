@@ -2,7 +2,7 @@
 # wg-mimic-fabric — WireGuard + Mimic tunnel orchestrator (MVP)
 set -Eeuo pipefail
 
-SCRIPT_VERSION="0.6.5"
+SCRIPT_VERSION="0.6.6"
 MIMIC_UPSTREAM_TAG="${MIMIC_UPSTREAM_TAG:-v0.7.0}"
 APP_NAME="wg-mimic-fabric"
 WMF_PROJECT_REPO="${WMF_REPO:-ike-sh/wg-mimic-fabric}"
@@ -815,10 +815,16 @@ primary_backup_check() {
 render_mimic_conf_for_profile() {
     local role="${ROLE:-}" port="${WG_PORT:-}"
     if [[ "$role" == "nat-transit" ]]; then
-        # IX side: WG listens locally; disguise the local WG UDP port as TCP
-        printf 'filter = local=%s:%s\n' "$(format_mimic_ip "${IX_PUBLIC_IP:-${IX_ENDPOINT_HOST:-0.0.0.0}}")" "$port"
+        # IX = WG listener (server). Match the local listen port on ANY local IP:
+        # 0.0.0.0 (or [::]) is NAT-safe — the public/floating IP is frequently not
+        # on the NIC, so a specific local IP would never match what XDP/TC sees.
+        # handshake=0 keeps this side passive; the ingress (client) initiates the
+        # fake-TCP handshake (mimic still runs on BOTH ends, encoding+decoding).
+        local wild="0.0.0.0"
+        [[ "${IX_ENDPOINT_HOST:-}" == *:* ]] && wild="[::]"
+        printf 'filter = local=%s:%s,handshake=0\n' "$wild" "$port"
     elif [[ "$role" == "nat-ingress" ]]; then
-        # ingress side: WG dials IX endpoint; disguise that remote as TCP
+        # ingress = WG dialer (client) → match the remote IX endpoint; active handshake
         printf 'filter = remote=%s:%s\n' "$(format_mimic_ip "${IX_ENDPOINT_HOST:-}")" "$port"
     fi
 }
@@ -1183,7 +1189,7 @@ create_transit_interactive() {
     command_exists nft || die "需要 nftables，请 apt install nftables"
     command_exists wg || die "需要 wireguard-tools，请 apt install wireguard-tools"
 
-    local profile_id endpoint_host wg_port wg_mtu ix_public_ip wan_iface
+    local profile_id endpoint_host wg_port wg_mtu wan_iface
     local subnet ix_ip ingress_ip transit_port landing_host landing_port proto ip_version
     local transit_pool="" tp_default="40000"
     prompt profile_id "IX 中转线路 ID" "ix-nat"
@@ -1191,13 +1197,13 @@ create_transit_interactive() {
     [[ ! -f "$(profile_env_path "$profile_id")" ]] || die "线路已存在：$profile_id"
 
     local egress_ip local_ip
-    local_ip="$(detect_local_ipv4)"
     egress_ip="$(detect_public_ipv4)"
-    [[ -n "$local_ip" ]]  && info "本机网卡 IPv4：${local_ip}（入口可达地址/Mimic 绑定一般用这个）"
-    [[ -n "$egress_ip" ]] && info "出口 IPv4：${egress_ip}（curl 探测的出网IP，通常≠入口IP，仅参考）"
-    prompt endpoint_host "公网入口可达的 IX 地址（域名或IP）" "${local_ip:-$egress_ip}"
+    local_ip="$(detect_local_ipv4)"
+    [[ -n "$egress_ip" ]] && info "出网 IPv4（curl 探测）：${egress_ip}"
+    [[ -n "$local_ip" ]]  && info "本机网卡 IPv4：${local_ip}（NAT 机器此为内网IP）"
+    info "请填「公网入口能连到本机的公网地址」；NAT/多IP 机器若是另配的浮动公网IP，请手动填写"
+    prompt endpoint_host "公网入口可达的 IX 公网地址（域名或IP）" "${egress_ip:-$local_ip}"
     [[ -n "$endpoint_host" ]] || die "IX 可达地址不能为空"
-    prompt ix_public_ip "IX 本机公网 IP（Mimic local 绑定）" "${local_ip:-$endpoint_host}"
     prompt_port wg_port "WireGuard 监听端口（Mimic 伪 TCP 绑定）" "51820"
     prompt wg_mtu "WG 隧道 MTU" "1420"
     validate_mtu "$wg_mtu"
@@ -1257,7 +1263,6 @@ create_transit_interactive() {
         "WG_PORT=${wg_port}" \
         "WG_MTU=${wg_mtu}" \
         "IX_ENDPOINT_HOST=${endpoint_host}" \
-        "IX_PUBLIC_IP=${ix_public_ip}" \
         "WG_PRIVATE_KEY=${ix_priv}" \
         "WG_PUBLIC_KEY=${ix_pub}" \
         "WG_PEER_PUBLIC_KEY=${ing_pub}" \
@@ -1317,11 +1322,11 @@ import_code_interactive() {
     ing_pub="$(wg_pubkey_of "$ing_priv")"
 
     local egress_ip local_ip
-    local_ip="$(detect_local_ipv4)"
     egress_ip="$(detect_public_ipv4)"
-    [[ -n "$local_ip" ]]  && info "本机网卡 IPv4：${local_ip}（客户端连接地址一般用这个）"
-    [[ -n "$egress_ip" ]] && info "出口 IPv4：${egress_ip}（curl 探测的出网IP，通常≠入口IP，仅参考）"
-    prompt public_ip "公网 IPv4（客户端连接地址）" "${local_ip:-$egress_ip}"
+    local_ip="$(detect_local_ipv4)"
+    [[ -n "$egress_ip" ]] && info "出网 IPv4（curl 探测）：${egress_ip}"
+    [[ -n "$local_ip" ]]  && info "本机网卡 IPv4：${local_ip}（NAT 机器此为内网IP）"
+    prompt public_ip "公网 IPv4（客户端连接本入口的地址）" "${egress_ip:-$local_ip}"
     wan_iface="$(detect_default_iface)"
     prompt wan_iface "Mimic 绑定网卡" "${wan_iface:-eth0}"
 
