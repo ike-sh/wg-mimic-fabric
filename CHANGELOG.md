@@ -1,5 +1,21 @@
 # Changelog
 
+## [1.1.0-beta.1] - 2026-06-15
+
+### Added（混淆组网 / 全局出口 Phase 1：A↔B 混淆链）
+
+- **swgp-go 集成**：`wm install-swgp`（GitHub release 动态匹配 linux+arch 资产，回退 `go install`）；`render_swgp_conf`/`apply_swgp_conf` 生成 server/client JSON；`wg-mimic-swgp@.service` systemd 单元。
+- **新角色 `exit`(B 国外出口) / `relay`(A 国内网关)**，与现有 `nat-transit`/`nat-ingress` 并列：
+  - `wm create-exit`（B）：建 WG 监听 + 可选 swgp/mimic + 出口；生成**出口接入码**（`code_schema=6` `nat-exit-code`，向后兼容 5）。
+  - `wm import-exit-code`（A）：建到 B 的混淆隧道（`WG→swgp-go→mimic`）。
+- **混淆四选一** `OBFS_MODE=direct/mimic/swgp/swgp+mimic`：mimic 的 filter 自动对准**线上端口**（含 swgp 时为 swgp 端口）；swgp 默认 `zero-overhead-2026`（不减 MTU）。
+- **自动 MTU**：direct 1420 / mimic·swgp 1400 / paranoid 1360。
+- smoke 新增 `swgp`/`code6`/`obfs` 用例；现有用例保持回归。
+
+> Phase 1 仅打通 A↔B 混淆隧道（`wm test <relay>` 验证）。客户端 WG 入口 + 全局出口路由为 Phase 2。详见 `docs/plans/2026-06-15-obfuscation-mesh-gateway-{design,plan}.md`。
+>
+> ⚠️ beta：新角色未在真机充分验证；现有 nat-transit/nat-ingress 路径按 role 分支隔离、未改动（升级后建议先 `bash scripts/smoke.sh all` + `wm health`/`wm test` 确认现有线路无恙）。
+
 ## [1.0.3] - 2026-06-15
 
 ### Fixed

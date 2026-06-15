@@ -2,7 +2,7 @@
 # wg-mimic-fabric — WireGuard + Mimic tunnel orchestrator (MVP)
 set -Eeuo pipefail
 
-SCRIPT_VERSION="1.0.3"
+SCRIPT_VERSION="1.1.0-beta.1"
 MIMIC_UPSTREAM_TAG="${MIMIC_UPSTREAM_TAG:-v0.7.0}"
 APP_NAME="wg-mimic-fabric"
 WMF_PROJECT_REPO="${WMF_REPO:-ike-sh/wg-mimic-fabric}"
@@ -1488,6 +1488,113 @@ prompt() {
     printf -v "$var" '%s' "$(trim "$__prompt_val")"
 }
 
+# ── 混淆组网：B(exit) 生成 / A(relay) 导入 ─────────────────────────────────────
+
+create_exit_interactive() {
+    require_root
+    ensure_dirs
+    command_exists nft || die "需要 nftables，请 apt install nftables"
+    command_exists wg || die "需要 wireguard-tools，请 apt install wireguard-tools"
+
+    local profile_id endpoint_host wg_port wg_mtu wan_iface
+    local subnet ix_ip ingress_ip obfs_mode swgp_mode swgp_port swgp_psk
+    prompt profile_id "出口线路 ID（B 国外）" "exit"
+    profile_id="$(sanitize_id "$profile_id")"
+    [[ ! -f "$(profile_env_path "$profile_id")" ]] || die "线路已存在：$profile_id"
+    info "填「A(国内网关)能连到本机 B 的公网/中转地址」（中转机填入口IP）"
+    prompt endpoint_host "A 可达的 B 公网/中转地址（域名或IP）" ""
+    [[ -n "$endpoint_host" ]] || die "B 可达地址不能为空"
+    prompt_port wg_port "WireGuard 监听端口" "51820"
+    prompt obfs_mode "混淆方式 direct/mimic/swgp/swgp+mimic" "swgp+mimic"
+    case "$obfs_mode" in direct|mimic|swgp|swgp+mimic) ;; *) die "混淆方式只能 direct/mimic/swgp/swgp+mimic" ;; esac
+    swgp_port=0; swgp_mode=""; swgp_psk=""
+    if [[ "$obfs_mode" == *swgp* ]]; then
+        prompt_port swgp_port "swgp-go 线上端口（A 连这个）" "$((wg_port + 1))"
+        [[ "$swgp_port" != "$wg_port" ]] || die "swgp 端口不能与 WG 端口相同"
+        prompt swgp_mode "swgp 模式 zero-overhead-2026/paranoid-2026" "zero-overhead-2026"
+        install_swgp
+        swgp_psk="$(swgp_genpsk)"
+    fi
+    local mtu_def=1400; [[ "$obfs_mode" == *paranoid* ]] && mtu_def=1360; [[ "$obfs_mode" == direct ]] && mtu_def=1420
+    prompt wg_mtu "WG 隧道 MTU" "$mtu_def"
+    validate_mtu "$wg_mtu"
+    wan_iface="$(detect_default_iface)"
+    prompt wan_iface "Mimic/出网绑定网卡" "${wan_iface:-eth0}"
+    prompt subnet "组网网段" "$(default_mesh_subnet)"
+    prompt ix_ip "B 虚拟 IP" "$(default_ix_ip)"
+    prompt ingress_ip "A 虚拟 IP" "$(default_ingress_ip)"
+    validate_ipv4 "$ix_ip" || die "B 虚拟 IP 非法"
+    validate_ipv4 "$ingress_ip" || die "A 虚拟 IP 非法"
+
+    local b_priv b_pub a_priv a_pub a_priv_b64
+    b_priv="$(wg_genkey)"; b_pub="$(wg_pubkey_of "$b_priv")"
+    a_priv="$(wg_genkey)"; a_pub="$(wg_pubkey_of "$a_priv")"
+    a_priv_b64="$(printf '%s' "$a_priv" | base64url_encode)"
+
+    write_profile_kv "$(profile_env_path "$profile_id")" \
+        "PROFILE_ID=${profile_id}" "PROFILE_NAME=${profile_id}" "ROLE=exit" "ENABLED=true" \
+        "WAN_IFACE=${wan_iface}" "WG_MESH_SUBNET=${subnet}" "WG_IX_IP=${ix_ip}" \
+        "WG_INGRESS_IP=${ingress_ip}" "IP_VERSION=4" "WG_PORT=${wg_port}" "WG_MTU=${wg_mtu}" \
+        "IX_ENDPOINT_HOST=${endpoint_host}" "WG_PRIVATE_KEY=${b_priv}" "WG_PUBLIC_KEY=${b_pub}" \
+        "WG_PEER_PUBLIC_KEY=${a_pub}" "INGRESS_PRIVKEY_B64=${a_priv_b64}" "MIMIC_KEEPALIVE=300:::" \
+        "MIMIC_XDP_MODE=" "OBFS_MODE=${obfs_mode}" "SWGP_MODE=${swgp_mode}" \
+        "SWGP_PSK=${swgp_psk}" "SWGP_PORT=${swgp_port}" "EXIT_MODE=global" "FW_OPEN_PORT=true"
+
+    load_profile "$profile_id"
+    apply_nft_all
+    ensure_ip_forward
+    local code; code="$(generate_exit_code)"
+    printf '%s\n' "$code" >"${CODES_DIR}/${profile_id}.code"; chmod 600 "${CODES_DIR}/${profile_id}.code"
+    printf '\n═══ 出口接入码（复制到 A 国内网关：wm import-exit-code）═══\n%s\n════════════════════════════════════════════\n' "$code"
+    local _autostart=""; prompt _autostart "现在就启动该线路吗？[Y/n]" "Y"
+    case "$_autostart" in [Nn]*) info "稍后：wm start ${profile_id}" ;; *) start_profile "$profile_id" ;; esac
+}
+
+import_exit_code() {
+    require_root
+    ensure_dirs
+    command_exists nft || die "需要 nftables"
+    command_exists wg || die "需要 wireguard-tools"
+    local code relay_id wan_iface a_priv a_pub xdp
+    printf '请粘贴 WMGF1: 出口接入码：' >&2
+    read -r code </dev/tty; code="$(trim "$code")"
+    parse_code "$code"
+    [[ "${CODE_KIND:-}" == "exit" ]] || die "这不是出口接入码（需 nat-exit-code）；普通中转码请用 wm import-code"
+    relay_id="${CODE_PROFILE_ID}-relay"
+    if [[ -f "$(profile_env_path "$relay_id")" ]]; then
+        local _u="Y"; prompt _u "网关线路 ${relay_id} 已存在，用此码更新它吗？[Y/n]" "Y"
+        case "$_u" in [Nn]*) die "已取消" ;; esac
+        stop_profile "$relay_id" >/dev/null 2>&1 || true
+    fi
+    a_priv="$(printf '%s' "$CODE_INGRESS_PRIVKEY_B64" | base64url_decode)"
+    a_pub="$(wg_pubkey_of "$a_priv")"
+    [[ "$CODE_OBFS_MODE" == *swgp* ]] && install_swgp
+    wan_iface="$(detect_default_iface)"
+    prompt wan_iface "Mimic/绑定网卡" "${wan_iface:-eth0}"
+    xdp="native"; nic_prefers_skb "$wan_iface" && xdp="skb"
+
+    printf '\n── 出口接入码摘要 ──\n  B 端点: %s:%s\n  混淆: %s  swgp端口: %s\n  组网: A %s ⇄ B %s\n\n' \
+        "$CODE_IX_ENDPOINT_HOST" "$CODE_WG_PORT" "$CODE_OBFS_MODE" "${CODE_SWGP_PORT}" \
+        "$CODE_INGRESS_WG_IP" "$CODE_IX_WG_IP"
+
+    write_profile_kv "$(profile_env_path "$relay_id")" \
+        "PROFILE_ID=${relay_id}" "PROFILE_NAME=${relay_id}" "ROLE=relay" "ENABLED=true" \
+        "WAN_IFACE=${wan_iface}" "WG_MESH_SUBNET=${CODE_WG_MESH_SUBNET}" "WG_IX_IP=${CODE_IX_WG_IP}" \
+        "WG_INGRESS_IP=${CODE_INGRESS_WG_IP}" "IP_VERSION=${CODE_IP_VERSION:-4}" \
+        "WG_PORT=${CODE_WG_PORT}" "WG_MTU=${CODE_WG_MTU}" "IX_ENDPOINT_HOST=${CODE_IX_ENDPOINT_HOST}" \
+        "WG_PRIVATE_KEY=${a_priv}" "WG_PUBLIC_KEY=${a_pub}" "WG_PEER_PUBLIC_KEY=${CODE_IX_WG_PUBKEY}" \
+        "MIMIC_KEEPALIVE=${CODE_MIMIC_KEEPALIVE:-300:::}" "MIMIC_XDP_MODE=${xdp}" \
+        "OBFS_MODE=${CODE_OBFS_MODE}" "SWGP_MODE=${CODE_SWGP_MODE}" "SWGP_PSK=${CODE_SWGP_PSK}" \
+        "SWGP_PORT=${CODE_SWGP_PORT}" "EXIT_MODE=${CODE_EXIT_MODE:-global}" "FW_OPEN_PORT=false"
+
+    load_profile "$relay_id"
+    apply_nft_all
+    ensure_ip_forward
+    local _autostart=""; prompt _autostart "现在就启动该线路吗？[Y/n]" "Y"
+    case "$_autostart" in [Nn]*) info "稍后：wm start ${relay_id}" ;; *) start_profile "$relay_id" ;; esac
+    ok "验证 A↔B 隧道：wm test ${relay_id}"
+}
+
 create_transit_interactive() {
     require_root
     ensure_dirs
@@ -2899,6 +3006,8 @@ wg-mimic-fabric ${SCRIPT_VERSION} — 公网入口 ⇄ IX WireGuard 组网 + Mim
   wm --version
   wm create-transit               IX 机：创建组网线路+首条规则并生成接入码
   wm import-code                  公网入口：粘贴接入码，自动组网与转发
+  wm create-exit                  B(国外出口)：建混淆组网(WG+swgp-go+mimic)并生成出口接入码
+  wm import-exit-code             A(国内网关)：粘贴出口接入码，建到 B 的混淆隧道
   wm start|stop|restart [ID]      启停线路（两端均需 WG+Mimic）
   wm list-profiles
   wm show-config [ID]
@@ -3034,6 +3143,8 @@ main() {
         resume) resume_after_boot ;;
         create-transit) create_transit_interactive ;;
         import-code) import_code_interactive ;;
+        create-exit) create_exit_interactive ;;
+        import-exit-code) import_exit_code ;;
         start) start_profile "$(resolve_profile_id "${2:-}")" ;;
         stop) stop_profile "$(resolve_profile_id "${2:-}")" ;;
         restart) restart_profile "${2:-}" ;;
