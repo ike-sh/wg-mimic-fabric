@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.1.0-beta.2] - 2026-06-15
+
+### Added（混淆组网 Phase 2：客户端入口 + 全局出口）
+
+- **客户端 WG 入口**：relay(A) 单 WG 接口同时当客户端服务端（`ListenPort`）+ 拨 B 出口（peer B `AllowedIPs=0.0.0.0/0`）；客户端 peer 用最长前缀匹配各走各路。
+- **`wm add-client <网关> <名>` / `list-clients` / `del-client`**：生成标准 WG `.conf`（`AllowedIPs=0.0.0.0/0`、`DNS=1.1.1.1`、`MTU=1280`）+ `qrencode` 二维码，官方App/小火箭/mihomo/sing-box 通吃。
+- **全局出口路由/NAT**：A 把客户端子网 masquerade 到上行(src→A mesh IP，B 才认)；B 把 mesh 子网 masquerade 出网卡 → 客户端对外即 B 出口IP。
+- **防路由环**：relay 全局出口用 `FwMark` + swgp `proxyFwmark`，让 A 自身/swgp 到 B 的流量避开 WG 默认路由。
+- `import-exit-code` 增「A 公网IP / 客户端端口」配置（更新模式保留旧值）；smoke 新增 `client` 用例。
+
+> ⚠️ beta：Phase 2 路由/NAT/fwmark **必须真机验证**（本机无法运行期测试，仅 `bash -n` + smoke 渲染断言）。先在测试机：B `wm create-exit` → A `wm import-exit-code` → `wm test` 通后 `wm add-client` 扫码连。
+
 ## [1.1.0-beta.1] - 2026-06-15
 
 ### Added（混淆组网 / 全局出口 Phase 1：A↔B 混淆链）

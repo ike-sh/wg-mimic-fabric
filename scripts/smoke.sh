@@ -230,6 +230,35 @@ test_obfs() {
     echo "OBFS OK"
 }
 
+test_client() {
+    write_profile_kv "$(profile_env_path gw)" \
+        "PROFILE_ID=gw" "ROLE=relay" "ENABLED=true" "WAN_IFACE=eth0" \
+        "WG_MESH_SUBNET=10.88.0.0/24" "WG_IX_IP=10.88.0.2" "WG_INGRESS_IP=10.88.0.1" \
+        "WG_PORT=51820" "WG_MTU=1400" "IX_ENDPOINT_HOST=1.2.3.4" \
+        "WG_PRIVATE_KEY=k" "WG_PUBLIC_KEY=GWPUB" "WG_PEER_PUBLIC_KEY=BPUB" \
+        "OBFS_MODE=swgp+mimic" "SWGP_MODE=zero-overhead-2026" "SWGP_PSK=x" "SWGP_PORT=18443" \
+        "EXIT_MODE=global" "A_PUBLIC_HOST=8.8.8.8" "CLIENT_WG_PORT=51820" \
+        "CLIENT_SUBNET=10.89.0.0/24" "CLIENT_DNS=1.1.1.1" "CLIENT_MTU=1280" "FW_OPEN_PORT=true"
+    install -d -m 700 "$(clients_dir_for gw)"
+    printf '%s\n' "CLIENT_ID=ph" "CLIENT_NAME=ph" "CLIENT_PRIVKEY=cpriv" "CLIENT_PUBKEY=CPUB" "CLIENT_IP=10.89.0.2" \
+        >"$(client_env_path gw ph)"
+    load_profile gw
+    local w; w="$(render_wg_conf)"
+    grep -q 'ListenPort = 51820' <<<"$w" || fail "relay listenport: $w"
+    grep -qF "FwMark = ${WMF_FWMARK}" <<<"$w" || fail "relay fwmark"
+    grep -qF 'AllowedIPs = 0.0.0.0/0' <<<"$w" || fail "relay peerB 0/0"
+    grep -qF 'Address = 10.89.0.1/24' <<<"$w" || fail "relay client subnet addr"
+    grep -qF 'PublicKey = CPUB' <<<"$w" || fail "client peer pubkey"
+    grep -qF 'AllowedIPs = 10.89.0.2/32' <<<"$w" || fail "client peer allowedips"
+    local cc; cc="$(render_client_conf cpriv 10.89.0.2 GWPUB 8.8.8.8:51820)"
+    grep -qF 'Endpoint = 8.8.8.8:51820' <<<"$cc" || fail "client endpoint"
+    grep -qF 'AllowedIPs = 0.0.0.0/0' <<<"$cc" || fail "client allowed"
+    grep -qF 'DNS = 1.1.1.1' <<<"$cc" || fail "client dns"
+    local nf; nf="$(nft_emit_gw_masq)"
+    grep -q 'ip saddr 10.89.0.0/24 oifname' <<<"$nf" || fail "relay gw masq: $nf"
+    echo "CLIENT OK"
+}
+
 case "${1:-all}" in
     rule) test_rule ;;
     code) test_code ;;
@@ -243,7 +272,8 @@ case "${1:-all}" in
     swgp) test_swgp ;;
     code6) test_code6 ;;
     obfs) test_obfs ;;
-    nopy) test_rule; test_wgconf; test_nft; test_ipv6; test_group; test_pool; test_mimic; test_iface; test_obfs; echo "NOPY OK" ;;
-    all) test_rule; test_code; test_code6; test_swgp; test_obfs; test_wgconf; test_nft; test_ipv6; test_group; test_pool; test_mimic; test_iface; echo "ALL OK" ;;
-    *) echo "usage: smoke.sh [rule|code|code6|swgp|obfs|wgconf|nft|ipv6|group|pool|mimic|iface|nopy|all]"; exit 1 ;;
+    client) test_client ;;
+    nopy) test_rule; test_wgconf; test_nft; test_ipv6; test_group; test_pool; test_mimic; test_iface; test_obfs; test_client; echo "NOPY OK" ;;
+    all) test_rule; test_code; test_code6; test_swgp; test_obfs; test_client; test_wgconf; test_nft; test_ipv6; test_group; test_pool; test_mimic; test_iface; echo "ALL OK" ;;
+    *) echo "usage: smoke.sh [rule|code|code6|swgp|obfs|client|wgconf|nft|ipv6|group|pool|mimic|iface|nopy|all]"; exit 1 ;;
 esac
