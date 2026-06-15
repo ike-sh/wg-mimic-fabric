@@ -2,7 +2,7 @@
 # wg-mimic-fabric — WireGuard + Mimic tunnel orchestrator (MVP)
 set -Eeuo pipefail
 
-SCRIPT_VERSION="0.5.1"
+SCRIPT_VERSION="0.6.0"
 MIMIC_UPSTREAM_TAG="${MIMIC_UPSTREAM_TAG:-v0.7.0}"
 APP_NAME="wg-mimic-fabric"
 WMF_PROJECT_REPO="${WMF_REPO:-ike-sh/wg-mimic-fabric}"
@@ -153,45 +153,6 @@ resolve_profile_id() {
 
 # ── JSON / pairing code (python3) ──────────────────────────────────────────
 
-json_encode_pairing() {
-    python3 - "$@" <<'PY'
-import base64, json, sys
-from datetime import datetime, timezone
-args = sys.argv[1:]
-(
-    profile_id, server_pubkey, server_endpoint, wg_port, wg_mtu, ip_version,
-    wg_ipv4_subnet, server_ipv4, client_ipv4,
-    wg_ipv6_subnet, server_ipv6, client_ipv6,
-    client_pubkey, client_privkey, mimic_keepalive, wan_iface,
-) = args[:16]
-obj = {
-    "version": 1,
-    "code_schema": 2,
-    "project": "wg-mimic-fabric",
-    "role": "server",
-    "profile_id": profile_id,
-    "server_pubkey": server_pubkey,
-    "server_endpoint": server_endpoint,
-    "wg_port": int(wg_port),
-    "wg_mtu": int(wg_mtu),
-    "ip_version": ip_version,
-    "wg_ipv4_subnet": wg_ipv4_subnet,
-    "server_ipv4": server_ipv4,
-    "client_ipv4": client_ipv4,
-    "client_pubkey": client_pubkey,
-    "client_privkey_b64": base64.urlsafe_b64encode(client_privkey.encode()).decode().rstrip("="),
-    "mimic_keepalive": mimic_keepalive,
-    "wan_iface_hint": wan_iface,
-    "created_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-}
-if wg_ipv6_subnet:
-    obj["wg_ipv6_subnet"] = wg_ipv6_subnet
-    obj["server_ipv6"] = server_ipv6
-    obj["client_ipv6"] = client_ipv6
-print(json.dumps(obj, separators=(",", ":")))
-PY
-}
-
 base64url_encode() {
     python3 -c 'import base64,sys; d=sys.stdin.buffer.read(); print(base64.urlsafe_b64encode(d).decode().rstrip("="))'
 }
@@ -200,54 +161,10 @@ base64url_decode() {
     python3 -c 'import base64,sys; s=sys.stdin.read().strip(); s+="="*(-len(s)%4); sys.stdout.buffer.write(base64.urlsafe_b64decode(s))'
 }
 
-json_encode_transit_code() {
-    python3 - "$@" <<'PY'
-import json, sys
-from datetime import datetime, timezone
-(
-    profile_id, transit_listen_port, transit_reach_host,
-    landing_host, landing_port, forward_proto,
-) = sys.argv[1:7]
-obj = {
-    "version": 1,
-    "code_schema": 3,
-    "project": "wg-mimic-fabric",
-    "role": "transit-code",
-    "profile_id": profile_id,
-    "transit_listen_port": int(transit_listen_port),
-    "transit_reach_host": transit_reach_host,
-    "landing_host": landing_host,
-    "landing_port": int(landing_port),
-    "forward_proto": forward_proto,
-    "created_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-}
-print(json.dumps(obj, separators=(",", ":")))
-PY
-}
-
-generate_transit_code() {
-    local json b64
-    json="$(json_encode_transit_code \
-        "$PROFILE_ID" "${RELAY_LISTEN_PORT:-}" "${TRANSIT_REACH_HOST:-}" \
-        "${RELAY_TARGET_HOST:-}" "${RELAY_TARGET_PORT:-}" "${FORWARD_PROTO:-both}")"
-    b64="$(printf '%s' "$json" | base64url_encode)"
-    printf 'WMGF1:%s' "$b64"
-}
-
 parse_wmgf_code() {
     local code="$1"
     [[ "$code" == WMGF1:* ]] || die "接入码必须以 WMGF1: 开头"
     printf '%s' "${code#WMGF1:}" | base64url_decode
-}
-
-parse_transit_code() {
-    local code="$1" json role schema
-    json="$(parse_wmgf_code "$code")"
-    role="$(json_get "$json" role)"
-    schema="$(json_get "$json" code_schema)"
-    [[ "$role" == "transit-code" && "$schema" == "3" ]] \
-        || die "不是有效的 IX 中转接入码（需 code_schema=3 transit-code）"
-    printf '%s' "$json"
 }
 
 detect_public_ipv4() {
@@ -274,39 +191,153 @@ prompt_port() {
     done
 }
 
-generate_pairing_code() {
-    local json b64 client_priv
-    client_priv="$(cat "${KEYS_DIR}/${PROFILE_ID}/client.key" 2>/dev/null || true)"
-    [[ -n "$client_priv" ]] || client_priv="$(wg_genkey)"
-    json="$(json_encode_pairing \
-        "$PROFILE_ID" "$WG_PUBLIC_KEY" "${PUBLIC_IP}:${WG_PORT}" \
-        "$WG_PORT" "$WG_MTU" "${IP_VERSION:-4}" \
-        "$WG_IPV4_SUBNET" "$WG_SERVER_IPV4" "$WG_CLIENT_IPV4" \
-        "${WG_IPV6_SUBNET:-}" "${WG_SERVER_IPV6:-}" "${WG_CLIENT_IPV6:-}" \
-        "$WG_PEER_PUBLIC_KEY" "$client_priv" \
-        "$MIMIC_KEEPALIVE" "$WAN_IFACE")"
-    b64="$(printf '%s' "$json" | base64url_encode)"
-    printf 'WMGF1:%s' "$b64"
-}
-
-parse_pairing_code() {
-    local code="${1#WMGF1:}"
-    [[ "$1" == WMGF1:* ]] || die "配对码必须以 WMGF1: 开头"
-    printf '%s' "$code" | base64url_decode
-}
-
 json_get() {
     local json="$1" key="$2"
     python3 -c 'import json,sys; o=json.load(sys.stdin); print(o.get(sys.argv[1],""))' "$key" <<<"$json"
 }
 
-# ── WireGuard keys ─────────────────────────────────────────────────────────
+validate_ipv4() {
+    local ip="$1" o
+    [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
+    IFS='.' read -ra o <<<"$ip"
+    (( ${o[0]} <= 255 && ${o[1]} <= 255 && ${o[2]} <= 255 && ${o[3]} <= 255 ))
+}
+
+validate_proto() {
+    case "$1" in tcp|udp|both) return 0 ;; *) return 1 ;; esac
+}
+
+# ── WireGuard mesh helpers ─────────────────────────────────────────────────
 
 wg_genkey() { wg genkey; }
-wg_pubkey() { wg pubkey; }
+wg_pubkey_of() { printf '%s' "$1" | wg pubkey; }
 
-ensure_wg_tools() {
-    command_exists wg || die "未找到 wg，请安装：apt install wireguard-tools"
+default_mesh_subnet() { printf '10.88.0.0/24'; }
+default_ix_ip()       { printf '10.88.0.2'; }
+default_ingress_ip()  { printf '10.88.0.1'; }
+
+# ── rule env I/O (multi-rule) ──────────────────────────────────────────────
+
+rules_dir_for() { printf '%s/%s/rules' "$PROFILES_DIR" "$(sanitize_id "$1")"; }
+rule_env_path() { printf '%s/%s.env' "$(rules_dir_for "$1")" "$(sanitize_id "$2")"; }
+
+list_rule_ids() {
+    local d f; d="$(rules_dir_for "$1")"
+    [[ -d "$d" ]] || return 0
+    for f in "$d"/*.env; do
+        [[ -f "$f" ]] && basename "$f" .env
+    done
+}
+
+load_rule() {
+    local p; p="$(rule_env_path "$1" "$2")"
+    [[ -f "$p" ]] || return 1
+    RULE_ID=""; RULE_NOTE=""; RULE_ENABLED="true"; TRANSIT_PORT=""
+    LANDING_HOST=""; LANDING_PORT=""; FORWARD_PROTO="both"; CLIENT_PORT=""
+    # shellcheck disable=SC1090
+    source "$p"
+}
+
+write_rule() {
+    local pid="$1" rid="$2"; shift 2
+    local d; d="$(rules_dir_for "$pid")"
+    install -d -m 700 "$d"
+    local tmp; tmp="$(mktemp)"
+    printf '%s\n' "$@" >"$tmp"
+    install -m 600 "$tmp" "$(rule_env_path "$pid" "$rid")"
+    rm -f "$tmp"
+}
+
+generate_unique_rule_id() {
+    local pid="$1" base="${2:-rule}" n=1 rid
+    rid="$base"
+    while [[ -f "$(rule_env_path "$pid" "$rid")" ]]; do
+        n=$((n + 1)); rid="${base}-${n}"
+    done
+    printf '%s' "$rid"
+}
+
+rules_to_tsv() {
+    local pid="$1" rid
+    for rid in $(list_rule_ids "$pid"); do
+        (
+            load_rule "$pid" "$rid" || exit 0
+            printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+                "$RULE_ID" "${RULE_NOTE:-}" "$TRANSIT_PORT" \
+                "$LANDING_HOST" "$LANDING_PORT" "${FORWARD_PROTO:-both}"
+        )
+    done
+}
+
+# ── access code (WMGF1, code_schema=5, WG mesh) ─────────────────────────────
+
+render_code_json() {
+    local rules_tsv rules_b64 created
+    [[ "${ROLE:-}" == "nat-transit" ]] || die "仅 IX(nat-transit) 线路可生成接入码"
+    rules_tsv="$(rules_to_tsv "$PROFILE_ID")"
+    [[ -n "$rules_tsv" ]] || die "线路 ${PROFILE_ID} 暂无转发规则，无法生成接入码"
+    rules_b64="$(printf '%s' "$rules_tsv" | base64url_encode)"
+    created="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    python3 - "$PROFILE_ID" "${PROFILE_NAME:-$PROFILE_ID}" "$WG_MESH_SUBNET" \
+        "$WG_IX_IP" "$WG_INGRESS_IP" "$WG_PUBLIC_KEY" "$INGRESS_PRIVKEY_B64" \
+        "$IX_ENDPOINT_HOST" "$WG_PORT" "$WG_MTU" "${MIMIC_KEEPALIVE:-300:::}" \
+        "${FORWARD_PROTO:-both}" "$rules_b64" "$created" <<'PY'
+import base64, json, sys
+( pid, pname, subnet, ix_ip, ing_ip, ix_pub, ing_priv_b64, endpoint,
+  wg_port, wg_mtu, keepalive, fproto, rules_b64, created ) = sys.argv[1:15]
+def decode_tsv(b):
+    b = b + "=" * (-len(b) % 4)
+    return base64.urlsafe_b64decode(b.encode()).decode()
+rules = []
+for line in decode_tsv(rules_b64).splitlines():
+    if not line.strip():
+        continue
+    f = line.split("\t")
+    while len(f) < 6:
+        f.append("")
+    rules.append({
+        "rule_id": f[0], "note": f[1],
+        "transit_port": int(f[2]) if f[2] else 0,
+        "landing_host": f[3],
+        "landing_port": int(f[4]) if f[4] else 0,
+        "proto": f[5] or "both",
+    })
+obj = {
+    "version": 1, "code_schema": 5, "project": "wg-mimic-fabric",
+    "role": "nat-transit-code", "profile_id": pid, "profile_name": pname,
+    "wg_mesh_subnet": subnet, "ix_wg_ip": ix_ip, "ingress_wg_ip": ing_ip,
+    "ix_wg_pubkey": ix_pub, "ingress_wg_privkey_b64": ing_priv_b64,
+    "ix_endpoint_host": endpoint, "wg_port": int(wg_port), "wg_mtu": int(wg_mtu),
+    "mimic_keepalive": keepalive, "forward_proto": fproto,
+    "rules": rules, "rules_b64": rules_b64, "created_at": created,
+}
+print(json.dumps(obj, separators=(",", ":")))
+PY
+}
+
+generate_code() {
+    render_code_json | base64url_encode | sed 's/^/WMGF1:/'
+}
+
+parse_code() {
+    local code="$1" json schema role
+    json="$(parse_wmgf_code "$code")"
+    schema="$(json_get "$json" code_schema)"
+    role="$(json_get "$json" role)"
+    [[ "$schema" == "5" && "$role" == "nat-transit-code" ]] \
+        || die "不是有效的 v0.6 接入码（需 code_schema=5 nat-transit-code）"
+    CODE_PROFILE_ID="$(json_get "$json" profile_id)"
+    CODE_WG_MESH_SUBNET="$(json_get "$json" wg_mesh_subnet)"
+    CODE_IX_WG_IP="$(json_get "$json" ix_wg_ip)"
+    CODE_INGRESS_WG_IP="$(json_get "$json" ingress_wg_ip)"
+    CODE_IX_WG_PUBKEY="$(json_get "$json" ix_wg_pubkey)"
+    CODE_INGRESS_PRIVKEY_B64="$(json_get "$json" ingress_wg_privkey_b64)"
+    CODE_IX_ENDPOINT_HOST="$(json_get "$json" ix_endpoint_host)"
+    CODE_WG_PORT="$(json_get "$json" wg_port)"
+    CODE_WG_MTU="$(json_get "$json" wg_mtu)"
+    CODE_MIMIC_KEEPALIVE="$(json_get "$json" mimic_keepalive)"
+    CODE_FORWARD_PROTO="$(json_get "$json" forward_proto)"
+    CODE_RULES_TSV="$(json_get "$json" rules_b64 | base64url_decode)"
 }
 
 ensure_mimic() {
@@ -318,44 +349,10 @@ detect_default_iface() {
     ip -4 route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}'
 }
 
-suggest_wg_mtu() {
-    local mode="${1:-4}"
-    case "$mode" in
-        6|dual) printf '1408' ;;
-        *) printf '1420' ;;
-    esac
-}
-
-print_mtu_guide() {
-    local mode="${1:-4}" suggested
-    suggested="$(suggest_wg_mtu "$mode")"
-    cat <<EOF
-
-── MTU 说明（Mimic 核心参数）──
-  Mimic 每包额外占用 12 字节，WG 接口 MTU 必须减去 12。
-
-  推荐值：
-    IPv4 单栈     → 1420（最大可试 1428）
-    IPv6 / dual   → 1408（从默认 1420 减 12）
-
-  若还有 PPPoE/VPN 等封装，在现有 MTU 基础上再减 12。
-  当前 IP 模式「${mode}」建议：${suggested}
-
-EOF
-}
-
 validate_mtu() {
     local mtu="$1"
     [[ "$mtu" =~ ^[0-9]+$ ]] || die "MTU 必须是数字"
     (( mtu >= 1280 && mtu <= 1500 )) || die "MTU 应在 1280–1500 之间（当前 ${mtu}）"
-}
-
-prompt_mtu() {
-    local var="$1" mode="${2:-4}" default
-    default="$(suggest_wg_mtu "$mode")"
-    print_mtu_guide "$mode"
-    prompt "$var" "WG 隧道接口 MTU" "$default"
-    validate_mtu "${!var}"
 }
 
 format_mimic_ip() {
@@ -423,16 +420,13 @@ assume_yes() { [[ "${WMF_PURGE_YES:-}${WMF_UPGRADE_YES:-}" == *1* ]]; }
 # ── render configs ─────────────────────────────────────────────────────────
 
 render_mimic_conf_for_profile() {
-    local role="${ROLE:-}" pub_ip="${PUBLIC_IP:-${INGRESS_PUBLIC_HOST:-}}" port="${WG_PORT:-}"
-    if [[ "$role" == "relay" && "${RELAY_KIND:-}" == "ingress" ]]; then
-        printf 'filter = %s=%s:%s\n' "local" "$(format_mimic_ip "$pub_ip")" "${RELAY_LISTEN_PORT:-}"
-    elif [[ "$role" == "server" ]]; then
-        printf 'filter = %s=%s:%s\n' "local" "$(format_mimic_ip "$pub_ip")" "$port"
-    elif [[ "$role" == "forwarder" ]]; then
-        printf 'filter = %s=%s:%s\n' "remote" "$(format_mimic_ip "${SERVER_PUBLIC_IP:-}")" "${SERVER_WG_PORT:-$port}"
-    else
-        local endpoint="${SERVER_ENDPOINT:-}" rip="${endpoint%:*}"
-        printf 'filter = %s=%s:%s\n' "remote" "$(format_mimic_ip "$rip")" "$port"
+    local role="${ROLE:-}" port="${WG_PORT:-}"
+    if [[ "$role" == "nat-transit" ]]; then
+        # IX side: WG listens locally; disguise the local WG UDP port as TCP
+        printf 'filter = local=%s:%s\n' "$(format_mimic_ip "${IX_PUBLIC_IP:-${IX_ENDPOINT_HOST:-0.0.0.0}}")" "$port"
+    elif [[ "$role" == "nat-ingress" ]]; then
+        # ingress side: WG dials IX endpoint; disguise that remote as TCP
+        printf 'filter = remote=%s:%s\n' "$(format_mimic_ip "${IX_ENDPOINT_HOST:-}")" "$port"
     fi
 }
 
@@ -465,213 +459,175 @@ apply_mimic_conf_iface() {
     chmod 644 "$path"
 }
 
-render_wg_server_conf() {
-    cat <<EOF
-# Generated by wg-mimic-fabric — server ${PROFILE_ID}
+render_wg_conf() {
+    if [[ "${ROLE:-}" == "nat-transit" ]]; then
+        cat <<EOF
+# Generated by wg-mimic-fabric — nat-transit ${PROFILE_ID}
 [Interface]
 PrivateKey = ${WG_PRIVATE_KEY}
-Address = ${WG_SERVER_IPV4}
-${WG_SERVER_IPV6:+Address = ${WG_SERVER_IPV6}}
+Address = ${WG_IX_IP}/32
 ListenPort = ${WG_PORT}
 MTU = ${WG_MTU}
 
 [Peer]
-PublicKey = ${WG_PEER_PUBLIC_KEY:-REPLACE_CLIENT_PUBKEY}
-AllowedIPs = ${WG_CLIENT_IPV4}${WG_CLIENT_IPV6:+, ${WG_CLIENT_IPV6}}
+PublicKey = ${WG_PEER_PUBLIC_KEY}
+AllowedIPs = ${WG_INGRESS_IP}/32
 PersistentKeepalive = 25
 EOF
-}
-
-render_wg_client_conf() {
-    local allowed="${WG_IPV4_SUBNET}"
-    [[ -n "${WG_IPV6_SUBNET:-}" ]] && allowed="${allowed}, ${WG_IPV6_SUBNET}"
-    cat <<EOF
-# Generated by wg-mimic-fabric — client ${PROFILE_ID}
+    else
+        cat <<EOF
+# Generated by wg-mimic-fabric — nat-ingress ${PROFILE_ID}
 [Interface]
 PrivateKey = ${WG_PRIVATE_KEY}
-Address = ${WG_CLIENT_IPV4}
-${WG_CLIENT_IPV6:+Address = ${WG_CLIENT_IPV6}}
+Address = ${WG_INGRESS_IP}/32
 MTU = ${WG_MTU}
 
 [Peer]
 PublicKey = ${WG_PEER_PUBLIC_KEY}
-Endpoint = ${SERVER_ENDPOINT}
-AllowedIPs = ${allowed}
+Endpoint = ${IX_ENDPOINT_HOST}:${WG_PORT}
+AllowedIPs = ${WG_IX_IP}/32
 PersistentKeepalive = 25
 EOF
+    fi
 }
 
 apply_profile_configs() {
-    if [[ "${ROLE:-}" == "relay" && "${RELAY_KIND:-}" != "ingress" ]]; then
-        return 0
-    fi
     [[ -n "${WAN_IFACE:-}" ]] || die "配置缺少 WAN_IFACE（Mimic 绑定网卡）"
     apply_mimic_conf_iface "$WAN_IFACE"
-    [[ "${ROLE:-}" == "forwarder" || "${ROLE:-}" == "relay" ]] && return 0
-
     local wg_iface; wg_iface="$(wg_iface_for "$PROFILE_ID")"
     local wg_path="${WG_CONF_DIR}/${wg_iface}.conf"
     backup_file "$wg_path"
-    if [[ "${ROLE:-}" == "server" ]]; then
-        render_wg_server_conf >"$wg_path"
-    else
-        render_wg_client_conf >"$wg_path"
-    fi
+    render_wg_conf >"$wg_path"
     chmod 600 "$wg_path"
+    write_tunnel_mimic_dropin "$PROFILE_ID" "$WAN_IFACE"
 }
 
-collect_nft_input_ports() {
+# Collect DNAT entries across enabled profiles+rules as TSV:
+#   daddr_match \t proto \t dport \t target_ip \t target_port \t tag
+# nat-transit: 客户端流量到 IX 虚拟IP:transit_port → DNAT 落地
+# nat-ingress: 客户端到 公网:client_port → DNAT IX虚拟IP:transit_port（经 WG）
+collect_dnat_entries() {
     local p
     for p in "$PROFILES_DIR"/*.env; do
         [[ -f "$p" ]] || continue
         (
             # shellcheck disable=SC1090
             source "$p"
-            [[ "${FW_OPEN_PORT:-true}" == "true" ]] || exit 0
-            if [[ "${ROLE:-}" == "server" ]]; then
-                printf '%s %s-server\n' "$WG_PORT" "$PROFILE_ID"
-            elif [[ "${ROLE:-}" == "forwarder" ]]; then
-                printf '%s %s-fwd\n' "$FORWARDER_LISTEN_PORT" "$PROFILE_ID"
-            elif [[ "${ROLE:-}" == "relay" ]]; then
-                printf '%s %s-relay\n' "$RELAY_LISTEN_PORT" "$PROFILE_ID"
+            [[ "${ENABLED:-true}" == "true" ]] || exit 0
+            local rid
+            for rid in $(list_rule_ids "$PROFILE_ID"); do
+                (
+                    load_rule "$PROFILE_ID" "$rid" || exit 0
+                    [[ "${RULE_ENABLED:-true}" == "true" ]] || exit 0
+                    if [[ "${ROLE:-}" == "nat-transit" ]]; then
+                        [[ -n "$TRANSIT_PORT" && -n "$LANDING_HOST" && -n "$LANDING_PORT" ]] || exit 0
+                        printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+                            "$WG_IX_IP" "${FORWARD_PROTO:-both}" "$TRANSIT_PORT" \
+                            "$LANDING_HOST" "$LANDING_PORT" "${PROFILE_ID}-${rid}"
+                    elif [[ "${ROLE:-}" == "nat-ingress" ]]; then
+                        [[ -n "${CLIENT_PORT:-}" && -n "$TRANSIT_PORT" ]] || exit 0
+                        printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+                            "-" "${FORWARD_PROTO:-both}" "$CLIENT_PORT" \
+                            "$WG_IX_IP" "$TRANSIT_PORT" "${PROFILE_ID}-${rid}"
+                    fi
+                )
+            done
+        )
+    done
+}
+
+# Collect input-open ports as TSV: tag \t port
+collect_input_ports() {
+    local p
+    for p in "$PROFILES_DIR"/*.env; do
+        [[ -f "$p" ]] || continue
+        (
+            # shellcheck disable=SC1090
+            source "$p"
+            [[ "${ENABLED:-true}" == "true" && "${FW_OPEN_PORT:-true}" == "true" ]] || exit 0
+            if [[ "${ROLE:-}" == "nat-transit" ]]; then
+                printf '%s\t%s\n' "${PROFILE_ID}-wg" "$WG_PORT"
+            elif [[ "${ROLE:-}" == "nat-ingress" ]]; then
+                local rid
+                for rid in $(list_rule_ids "$PROFILE_ID"); do
+                    (
+                        load_rule "$PROFILE_ID" "$rid" || exit 0
+                        [[ "${RULE_ENABLED:-true}" == "true" && -n "${CLIENT_PORT:-}" ]] || exit 0
+                        printf '%s\t%s\n' "${PROFILE_ID}-${rid}" "$CLIENT_PORT"
+                    )
+                done
             fi
         )
-    done | sort -u -k1,1
-}
-
-collect_forwarder_nat_rules() {
-    local p
-    for p in "$PROFILES_DIR"/*.env; do
-        [[ -f "$p" ]] || continue
-        (
-            # shellcheck disable=SC1090
-            source "$p"
-            [[ "${ROLE:-}" == "forwarder" ]] || exit 0
-            printf '%s %s %s udp %s\n' "$FORWARDER_LISTEN_PORT" "$SERVER_PUBLIC_IP" "$SERVER_WG_PORT" "$PROFILE_ID"
-        )
     done
 }
 
-collect_relay_nat_rules() {
-    local p
-    for p in "$PROFILES_DIR"/*.env; do
-        [[ -f "$p" ]] || continue
-        (
-            # shellcheck disable=SC1090
-            source "$p"
-            [[ "${ROLE:-}" == "relay" ]] || exit 0
-            printf '%s %s %s %s %s\n' \
-                "${RELAY_LISTEN_PORT:-}" "${RELAY_TARGET_HOST:-}" "${RELAY_TARGET_PORT:-}" \
-                "${FORWARD_PROTO:-both}" "$PROFILE_ID"
-        )
-    done
-}
-
-render_nft_dnat_rules() {
-    local rules="$1" tag_prefix="${2:-wm}"
-    local listen tip tport proto pid
-    while read -r listen tip tport proto pid; do
-        [[ -n "$listen" && -n "$tip" && -n "$tport" ]] || continue
+nft_emit_dnat() {
+    local entries="$1" daddr proto dport tip tport tag match
+    [[ -n "$entries" ]] || return 0
+    while IFS=$'\t' read -r daddr proto dport tip tport tag; do
+        [[ -n "$dport" && -n "$tip" && -n "$tport" ]] || continue
+        match=""
+        [[ "$daddr" != "-" && -n "$daddr" ]] && match="ip daddr ${daddr} "
         case "$proto" in
             tcp)
-                printf '        tcp dport %s counter dnat to %s:%s comment "%s-%s"\n' \
-                    "$listen" "$tip" "$tport" "$tag_prefix" "$pid"
-                ;;
+                printf '        %stcp dport %s counter dnat to %s:%s comment "wm-%s"\n' "$match" "$dport" "$tip" "$tport" "$tag" ;;
             udp)
-                printf '        udp dport %s counter dnat to %s:%s comment "%s-%s"\n' \
-                    "$listen" "$tip" "$tport" "$tag_prefix" "$pid"
-                ;;
-            both|*)
-                printf '        tcp dport %s counter dnat to %s:%s comment "%s-%s-tcp"\n' \
-                    "$listen" "$tip" "$tport" "$tag_prefix" "$pid"
-                printf '        udp dport %s counter dnat to %s:%s comment "%s-%s-udp"\n' \
-                    "$listen" "$tip" "$tport" "$tag_prefix" "$pid"
-                ;;
+                printf '        %sudp dport %s counter dnat to %s:%s comment "wm-%s"\n' "$match" "$dport" "$tip" "$tport" "$tag" ;;
+            *)
+                printf '        %stcp dport %s counter dnat to %s:%s comment "wm-%s-tcp"\n' "$match" "$dport" "$tip" "$tport" "$tag"
+                printf '        %sudp dport %s counter dnat to %s:%s comment "wm-%s-udp"\n' "$match" "$dport" "$tip" "$tport" "$tag" ;;
         esac
-    done <<<"$rules"
+    done <<<"$entries"
 }
 
-render_nft_postrouting_rules() {
-    local rules="$1" tag_prefix="${2:-wm}"
-    local listen tip tport proto pid
-    while read -r listen tip tport proto pid; do
+nft_emit_masq() {
+    local entries="$1" daddr proto dport tip tport tag
+    [[ -n "$entries" ]] || return 0
+    while IFS=$'\t' read -r daddr proto dport tip tport tag; do
         [[ -n "$tip" && -n "$tport" ]] || continue
         case "$proto" in
             tcp)
-                printf '        ip daddr %s tcp dport %s counter masquerade comment "%s-%s"\n' \
-                    "$tip" "$tport" "$tag_prefix" "$pid"
-                ;;
+                printf '        ip daddr %s tcp dport %s counter masquerade comment "wm-%s"\n' "$tip" "$tport" "$tag" ;;
             udp)
-                printf '        ip daddr %s udp dport %s counter masquerade comment "%s-%s"\n' \
-                    "$tip" "$tport" "$tag_prefix" "$pid"
-                ;;
-            both|*)
-                printf '        ip daddr %s tcp dport %s counter masquerade comment "%s-%s-tcp"\n' \
-                    "$tip" "$tport" "$tag_prefix" "$pid"
-                printf '        ip daddr %s udp dport %s counter masquerade comment "%s-%s-udp"\n' \
-                    "$tip" "$tport" "$tag_prefix" "$pid"
-                ;;
+                printf '        ip daddr %s udp dport %s counter masquerade comment "wm-%s"\n' "$tip" "$tport" "$tag" ;;
+            *)
+                printf '        ip daddr %s tcp dport %s counter masquerade comment "wm-%s-tcp"\n' "$tip" "$tport" "$tag"
+                printf '        ip daddr %s udp dport %s counter masquerade comment "wm-%s-udp"\n' "$tip" "$tport" "$tag" ;;
         esac
-    done <<<"$rules"
+    done <<<"$entries"
 }
 
-render_nft_forward_rules() {
-    local rules="$1" tag_prefix="${2:-wm}"
-    local listen tip tport proto pid
-    while read -r listen tip tport proto pid; do
-        [[ -n "$tip" && -n "$tport" ]] || continue
-        case "$proto" in
-            tcp)
-                printf '        ip daddr %s tcp dport %s accept comment "%s-%s"\n' "$tip" "$tport" "$tag_prefix" "$pid"
-                printf '        ip saddr %s tcp sport %s accept comment "%s-%s-r"\n' "$tip" "$tport" "$tag_prefix" "$pid"
-                ;;
-            udp)
-                printf '        ip daddr %s udp dport %s accept comment "%s-%s"\n' "$tip" "$tport" "$tag_prefix" "$pid"
-                printf '        ip saddr %s udp sport %s accept comment "%s-%s-r"\n' "$tip" "$tport" "$tag_prefix" "$pid"
-                ;;
-            both|*)
-                printf '        ip daddr %s tcp dport %s accept comment "%s-%s-tcp"\n' "$tip" "$tport" "$tag_prefix" "$pid"
-                printf '        ip saddr %s tcp sport %s accept comment "%s-%s-tcp-r"\n' "$tip" "$tport" "$tag_prefix" "$pid"
-                printf '        ip daddr %s udp dport %s accept comment "%s-%s-udp"\n' "$tip" "$tport" "$tag_prefix" "$pid"
-                printf '        ip saddr %s udp sport %s accept comment "%s-%s-udp-r"\n' "$tip" "$tport" "$tag_prefix" "$pid"
-                ;;
-        esac
-    done <<<"$rules"
+nft_emit_input() {
+    local inputs="$1" tag port
+    [[ -n "$inputs" ]] || return 0
+    while IFS=$'\t' read -r tag port; do
+        [[ -n "$port" ]] || continue
+        printf '        tcp dport %s counter accept comment "wm-%s-tcp"\n' "$port" "$tag"
+        printf '        udp dport %s counter accept comment "wm-%s-udp"\n' "$port" "$tag"
+    done <<<"$inputs"
 }
 
 render_nft_all() {
-    local ports fwd_rules relay_rules all_rules
-    ports="$(collect_nft_input_ports)"
-    fwd_rules="$(collect_forwarder_nat_rules)"
-    relay_rules="$(collect_relay_nat_rules)"
-    all_rules="$(printf '%s\n%s' "$fwd_rules" "$relay_rules" | sed '/^$/d')"
+    local entries inputs
+    entries="$(collect_dnat_entries)"
+    inputs="$(collect_input_ports)"
     {
         printf 'table inet %s {\n' "$NFT_TABLE"
-        if [[ -n "$all_rules" ]]; then
-            printf '    chain prerouting {\n'
-            printf '        type nat hook prerouting priority dstnat; policy accept;\n'
-            render_nft_dnat_rules "$all_rules"
-            printf '    }\n'
-            printf '    chain postrouting {\n'
-            printf '        type nat hook postrouting priority srcnat; policy accept;\n'
-            printf '        ip protocol tcp oifname "lo" return\n'
-            printf '        ip protocol udp oifname "lo" return\n'
-            render_nft_postrouting_rules "$all_rules"
-            printf '    }\n'
-            printf '    chain forward {\n'
-            printf '        type filter hook forward priority filter; policy accept;\n'
-            render_nft_forward_rules "$all_rules"
-            printf '    }\n'
-        fi
+        printf '    chain prerouting {\n'
+        printf '        type nat hook prerouting priority dstnat; policy accept;\n'
+        nft_emit_dnat "$entries"
+        printf '    }\n'
+        printf '    chain postrouting {\n'
+        printf '        type nat hook postrouting priority srcnat; policy accept;\n'
+        printf '        oifname "lo" return\n'
+        nft_emit_masq "$entries"
+        printf '    }\n'
+        printf '    chain forward {\n'
+        printf '        type filter hook forward priority filter; policy accept;\n'
+        printf '    }\n'
         printf '    chain input {\n'
         printf '        type filter hook input priority filter; policy accept;\n'
-        if [[ -n "$ports" ]]; then
-            while read -r port tag; do
-                [[ -n "$port" ]] || continue
-                printf '        tcp dport %s counter accept comment "wm-%s-tcp"\n' "$port" "$tag"
-                printf '        udp dport %s counter accept comment "wm-%s-udp"\n' "$port" "$tag"
-            done <<<"$ports"
-        fi
+        nft_emit_input "$inputs"
         printf '    }\n'
         printf '}\n'
     }
@@ -688,10 +644,6 @@ apply_nft_all() {
     rm -f "$tmp"
 }
 
-apply_nft_profile() {
-    apply_nft_all
-}
-
 # ── systemd ────────────────────────────────────────────────────────────────
 
 install_systemd_units() {
@@ -699,10 +651,9 @@ install_systemd_units() {
     tmp="$(mktemp)"
     cat >"$tmp" <<EOF
 [Unit]
-Description=wg-mimic-fabric Mimic on %%i for profile %i
+Description=wg-mimic-fabric Mimic on %i
 After=network-online.target
 Wants=network-online.target
-Before=wg-mimic-tunnel@%i.service
 
 [Service]
 Type=notify
@@ -719,12 +670,11 @@ EOF
     cat >"$tmp" <<'EOF'
 [Unit]
 Description=wg-mimic-fabric WireGuard tunnel %i
-After=wg-mimic-mimic@%i.service network-online.target
-Requires=wg-mimic-mimic@%i.service
+After=network-online.target
 Wants=network-online.target
 
 [Service]
-Type=onshot
+Type=oneshot
 RemainAfterExit=yes
 ExecStart=/usr/bin/wg-quick up /etc/wireguard/wm-%i.conf
 ExecStop=/usr/bin/wg-quick down /etc/wireguard/wm-%i.conf
@@ -737,63 +687,65 @@ EOF
     systemctl daemon-reload
 }
 
-# Note: mimic systemd uses iface name as %i, tunnel uses profile id as %i
-# We need aligned naming — use WAN_IFACE for mimic@ and profile for tunnel@
+# mimic@ is keyed by WAN_IFACE (one per nic, shared by lines); tunnel@ is keyed by
+# profile id. A per-profile drop-in binds each tunnel@<id> to its real mimic@<iface>
+# so boot ordering / Requires resolve to the correct unit instance.
+write_tunnel_mimic_dropin() {
+    local profile_id="$1" iface="$2"
+    [[ -n "$profile_id" && -n "$iface" ]] || return 0
+    local dir="/etc/systemd/system/wg-mimic-tunnel@${profile_id}.service.d"
+    local tmp; tmp="$(mktemp)"
+    cat >"$tmp" <<EOF
+[Unit]
+After=wg-mimic-mimic@${iface}.service
+Requires=wg-mimic-mimic@${iface}.service
+EOF
+    install -d -m 755 "$dir"
+    install -m 644 "$tmp" "${dir}/10-mimic-dep.conf"
+    rm -f "$tmp"
+    systemctl daemon-reload 2>/dev/null || true
+}
+
+remove_tunnel_mimic_dropin() {
+    local profile_id="$1"
+    [[ -n "$profile_id" ]] || return 0
+    rm -rf "/etc/systemd/system/wg-mimic-tunnel@${profile_id}.service.d" 2>/dev/null || true
+}
 
 start_profile() {
+    require_root
     load_profile "$1"
-    if [[ "${ROLE:-}" == "relay" ]]; then
-        local path; path="$(profile_env_path "$PROFILE_ID")"
-        if grep -q '^ENABLED=' "$path" 2>/dev/null; then
-            sed -i 's/^ENABLED=.*/ENABLED=true/' "$path"
-        fi
-        load_profile "$1"
-        if [[ "${RELAY_KIND:-}" == "ingress" ]]; then
-            ensure_mimic
-            apply_profile_configs
-            apply_nft_all
-            ensure_ip_forward
-            systemctl enable --now "wg-mimic-mimic@${WAN_IFACE}.service"
-            ok "已启动公网入口：${PROFILE_ID}（Mimic UDP→TCP :${RELAY_LISTEN_PORT:-?} → ${RELAY_TARGET_HOST:-?}:${RELAY_TARGET_PORT:-?}）"
-            return
-        fi
-        apply_nft_all
-        ensure_ip_forward
-        ok "已启动 IX 中转：${PROFILE_ID}（${RELAY_LISTEN_PORT:-?} → ${RELAY_TARGET_HOST:-?}:${RELAY_TARGET_PORT:-?}）"
-        return
-    fi
+    local path; path="$(profile_env_path "$PROFILE_ID")"
+    grep -q '^ENABLED=' "$path" 2>/dev/null && sed -i 's/^ENABLED=.*/ENABLED=true/' "$path"
+    load_profile "$1"
+    ensure_mimic
     apply_profile_configs
     apply_nft_all
-    [[ "${ROLE:-}" == "forwarder" ]] && ensure_ip_forward
+    ensure_ip_forward
     systemctl enable --now "wg-mimic-mimic@${WAN_IFACE}.service"
-    if [[ "${ROLE:-}" != "forwarder" ]]; then
-        systemctl enable --now "wg-mimic-tunnel@${PROFILE_ID}.service"
-    fi
+    systemctl enable --now "wg-mimic-tunnel@${PROFILE_ID}.service"
     ok "已启动线路：${PROFILE_ID} (${ROLE:-})"
+    if [[ "${ROLE:-}" == "nat-ingress" ]]; then
+        ok "客户端连接：${INGRESS_PUBLIC_HOST:-本机公网IP}:<client_port>（wm show-port-map ${PROFILE_ID}）"
+    fi
 }
 
 stop_profile() {
+    require_root
     load_profile "$1"
-    if [[ "${ROLE:-}" == "relay" ]]; then
-        local path; path="$(profile_env_path "$PROFILE_ID")"
-        if grep -q '^ENABLED=' "$path" 2>/dev/null; then
-            sed -i 's/^ENABLED=.*/ENABLED=false/' "$path"
-        else
-            printf 'ENABLED=false\n' >>"$path"
-        fi
-        apply_nft_all
-        if [[ "${RELAY_KIND:-}" == "ingress" && -n "${WAN_IFACE:-}" ]]; then
-            apply_mimic_conf_iface "$WAN_IFACE"
-            systemctl try-restart "wg-mimic-mimic@${WAN_IFACE}.service" 2>/dev/null \
-                || systemctl stop "wg-mimic-mimic@${WAN_IFACE}.service" 2>/dev/null || true
-        fi
-        ok "已停止 relay：${PROFILE_ID}"
-        return
+    local path; path="$(profile_env_path "$PROFILE_ID")"
+    if grep -q '^ENABLED=' "$path" 2>/dev/null; then
+        sed -i 's/^ENABLED=.*/ENABLED=false/' "$path"
+    else
+        printf 'ENABLED=false\n' >>"$path"
     fi
-    if [[ "${ROLE:-}" != "forwarder" ]]; then
-        systemctl stop "wg-mimic-tunnel@${PROFILE_ID}.service" 2>/dev/null || true
+    systemctl disable --now "wg-mimic-tunnel@${PROFILE_ID}.service" 2>/dev/null || true
+    apply_nft_all
+    if [[ -n "${WAN_IFACE:-}" ]]; then
+        apply_mimic_conf_iface "$WAN_IFACE"
+        systemctl try-restart "wg-mimic-mimic@${WAN_IFACE}.service" 2>/dev/null \
+            || systemctl stop "wg-mimic-mimic@${WAN_IFACE}.service" 2>/dev/null || true
     fi
-    systemctl stop "wg-mimic-mimic@${WAN_IFACE}.service" 2>/dev/null || true
     ok "已停止线路：${PROFILE_ID}"
 }
 
@@ -811,154 +763,312 @@ prompt() {
     printf -v "$var" '%s' "$(trim "$val")"
 }
 
-create_server_interactive() {
-    die "已移除。请在 IX 机执行：wm create-transit"
-}
-
-create_forwarder_interactive() {
-    die "已移除。请使用 IX 中转 + 公网入口接入码流程（wm create-transit / import-transit-code）"
-}
-
-import_code_interactive() {
-    die "已移除。公网入口请使用：wm import-transit-code"
-}
-
 create_transit_interactive() {
     require_root
     ensure_dirs
     command_exists nft || die "需要 nftables，请 apt install nftables"
+    command_exists wg || die "需要 wireguard-tools，请 apt install wireguard-tools"
 
-    local profile_id listen_port reach_host target_host target_port forward_proto code
-    prompt profile_id "IX 中转线路 ID" "ix-transit"
+    local profile_id endpoint_host wg_port wg_mtu ix_public_ip wan_iface
+    local subnet ix_ip ingress_ip transit_port landing_host landing_port proto
+    prompt profile_id "IX 中转线路 ID" "ix-nat"
     profile_id="$(sanitize_id "$profile_id")"
     [[ ! -f "$(profile_env_path "$profile_id")" ]] || die "线路已存在：$profile_id"
 
-    prompt_port listen_port "IX 中转监听端口（入口机将转发到此口）" "40000"
-    prompt reach_host "IX 机对入口可达的 IP（IX 网段 IP）"
-    [[ -n "$reach_host" ]] || die "IX 可达 IP 不能为空"
+    ix_public_ip="$(detect_public_ipv4)"
+    [[ -n "$ix_public_ip" ]] && info "检测到本机公网 IPv4：${ix_public_ip}"
+    prompt endpoint_host "公网入口可达的 IX 地址（域名或IP）" "${ix_public_ip:-}"
+    [[ -n "$endpoint_host" ]] || die "IX 可达地址不能为空"
+    prompt ix_public_ip "IX 本机公网 IP（Mimic local 绑定）" "${ix_public_ip:-$endpoint_host}"
+    prompt_port wg_port "WireGuard 监听端口（Mimic 伪 TCP 绑定）" "51820"
+    prompt wg_mtu "WG 隧道 MTU" "1420"
+    validate_mtu "$wg_mtu"
+    wan_iface="$(detect_default_iface)"
+    prompt wan_iface "Mimic 绑定网卡" "${wan_iface:-eth0}"
 
-    prompt target_host "落地 IP"
-    [[ -n "$target_host" ]] || die "落地 IP 不能为空"
-    prompt_port target_port "落地端口"
-    prompt forward_proto "协议 tcp / udp / both" "both"
-    case "$forward_proto" in
-        tcp|udp|both) ;;
-        *) die "协议必须是 tcp、udp 或 both" ;;
-    esac
+    prompt subnet "组网网段" "$(default_mesh_subnet)"
+    prompt ix_ip "IX 虚拟 IP" "$(default_ix_ip)"
+    prompt ingress_ip "公网入口虚拟 IP" "$(default_ingress_ip)"
+    validate_ipv4 "$ix_ip" || die "IX 虚拟 IP 非法"
+    validate_ipv4 "$ingress_ip" || die "入口虚拟 IP 非法"
+
+    info "首条转发规则："
+    prompt_port transit_port "中转端口（IX 虚拟IP 上的端口）" "40000"
+    prompt landing_host "落地 IP/域名"
+    [[ -n "$landing_host" ]] || die "落地地址不能为空"
+    prompt_port landing_port "落地端口"
+    prompt proto "协议 tcp / udp / both" "both"
+    validate_proto "$proto" || die "协议必须是 tcp、udp 或 both"
+
+    local ix_priv ix_pub ing_priv ing_pub ing_priv_b64
+    ix_priv="$(wg_genkey)"; ix_pub="$(wg_pubkey_of "$ix_priv")"
+    ing_priv="$(wg_genkey)"; ing_pub="$(wg_pubkey_of "$ing_priv")"
+    ing_priv_b64="$(printf '%s' "$ing_priv" | base64url_encode)"
 
     write_profile_kv "$(profile_env_path "$profile_id")" \
         "PROFILE_ID=${profile_id}" \
         "PROFILE_NAME=${profile_id}" \
-        "ROLE=relay" \
-        "RELAY_KIND=transit" \
+        "ROLE=nat-transit" \
         "ENABLED=true" \
-        "RELAY_LISTEN_PORT=${listen_port}" \
-        "TRANSIT_REACH_HOST=${reach_host}" \
-        "RELAY_TARGET_HOST=${target_host}" \
-        "RELAY_TARGET_PORT=${target_port}" \
-        "FORWARD_PROTO=${forward_proto}" \
+        "WAN_IFACE=${wan_iface}" \
+        "WG_MESH_SUBNET=${subnet}" \
+        "WG_IX_IP=${ix_ip}" \
+        "WG_INGRESS_IP=${ingress_ip}" \
+        "WG_PORT=${wg_port}" \
+        "WG_MTU=${wg_mtu}" \
+        "IX_ENDPOINT_HOST=${endpoint_host}" \
+        "IX_PUBLIC_IP=${ix_public_ip}" \
+        "WG_PRIVATE_KEY=${ix_priv}" \
+        "WG_PUBLIC_KEY=${ix_pub}" \
+        "WG_PEER_PUBLIC_KEY=${ing_pub}" \
+        "INGRESS_PRIVKEY_B64=${ing_priv_b64}" \
+        "FORWARD_PROTO=${proto}" \
+        "MIMIC_KEEPALIVE=300:::" \
+        "MIMIC_XDP_MODE=" \
         "FW_OPEN_PORT=true"
+
+    write_rule "$profile_id" "rule-main" \
+        "RULE_ID=rule-main" \
+        "RULE_NOTE=默认转发" \
+        "RULE_ENABLED=true" \
+        "TRANSIT_PORT=${transit_port}" \
+        "LANDING_HOST=${landing_host}" \
+        "LANDING_PORT=${landing_port}" \
+        "FORWARD_PROTO=${proto}"
 
     load_profile "$profile_id"
     apply_nft_all
     ensure_ip_forward
 
-    code="$(generate_transit_code)"
+    local code
+    code="$(generate_code)"
     printf '%s\n' "$code" >"${CODES_DIR}/${profile_id}.code"
     chmod 600 "${CODES_DIR}/${profile_id}.code"
 
-    printf '\n═══ IX 中转接入码（复制到公网入口机）═══\n'
+    printf '\n═══ IX 接入码（复制到公网入口机）═══\n'
     printf '%s\n' "$code"
     printf '════════════════════════════════════════════\n'
-    printf '公网入口：wm import-transit-code 粘贴上方接入码\n'
+    printf '公网入口：wm import-code 粘贴上方接入码\n'
     printf 'IX 机启动：wm start %s\n' "$profile_id"
-    printf '（IX→落地为纯 UDP/TCP 转发，无需 mimic）\n'
 }
 
-import_transit_code_interactive() {
+import_code_interactive() {
     require_root
     ensure_dirs
     command_exists nft || die "需要 nftables"
+    command_exists wg || die "需要 wireguard-tools"
     install_mimic_packages || die "公网入口需要 mimic（UDP 伪装 TCP）"
     ensure_mimic_kmod_loaded || warn "mimic 内核模块未加载，请 reboot 或安装 linux-headers-\$(uname -r)"
 
-    local code json profile_id transit_id listen_port reach_host tport proto
-    local target_host target_port ingress_id public_ip wan_iface
-    printf '请粘贴 WMGF1: IX 中转接入码：' >&2
+    local code ingress_id wan_iface public_ip ing_priv ing_pub
+    printf '请粘贴 WMGF1: IX 接入码：' >&2
     read -r code </dev/tty
     code="$(trim "$code")"
-    json="$(parse_transit_code "$code")"
+    parse_code "$code"
 
-    transit_id="$(json_get "$json" profile_id)"
-    reach_host="$(json_get "$json" transit_reach_host)"
-    tport="$(json_get "$json" transit_listen_port)"
-    target_host="$(json_get "$json" landing_host)"
-    target_port="$(json_get "$json" landing_port)"
-    proto="$(json_get "$json" forward_proto)"
+    ingress_id="${CODE_PROFILE_ID}-ingress"
+    [[ ! -f "$(profile_env_path "$ingress_id")" ]] || die "入口线路已存在：$ingress_id（可先 wm stop 后删除）"
 
-    ingress_id="${transit_id}-ingress"
-    [[ ! -f "$(profile_env_path "$ingress_id")" ]] || die "入口线路已存在：$ingress_id（可先 wm stop 后删除配置）"
+    ing_priv="$(printf '%s' "$CODE_INGRESS_PRIVKEY_B64" | base64url_decode)"
+    ing_pub="$(wg_pubkey_of "$ing_priv")"
 
     public_ip="$(detect_public_ipv4)"
-    [[ -n "$public_ip" ]] && info "检测到公网 IPv4：${public_ip}"
-
-    printf '\n── 接入码摘要 ──\n'
-    printf '  IX 中转: %s:%s\n' "$reach_host" "$tport"
-    printf '  落地: %s:%s (%s)\n\n' "$target_host" "$target_port" "$proto"
-
-    prompt_port listen_port "公网入口端口（客户端 Mimic 连此口）" "30000"
-
-    public_ip="$(detect_public_ipv4)"
-    [[ -n "$public_ip" ]] || prompt public_ip "公网 IPv4（Mimic filter local=）"
-    [[ -n "$public_ip" ]] || die "公网 IP 不能为空"
-
+    [[ -n "$public_ip" ]] || prompt public_ip "公网 IPv4（客户端连接地址）"
     wan_iface="$(detect_default_iface)"
     prompt wan_iface "Mimic 绑定网卡" "${wan_iface:-eth0}"
+
+    printf '\n── 接入码摘要 ──\n'
+    printf '  IX 端点: %s:%s\n' "$CODE_IX_ENDPOINT_HOST" "$CODE_WG_PORT"
+    printf '  组网: 入口 %s ⇄ IX %s\n\n' "$CODE_INGRESS_WG_IP" "$CODE_IX_WG_IP"
 
     write_profile_kv "$(profile_env_path "$ingress_id")" \
         "PROFILE_ID=${ingress_id}" \
         "PROFILE_NAME=${ingress_id}" \
-        "ROLE=relay" \
-        "RELAY_KIND=ingress" \
+        "ROLE=nat-ingress" \
         "ENABLED=true" \
         "WAN_IFACE=${wan_iface}" \
         "INGRESS_PUBLIC_HOST=${public_ip}" \
-        "RELAY_LISTEN_PORT=${listen_port}" \
-        "RELAY_TARGET_HOST=${reach_host}" \
-        "RELAY_TARGET_PORT=${tport}" \
-        "FORWARD_PROTO=${proto}" \
-        "REMOTE_TRANSIT_PROFILE_ID=${transit_id}" \
-        "MIMIC_KEEPALIVE=300:::" \
+        "WG_MESH_SUBNET=${CODE_WG_MESH_SUBNET}" \
+        "WG_IX_IP=${CODE_IX_WG_IP}" \
+        "WG_INGRESS_IP=${CODE_INGRESS_WG_IP}" \
+        "WG_PORT=${CODE_WG_PORT}" \
+        "WG_MTU=${CODE_WG_MTU}" \
+        "IX_ENDPOINT_HOST=${CODE_IX_ENDPOINT_HOST}" \
+        "WG_PRIVATE_KEY=${ing_priv}" \
+        "WG_PUBLIC_KEY=${ing_pub}" \
+        "WG_PEER_PUBLIC_KEY=${CODE_IX_WG_PUBKEY}" \
+        "FORWARD_PROTO=${CODE_FORWARD_PROTO}" \
+        "MIMIC_KEEPALIVE=${CODE_MIMIC_KEEPALIVE:-300:::}" \
         "MIMIC_XDP_MODE=native" \
         "FW_OPEN_PORT=true"
+
+    local client_port=30000 rid note tport lhost lport rproto
+    while IFS=$'\t' read -r rid note tport lhost lport rproto; do
+        [[ -n "$rid" ]] || continue
+        prompt_port client_port "规则 ${rid}（${note:-}）客户端入口端口" "$client_port"
+        write_rule "$ingress_id" "$rid" \
+            "RULE_ID=${rid}" \
+            "RULE_NOTE=${note}" \
+            "RULE_ENABLED=true" \
+            "TRANSIT_PORT=${tport}" \
+            "LANDING_HOST=${lhost}" \
+            "LANDING_PORT=${lport}" \
+            "FORWARD_PROTO=${rproto:-both}" \
+            "CLIENT_PORT=${client_port}"
+        client_port=$((client_port + 1))
+    done <<<"$CODE_RULES_TSV"
 
     load_profile "$ingress_id"
     apply_nft_all
     ensure_ip_forward
 
     printf '\n═══ 公网入口已配置 ═══\n'
-    printf '客户端 Mimic → %s:%s（伪 TCP）\n' "$public_ip" "$listen_port"
-    printf 'Mimic 解包后转发: → %s:%s → 落地 %s:%s\n' \
-        "$reach_host" "$tport" "$target_host" "$target_port"
+    show_port_map "$ingress_id"
     printf '\n执行：wm start %s\n' "$ingress_id"
-    printf 'Intel 网卡丢包可改 MIMIC_XDP_MODE=skb\n'
 }
 
-set_server_peer() {
-    local profile_id="$1" peer_pub="$2"
+regenerate_code_if_transit() {
+    [[ "${ROLE:-}" == "nat-transit" ]] || return 0
+    local code; code="$(generate_code)"
+    printf '%s\n' "$code" >"${CODES_DIR}/${PROFILE_ID}.code"
+    chmod 600 "${CODES_DIR}/${PROFILE_ID}.code"
+    info "接入码已更新（公网入口需重新 import-code）"
+}
+
+show_port_map() {
+    local id; id="$(resolve_profile_id "${1:-}")"
+    load_profile "$id"
+    local rid
+    printf '端口地图 — %s (%s)\n' "$PROFILE_ID" "${ROLE:-}"
+    for rid in $(list_rule_ids "$PROFILE_ID"); do
+        (
+            load_rule "$PROFILE_ID" "$rid" || exit 0
+            if [[ "${ROLE:-}" == "nat-ingress" ]]; then
+                printf '  [%s] %s:%s → IX %s:%s → 落地 %s:%s (%s)\n' \
+                    "${RULE_NOTE:-$rid}" "${INGRESS_PUBLIC_HOST:-公网IP}" "${CLIENT_PORT:-?}" \
+                    "$WG_IX_IP" "$TRANSIT_PORT" "$LANDING_HOST" "$LANDING_PORT" "${FORWARD_PROTO:-both}"
+            else
+                printf '  [%s] IX %s:%s → 落地 %s:%s (%s)\n' \
+                    "${RULE_NOTE:-$rid}" "$WG_IX_IP" "$TRANSIT_PORT" "$LANDING_HOST" "$LANDING_PORT" "${FORWARD_PROTO:-both}"
+            fi
+        )
+    done
+}
+
+list_rules() {
+    local id; id="$(resolve_profile_id "${1:-}")"
+    load_profile "$id"
+    local rid
+    printf '线路 %s (%s) 规则：\n' "$PROFILE_ID" "${ROLE:-}"
+    [[ -n "$(list_rule_ids "$PROFILE_ID")" ]] || { printf '  (无规则)\n'; return; }
+    for rid in $(list_rule_ids "$PROFILE_ID"); do
+        (
+            load_rule "$PROFILE_ID" "$rid" || exit 0
+            if [[ "${ROLE:-}" == "nat-ingress" ]]; then
+                printf '  %s [%s] %s  入口:%s → IX:%s → %s:%s (%s)\n' \
+                    "$RULE_ID" "${RULE_ENABLED:-true}" "${RULE_NOTE:-}" \
+                    "${CLIENT_PORT:-?}" "$TRANSIT_PORT" "$LANDING_HOST" "$LANDING_PORT" "${FORWARD_PROTO:-both}"
+            else
+                printf '  %s [%s] %s  IX:%s → %s:%s (%s)\n' \
+                    "$RULE_ID" "${RULE_ENABLED:-true}" "${RULE_NOTE:-}" \
+                    "$TRANSIT_PORT" "$LANDING_HOST" "$LANDING_PORT" "${FORWARD_PROTO:-both}"
+            fi
+        )
+    done
+}
+
+add_rule() {
+    local id; id="$(resolve_profile_id "${1:-}")"
     require_root
-    load_profile "$profile_id"
-    [[ "${ROLE:-}" == "server" ]] || die "仅服务端线路可 set-peer"
-    WG_PEER_PUBLIC_KEY="$peer_pub"
-    sed -i "s/^WG_PEER_PUBLIC_KEY=.*/WG_PEER_PUBLIC_KEY=${peer_pub}/" "$(profile_env_path "$profile_id")"
-    apply_profile_configs
-    local wg_iface; wg_iface="$(wg_iface_for "$PROFILE_ID")"
-    if systemctl is-active --quiet "wg-mimic-tunnel@${PROFILE_ID}.service" 2>/dev/null; then
-        local allowed="${WG_CLIENT_IPV4}"
-        [[ -n "${WG_CLIENT_IPV6:-}" ]] && allowed="${allowed}, ${WG_CLIENT_IPV6}"
-        wg set "$wg_iface" peer "$peer_pub" allowed-ips "$allowed" 2>/dev/null || true
+    load_profile "$id"
+    local rid note transit_port landing_host landing_port proto client_port
+    rid="$(generate_unique_rule_id "$PROFILE_ID" "rule")"
+    prompt note "规则备注" "$rid"
+    prompt_port transit_port "中转端口（IX 虚拟IP）" "40001"
+    prompt landing_host "落地 IP/域名"
+    [[ -n "$landing_host" ]] || die "落地地址不能为空"
+    prompt_port landing_port "落地端口"
+    prompt proto "协议 tcp/udp/both" "${FORWARD_PROTO:-both}"
+    validate_proto "$proto" || die "协议非法"
+    local kv=( "RULE_ID=${rid}" "RULE_NOTE=${note}" "RULE_ENABLED=true" \
+        "TRANSIT_PORT=${transit_port}" "LANDING_HOST=${landing_host}" \
+        "LANDING_PORT=${landing_port}" "FORWARD_PROTO=${proto}" )
+    if [[ "${ROLE:-}" == "nat-ingress" ]]; then
+        prompt_port client_port "客户端入口端口" "30001"
+        kv+=( "CLIENT_PORT=${client_port}" )
     fi
-    ok "已更新服务端 peer 公钥"
+    write_rule "$PROFILE_ID" "$rid" "${kv[@]}"
+    apply_nft_all
+    regenerate_code_if_transit
+    ok "已新增规则 ${rid}"
+}
+
+edit_rule() {
+    local id rid; id="$(resolve_profile_id "${1:-}")"; rid="$(sanitize_id "${2:-}")"
+    require_root
+    [[ -n "${2:-}" ]] || die "用法: wm edit-rule <线路> <规则ID>"
+    load_profile "$id"
+    load_rule "$PROFILE_ID" "$rid" || die "规则不存在：$rid"
+    local note transit_port landing_host landing_port proto client_port
+    prompt note "规则备注" "${RULE_NOTE:-$rid}"
+    prompt_port transit_port "中转端口" "${TRANSIT_PORT}"
+    prompt landing_host "落地 IP/域名" "${LANDING_HOST}"
+    prompt_port landing_port "落地端口" "${LANDING_PORT}"
+    prompt proto "协议 tcp/udp/both" "${FORWARD_PROTO:-both}"
+    validate_proto "$proto" || die "协议非法"
+    local kv=( "RULE_ID=${rid}" "RULE_NOTE=${note}" "RULE_ENABLED=${RULE_ENABLED:-true}" \
+        "TRANSIT_PORT=${transit_port}" "LANDING_HOST=${landing_host}" \
+        "LANDING_PORT=${landing_port}" "FORWARD_PROTO=${proto}" )
+    if [[ "${ROLE:-}" == "nat-ingress" ]]; then
+        prompt_port client_port "客户端入口端口" "${CLIENT_PORT:-30000}"
+        kv+=( "CLIENT_PORT=${client_port}" )
+    fi
+    write_rule "$PROFILE_ID" "$rid" "${kv[@]}"
+    apply_nft_all
+    regenerate_code_if_transit
+    ok "已更新规则 ${rid}"
+}
+
+delete_rule() {
+    local id rid; id="$(resolve_profile_id "${1:-}")"; rid="$(sanitize_id "${2:-}")"
+    require_root
+    [[ -n "${2:-}" ]] || die "用法: wm delete-rule <线路> <规则ID>"
+    load_profile "$id"
+    local p; p="$(rule_env_path "$PROFILE_ID" "$rid")"
+    [[ -f "$p" ]] || die "规则不存在：$rid"
+    rm -f "$p"
+    apply_nft_all
+    regenerate_code_if_transit
+    ok "已删除规则 ${rid}"
+}
+
+set_rule_enabled() {
+    local id rid val; id="$(resolve_profile_id "${1:-}")"; rid="$(sanitize_id "${2:-}")"; val="$3"
+    require_root
+    [[ -n "${2:-}" ]] || die "用法: wm enable-rule/disable-rule <线路> <规则ID>"
+    load_profile "$id"
+    local p; p="$(rule_env_path "$PROFILE_ID" "$rid")"
+    [[ -f "$p" ]] || die "规则不存在：$rid"
+    if grep -q '^RULE_ENABLED=' "$p"; then
+        sed -i "s/^RULE_ENABLED=.*/RULE_ENABLED=${val}/" "$p"
+    else
+        printf 'RULE_ENABLED=%s\n' "$val" >>"$p"
+    fi
+    apply_nft_all
+    regenerate_code_if_transit
+    ok "规则 ${rid} enabled=${val}"
+}
+
+enable_rule()  { set_rule_enabled "$1" "$2" "true"; }
+disable_rule() { set_rule_enabled "$1" "$2" "false"; }
+
+apply_rules() {
+    local id; id="$(resolve_profile_id "${1:-}")"
+    require_root
+    load_profile "$id"
+    apply_nft_all
+    ensure_ip_forward
+    ok "已重建 nft 规则：${PROFILE_ID}"
 }
 
 # ── health / diagnose ──────────────────────────────────────────────────────
@@ -969,41 +1079,15 @@ health_profile() {
     local status="healthy" wg_iface; wg_iface="$(wg_iface_for "$PROFILE_ID")"
 
     printf '线路: %s (%s)\n' "$PROFILE_ID" "${ROLE:-unknown}"
-    if [[ "${ROLE:-}" == "relay" ]]; then
-        printf 'Relay [%s]: listen %s (%s) → %s:%s\n' \
-            "${RELAY_KIND:-relay}" "${RELAY_LISTEN_PORT:-?}" "${FORWARD_PROTO:-both}" \
-            "${RELAY_TARGET_HOST:-?}" "${RELAY_TARGET_PORT:-?}"
-        [[ "$(sysctl -n net.ipv4.ip_forward 2>/dev/null)" == "1" ]] && printf 'IP forward: on\n' || { printf 'IP forward: off\n'; status="degraded"; }
-        if [[ "${RELAY_KIND:-}" == "ingress" && -n "${INGRESS_PUBLIC_HOST:-}" ]]; then
-            printf '客户端入口: %s:%s\n' "$INGRESS_PUBLIC_HOST" "${RELAY_LISTEN_PORT:-?}"
-        fi
-        [[ "${ENABLED:-true}" == "true" ]] && printf 'Relay: active\n' || { printf 'Relay: disabled\n'; status="degraded"; }
-        if [[ "${RELAY_KIND:-}" == "ingress" ]]; then
-            if command_exists mimic; then
-                if systemctl is-active --quiet "wg-mimic-mimic@${WAN_IFACE}.service" 2>/dev/null; then
-                    printf 'Mimic: active (%s, UDP→TCP)\n' "$WAN_IFACE"
-                else
-                    printf 'Mimic: inactive\n'; status="degraded"
-                fi
-            else
-                printf 'Mimic: not installed\n'; status="degraded"
-            fi
-        else
-            printf 'Mimic: N/A（IX 段纯转发）\n'
-        fi
-        printf 'WireGuard: N/A\n'
-        printf 'HEALTH_STATUS=%s\n' "$status"
-        return
-    elif [[ "${ROLE:-}" == "forwarder" ]]; then
-        printf '监听: UDP %s → %s:%s\n' "${FORWARDER_LISTEN_PORT:-?}" "${SERVER_PUBLIC_IP:-?}" "${SERVER_WG_PORT:-?}"
-    else
-        printf 'IP=%s  网卡: %s  端口: %s  MTU: %s\n' "${IP_VERSION:-4}" "$WAN_IFACE" "${WG_PORT:-?}" "${WG_MTU:-?}"
-        [[ -n "${WG_SERVER_IPV6:-}${WG_CLIENT_IPV6:-}" ]] && printf 'IPv6: %s\n' "${WG_SERVER_IPV6:-${WG_CLIENT_IPV6}}"
-    fi
+    printf '组网: 入口 %s ⇄ IX %s  端口 %s  MTU %s\n' \
+        "${WG_INGRESS_IP:-?}" "${WG_IX_IP:-?}" "${WG_PORT:-?}" "${WG_MTU:-?}"
+    [[ "${ROLE:-}" == "nat-ingress" && -n "${INGRESS_PUBLIC_HOST:-}" ]] && \
+        printf '客户端入口: %s\n' "$INGRESS_PUBLIC_HOST"
+    [[ "${ENABLED:-true}" == "true" ]] && printf '线路: enabled\n' || { printf '线路: disabled\n'; status="degraded"; }
 
     if command_exists mimic; then
         if systemctl is-active --quiet "wg-mimic-mimic@${WAN_IFACE}.service" 2>/dev/null; then
-            printf 'Mimic: active (%s)\n' "$WAN_IFACE"
+            printf 'Mimic: active (%s, UDP→TCP)\n' "$WAN_IFACE"
         else
             printf 'Mimic: inactive\n'; status="degraded"
         fi
@@ -1011,40 +1095,32 @@ health_profile() {
         printf 'Mimic: not installed\n'; status="degraded"
     fi
 
-    if [[ "${ROLE:-}" == "forwarder" ]]; then
-        [[ "$(sysctl -n net.ipv4.ip_forward 2>/dev/null)" == "1" ]] && printf 'IP forward: on\n' || { printf 'IP forward: off\n'; status="degraded"; }
-        printf 'WireGuard: N/A (forwarder 模式)\n'
-    elif systemctl is-active --quiet "wg-mimic-tunnel@${PROFILE_ID}.service" 2>/dev/null; then
+    if systemctl is-active --quiet "wg-mimic-tunnel@${PROFILE_ID}.service" 2>/dev/null; then
         printf 'WireGuard: active (%s)\n' "$wg_iface"
         wg show "$wg_iface" 2>/dev/null | sed 's/^/  /' || true
     else
         printf 'WireGuard: inactive\n'; status="degraded"
     fi
 
+    [[ "$(sysctl -n net.ipv4.ip_forward 2>/dev/null)" == "1" ]] && printf 'IP forward: on\n' || { printf 'IP forward: off\n'; status="degraded"; }
+    printf '规则数: %s\n' "$(list_rule_ids "$PROFILE_ID" | grep -c . || true)"
     printf 'HEALTH_STATUS=%s\n' "$status"
 }
 
 diagnose_profile() {
-    local id; id="$(resolve_profile_id "${1:-}")"
+    local id line; id="$(resolve_profile_id "${1:-}")"
     load_profile "$id"
     printf '=== OS compatibility ===\n'
     compat_os_report | while IFS= read -r line; do printf '  %s\n' "$line"; done
     printf '=== preflight ===\n'
-    if [[ "${ROLE:-}" == "relay" ]]; then
-        command_exists nft && ok "nftables" || warn "缺少 nftables"
-        [[ "$(sysctl -n net.ipv4.ip_forward 2>/dev/null)" == "1" ]] && ok "ip_forward" || warn "ip_forward 未开启"
-    else
-        if [[ "${ROLE:-}" != "forwarder" ]]; then
-            command_exists wg && ok "wireguard-tools" || warn "缺少 wireguard-tools"
-        fi
-        command_exists mimic && ok "mimic CLI" || warn "缺少 mimic"
-        lsmod 2>/dev/null | grep -q '^mimic ' && ok "mimic kernel module" || warn "mimic 内核模块未加载"
-        if kernel_ge_61; then
-            ok "kernel >= 6.1 ($(uname -r))"
-        else
-            warn "kernel < 6.1 ($(uname -r))"
-        fi
-        [[ -f /sys/kernel/btf/vmlinux ]] && ok "BTF vmlinux" || warn "无 BTF（OpenWrt/精简内核可能需 kprobe 模式编 mimic）"
+    command_exists nft && ok "nftables" || warn "缺少 nftables"
+    command_exists wg && ok "wireguard-tools" || warn "缺少 wireguard-tools"
+    command_exists mimic && ok "mimic CLI" || warn "缺少 mimic"
+    lsmod 2>/dev/null | grep -q '^mimic ' && ok "mimic kernel module" || warn "mimic 内核模块未加载"
+    if kernel_ge_61; then ok "kernel >= 6.1 ($(uname -r))"; else warn "kernel < 6.1 ($(uname -r))"; fi
+    [[ -f /sys/kernel/btf/vmlinux ]] && ok "BTF vmlinux" || warn "无 BTF（精简内核可能需 kprobe 编 mimic）"
+    [[ "$(sysctl -n net.ipv4.ip_forward 2>/dev/null)" == "1" ]] && ok "ip_forward" || warn "ip_forward 未开启"
+    if [[ -n "${WAN_IFACE:-}" && -f "${MIMIC_CONF_DIR}/${WAN_IFACE}.conf" ]]; then
         mimic run --check -F "${MIMIC_CONF_DIR}/${WAN_IFACE}.conf" "$WAN_IFACE" 2>&1 | sed 's/^/  /' || warn "mimic --check 失败"
     fi
     health_profile "$id"
@@ -1105,12 +1181,11 @@ EOF
 show_code() {
     local id; id="$(resolve_profile_id "${1:-}")"
     load_profile "$id"
-    [[ "${ROLE:-}" == "relay" && "${RELAY_KIND:-}" == "transit" ]] \
-        || die "仅 IX 中转线路可 show-code（wm create-transit）"
+    [[ "${ROLE:-}" == "nat-transit" ]] || die "仅 IX(nat-transit) 线路可 show-code"
     if [[ -f "${CODES_DIR}/${PROFILE_ID}.code" ]]; then
         cat "${CODES_DIR}/${PROFILE_ID}.code"
     else
-        generate_transit_code | tee "${CODES_DIR}/${PROFILE_ID}.code"
+        generate_code | tee "${CODES_DIR}/${PROFILE_ID}.code"
         chmod 600 "${CODES_DIR}/${PROFILE_ID}.code"
     fi
 }
@@ -1119,11 +1194,22 @@ refresh_code() {
     local id; id="$(resolve_profile_id "${1:-}")"
     require_root
     load_profile "$id"
-    [[ "${ROLE:-}" == "relay" && "${RELAY_KIND:-}" == "transit" ]] \
-        || die "仅 IX 中转线路可 refresh-code"
-    generate_transit_code | tee "${CODES_DIR}/${PROFILE_ID}.code"
+    [[ "${ROLE:-}" == "nat-transit" ]] || die "仅 IX(nat-transit) 线路可 refresh-code"
+    local ing_priv ing_pub ing_priv_b64 path
+    ing_priv="$(wg_genkey)"; ing_pub="$(wg_pubkey_of "$ing_priv")"
+    ing_priv_b64="$(printf '%s' "$ing_priv" | base64url_encode)"
+    path="$(profile_env_path "$PROFILE_ID")"
+    sed -i "s|^WG_PEER_PUBLIC_KEY=.*|WG_PEER_PUBLIC_KEY=${ing_pub}|" "$path"
+    if grep -q '^INGRESS_PRIVKEY_B64=' "$path"; then
+        sed -i "s|^INGRESS_PRIVKEY_B64=.*|INGRESS_PRIVKEY_B64=${ing_priv_b64}|" "$path"
+    else
+        printf 'INGRESS_PRIVKEY_B64=%s\n' "$ing_priv_b64" >>"$path"
+    fi
+    load_profile "$id"
+    apply_profile_configs
+    generate_code | tee "${CODES_DIR}/${PROFILE_ID}.code"
     chmod 600 "${CODES_DIR}/${PROFILE_ID}.code"
-    ok "已刷新接入码（公网入口需重新 import-transit-code）"
+    ok "已刷新接入码与入口密钥（公网入口需重新 import-code）"
 }
 
 set_profile_mtu() {
@@ -1508,6 +1594,7 @@ uninstall_wm_core() {
     for id in "${ids[@]}"; do
         wg_iface="$(wg_iface_for "$id")"
         systemctl disable "wg-mimic-tunnel@${id}.service" 2>/dev/null || true
+        remove_tunnel_mimic_dropin "$id"
         load_profile "$id" 2>/dev/null && ifaces+=("$WAN_IFACE") || true
         if [[ "$remove_configs" == "true" ]]; then
             rm -f "${WG_CONF_DIR}/${wg_iface}.conf"
@@ -1591,26 +1678,35 @@ WRAP
 
 usage() {
     cat <<EOF
-wg-mimic-fabric ${SCRIPT_VERSION} — 公网入口 / IX 中转 / 落地 端口转发编排
+wg-mimic-fabric ${SCRIPT_VERSION} — 公网入口 ⇄ IX WireGuard 组网 + Mimic 伪 TCP + nft 转发
 
 用法:
   wm                              交互菜单
   wm --version
-  wm create-transit               IX 机：创建中转线路并生成接入码
-  wm import-transit-code          公网入口：粘贴 IX 接入码并配置转发
-  wm start|stop|restart <ID>      启停线路
-  wm show-code <ID>               显示 IX 接入码
-  wm refresh-code <ID>            刷新 IX 接入码
+  wm create-transit               IX 机：创建组网线路+首条规则并生成接入码
+  wm import-code                  公网入口：粘贴接入码，自动组网与转发
+  wm start|stop|restart [ID]      启停线路（两端均需 WG+Mimic）
   wm list-profiles
-  wm health [ID]
-  wm upgrade-script
-  wm uninstall / wm purge
+  wm show-config [ID]
+  wm show-code [ID]               显示 IX 接入码
+  wm refresh-code [ID]            轮换入口密钥并刷新接入码
+  wm show-port-map [ID]           端口地图
+  wm list-rules [ID]
+  wm add-rule [ID]
+  wm edit-rule <ID> <规则ID>
+  wm delete-rule <ID> <规则ID>
+  wm enable-rule|disable-rule <ID> <规则ID>
+  wm apply-rules [ID]             重建 nft 规则
+  wm health [ID] / wm diagnose [ID]
+  wm set-mtu <ID> <MTU> / wm set-xdp-mode <ID> [skb|native]
+  wm install-all|install-mimic|install-deps|compat
+  wm upgrade-script / wm uninstall / wm purge
 
-纯转发：IX 段无需 mimic；**公网入口需要 mimic**（UDP 伪装 TCP）。
+架构: 客户端 → 公网入口:client_port → WG(Mimic 伪TCP) → IX 虚拟IP:transit_port → 落地
 
 环境变量:
-  WMF_TAG=v0.3.1                  安装/升级时指定版本
-  WMF_REPO=ike-sh/wg-mimic-fabric   GitHub 仓库
+  WMF_TAG=v0.6.0                  安装/升级时指定版本
+  WMF_REPO=ike-sh/wg-mimic-fabric GitHub 仓库
   WMF_UPGRADE_YES=1               升级跳过确认
   WMF_PURGE_YES=1                 purge 跳过确认
   WMF_UNINSTALL_YES=1             uninstall 跳过确认
@@ -1630,40 +1726,44 @@ show_menu() {
 ╔══════════════════════════════════════╗
 ║     wg-mimic-fabric 管理菜单         ║
 ╠══════════════════════════════════════╣
-║  1) IX 创建中转线路（生成接入码）    ║
+║  1) IX 创建组网线路（生成接入码）    ║
 ║  2) 公网入口导入接入码               ║
 ║  3) 启动线路                         ║
 ║  4) 停止线路                         ║
 ║  5) 健康检查                         ║
 ║  6) 列出线路                         ║
-║  7) 显示接入码（IX 线路）            ║
-║  8) 刷新接入码（IX 线路）            ║
-║  9) 升级脚本                         ║
-║ 10) 卸载 / 完全清理                  ║
+║  7) 显示接入码（IX）                 ║
+║  8) 刷新接入码（IX）                 ║
+║  9) 端口地图                         ║
+║ 10) 规则管理（列出/增/删）           ║
+║ 11) 升级脚本                         ║
+║ 12) 卸载 / 完全清理                  ║
 ║  0) 退出                             ║
 ╚══════════════════════════════════════╝
 MENU
-        local choice id
+        local choice id rid
         read -r -p "选择: " choice </dev/tty
         case "$(trim "$choice")" in
             1) create_transit_interactive ;;
-            2) import_transit_code_interactive ;;
+            2) import_code_interactive ;;
             3) read -r -p "线路 ID: " id </dev/tty; start_profile "$(sanitize_id "$(trim "$id")")" ;;
             4) read -r -p "线路 ID: " id </dev/tty; stop_profile "$(sanitize_id "$(trim "$id")")" ;;
-            5)
-                if readarray -t _ids < <(list_profile_ids) && [[ "${#_ids[@]}" -eq 1 ]]; then
-                    health_profile "${_ids[0]}"
-                else
-                    read -r -p "线路 ID（回车=唯一线路）: " id </dev/tty
-                    id="$(trim "$id")"
-                    health_profile "${id:-$(resolve_profile_id "")}"
-                fi
-                ;;
+            5) read -r -p "线路 ID（回车=唯一）: " id </dev/tty; health_profile "$(trim "$id")" ;;
             6) list_profile_ids | sed 's/^/  /' || printf '  (无线路)\n' ;;
-            7) read -r -p "IX 中转线路 ID: " id </dev/tty; show_code "$(sanitize_id "$(trim "$id")")" ;;
-            8) read -r -p "IX 中转线路 ID: " id </dev/tty; refresh_code "$(sanitize_id "$(trim "$id")")" ;;
-            9) upgrade_script ;;
-            10) uninstall_from_menu ;;
+            7) read -r -p "IX 线路 ID: " id </dev/tty; show_code "$(sanitize_id "$(trim "$id")")" ;;
+            8) read -r -p "IX 线路 ID: " id </dev/tty; refresh_code "$(sanitize_id "$(trim "$id")")" ;;
+            9) read -r -p "线路 ID（回车=唯一）: " id </dev/tty; show_port_map "$(trim "$id")" ;;
+            10)
+                read -r -p "线路 ID（回车=唯一）: " id </dev/tty; id="$(trim "$id")"
+                list_rules "$id"
+                read -r -p "操作 add/del/skip: " rid </dev/tty
+                case "$(trim "$rid")" in
+                    add) add_rule "$id" ;;
+                    del) read -r -p "规则 ID: " rid </dev/tty; delete_rule "$id" "$(trim "$rid")" ;;
+                esac
+                ;;
+            11) upgrade_script ;;
+            12) uninstall_from_menu ;;
             0|q|Q) exit 0 ;;
             *) warn "无效选择" ;;
         esac
@@ -1681,16 +1781,22 @@ main() {
         install-deps) install_deps ;;
         compat) compat_os_report ;;
         create-transit) create_transit_interactive ;;
-        import-transit-code) import_transit_code_interactive ;;
-        create-server|create-forwarder|create-relay|import-code) create_server_interactive ;;
+        import-code) import_code_interactive ;;
         start) start_profile "$(resolve_profile_id "${2:-}")" ;;
         stop) stop_profile "$(resolve_profile_id "${2:-}")" ;;
-        restart) stop_profile "$(resolve_profile_id "${2:-}")"; start_profile "$(resolve_profile_id "${2:-}")" ;;
+        restart) restart_profile "${2:-}" ;;
         list-profiles) list_profile_ids ;;
         show-config) load_profile "$(resolve_profile_id "${2:-}")"; cat "$(profile_env_path "$PROFILE_ID")" ;;
         show-code) show_code "${2:-}" ;;
         refresh-code) refresh_code "${2:-}" ;;
-        set-peer) set_server_peer "$(resolve_profile_id "${2:-}")" "${3:-}" ;;
+        show-port-map) show_port_map "${2:-}" ;;
+        list-rules) list_rules "${2:-}" ;;
+        add-rule) add_rule "${2:-}" ;;
+        edit-rule) edit_rule "${2:-}" "${3:-}" ;;
+        delete-rule) delete_rule "${2:-}" "${3:-}" ;;
+        enable-rule) enable_rule "${2:-}" "${3:-}" ;;
+        disable-rule) disable_rule "${2:-}" "${3:-}" ;;
+        apply-rules) apply_rules "${2:-}" ;;
         set-mtu) set_profile_mtu "${2:-}" "${3:-}" ;;
         set-xdp-mode) set_profile_xdp_mode "${2:-}" "${3:-}" ;;
         apply-nft-all) require_root; apply_nft_all; ok "nft 规则已重建" ;;
@@ -1704,4 +1810,4 @@ main() {
     esac
 }
 
-main "$@"
+[[ "${WMF_SOURCED:-}" == "1" ]] || main "$@"
