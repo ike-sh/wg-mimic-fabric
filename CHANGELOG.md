@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.5.0] - 2026-06-15
+
+### Changed（Breaking）
+
+- **菜单与主流程对齐 ix-transit**：IX `create-transit` 生成接入码 → 公网入口 `import-transit-code`
+- 移除菜单中的 WG 服务端 / 客户端 / Forwarder / 手动 relay
+- 接入码 `code_schema=3`（`transit-code`）
+- 纯转发推荐 `WMF_SKIP_MIMIC=1` 安装
+
 ## [0.4.0] - 2026-06-15
 
 ### Added

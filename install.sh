@@ -2,7 +2,7 @@
 # wg-mimic-fabric — WireGuard + Mimic tunnel orchestrator (MVP)
 set -Eeuo pipefail
 
-SCRIPT_VERSION="0.4.0"
+SCRIPT_VERSION="0.5.0"
 MIMIC_UPSTREAM_TAG="${MIMIC_UPSTREAM_TAG:-v0.7.0}"
 APP_NAME="wg-mimic-fabric"
 WMF_PROJECT_REPO="${WMF_REPO:-ike-sh/wg-mimic-fabric}"
@@ -198,6 +198,80 @@ base64url_encode() {
 
 base64url_decode() {
     python3 -c 'import base64,sys; s=sys.stdin.read().strip(); s+="="*(-len(s)%4); sys.stdout.buffer.write(base64.urlsafe_b64decode(s))'
+}
+
+json_encode_transit_code() {
+    python3 - "$@" <<'PY'
+import json, sys
+from datetime import datetime, timezone
+(
+    profile_id, transit_listen_port, transit_reach_host,
+    landing_host, landing_port, forward_proto,
+) = sys.argv[1:7]
+obj = {
+    "version": 1,
+    "code_schema": 3,
+    "project": "wg-mimic-fabric",
+    "role": "transit-code",
+    "profile_id": profile_id,
+    "transit_listen_port": int(transit_listen_port),
+    "transit_reach_host": transit_reach_host,
+    "landing_host": landing_host,
+    "landing_port": int(landing_port),
+    "forward_proto": forward_proto,
+    "created_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+}
+print(json.dumps(obj, separators=(",", ":")))
+PY
+}
+
+generate_transit_code() {
+    local json b64
+    json="$(json_encode_transit_code \
+        "$PROFILE_ID" "${RELAY_LISTEN_PORT:-}" "${TRANSIT_REACH_HOST:-}" \
+        "${RELAY_TARGET_HOST:-}" "${RELAY_TARGET_PORT:-}" "${FORWARD_PROTO:-both}")"
+    b64="$(printf '%s' "$json" | base64url_encode)"
+    printf 'WMGF1:%s' "$b64"
+}
+
+parse_wmgf_code() {
+    local code="$1"
+    [[ "$code" == WMGF1:* ]] || die "接入码必须以 WMGF1: 开头"
+    printf '%s' "${code#WMGF1:}" | base64url_decode
+}
+
+parse_transit_code() {
+    local code="$1" json role schema
+    json="$(parse_wmgf_code "$code")"
+    role="$(json_get "$json" role)"
+    schema="$(json_get "$json" code_schema)"
+    [[ "$role" == "transit-code" && "$schema" == "3" ]] \
+        || die "不是有效的 IX 中转接入码（需 code_schema=3 transit-code）"
+    printf '%s' "$json"
+}
+
+detect_public_ipv4() {
+    curl -4 -fsS --max-time 5 https://api.ipify.org 2>/dev/null \
+        || curl -4 -fsS --max-time 5 https://ifconfig.me 2>/dev/null \
+        || true
+}
+
+validate_port() {
+    local p="$1"
+    [[ "$p" =~ ^[0-9]+$ ]] && (( p >= 1 && p <= 65535 ))
+}
+
+prompt_port() {
+    local var="$1" text="$2" default="${3:-}"
+    local val
+    while true; do
+        prompt val "$text" "$default"
+        if validate_port "$val"; then
+            printf -v "$var" '%s' "$val"
+            return 0
+        fi
+        warn "端口必须是 1–65535 的数字"
+    done
 }
 
 generate_pairing_code() {
@@ -718,150 +792,34 @@ prompt() {
 }
 
 create_server_interactive() {
-    require_root
-    ensure_wg_tools
-    ensure_dirs
-
-    local profile_id public_ip wan_iface wg_port wg_mtu ip_version
-    prompt profile_id "线路 ID（字母数字）" "my-tunnel"
-    profile_id="$(sanitize_id "$profile_id")"
-    [[ ! -f "$(profile_env_path "$profile_id")" ]] || die "线路已存在：$profile_id"
-
-    prompt public_ip "服务端公网 IP（IPv4 或 IPv6）"
-    [[ -n "$public_ip" ]] || die "公网 IP 不能为空"
-
-    prompt ip_version "IP 版本 (4/6/dual)" "4"
-    case "$ip_version" in 4|6|dual) ;; *) die "IP 版本必须是 4、6 或 dual" ;; esac
-
-    wan_iface="$(detect_default_iface)"
-    prompt wan_iface "Mimic 绑定网卡" "${wan_iface:-eth0}"
-
-    prompt wg_port "WireGuard UDP 端口" "51820"
-    prompt_mtu wg_mtu "$ip_version"
-
-    local priv pub client_priv client_pub
-    priv="$(wg_genkey)"
-    pub="$(printf '%s' "$priv" | wg_pubkey)"
-    client_priv="$(wg_genkey)"
-    client_pub="$(printf '%s' "$client_priv" | wg_pubkey)"
-
-    install -d -m 700 "${KEYS_DIR}/${profile_id}"
-    printf '%s' "$priv" >"${KEYS_DIR}/${profile_id}/server.key"
-    printf '%s' "$client_priv" >"${KEYS_DIR}/${profile_id}/client.key"
-    chmod 600 "${KEYS_DIR}/${profile_id}"/*.key
-
-    local kv=(
-        "PROFILE_ID=${profile_id}"
-        "PROFILE_NAME=${profile_id}"
-        "ROLE=server"
-        "ENABLED=true"
-        "IP_VERSION=${ip_version}"
-        "WAN_IFACE=${wan_iface}"
-        "PUBLIC_IP=${public_ip}"
-        "WG_PORT=${wg_port}"
-        "WG_MTU=${wg_mtu}"
-        "WG_IPV4_SUBNET=10.66.66.0/24"
-        "WG_SERVER_IPV4=10.66.66.1/32"
-        "WG_CLIENT_IPV4=10.66.66.2/32"
-        "WG_PRIVATE_KEY=${priv}"
-        "WG_PUBLIC_KEY=${pub}"
-        "WG_PEER_PUBLIC_KEY=${client_pub}"
-        "MIMIC_KEEPALIVE=300:::"
-        "MIMIC_XDP_MODE="
-        "FW_OPEN_PORT=true"
-    )
-    if [[ "$ip_version" == "6" || "$ip_version" == "dual" ]]; then
-        kv+=(
-            "WG_IPV6_SUBNET=fd42:4242:4242::/64"
-            "WG_SERVER_IPV6=fd42:4242:4242::1/128"
-            "WG_CLIENT_IPV6=fd42:4242:4242::2/128"
-        )
-    fi
-    write_profile_kv "$(profile_env_path "$profile_id")" "${kv[@]}"
-
-    load_profile "$profile_id"
-    apply_profile_configs
-    apply_nft_all
-
-    local code; code="$(generate_pairing_code)"
-    printf '%s\n' "$code" >"${CODES_DIR}/${profile_id}.code"
-    chmod 600 "${CODES_DIR}/${profile_id}.code"
-
-    printf '\n═══ 配对码（WMGF1，含预生成客户端密钥）═══\n'
-    printf '%s\n' "$code"
-    printf '════════════════════════════════════════════\n'
-    printf '\n下一步：wm start %s\n' "$profile_id"
+    die "已移除。请在 IX 机执行：wm create-transit"
 }
 
 create_forwarder_interactive() {
-    require_root
-    ensure_dirs
-    command_exists mimic || die "需要 mimic，请先 wm install-deps"
-
-    local profile_id wan_iface listen_port server_ip server_port
-    prompt profile_id "Forwarder 线路 ID" "my-forwarder"
-    profile_id="$(sanitize_id "$profile_id")"
-    [[ ! -f "$(profile_env_path "$profile_id")" ]] || die "线路已存在：$profile_id"
-
-    wan_iface="$(detect_default_iface)"
-    prompt wan_iface "Mimic 绑定网卡" "${wan_iface:-eth0}"
-    prompt listen_port "本机 UDP 监听端口（客户端 WG Endpoint 指向此端口）" "1234"
-    prompt server_ip "远端 WG 服务端公网 IP"
-    [[ -n "$server_ip" ]] || die "服务端 IP 不能为空"
-    prompt server_port "远端 WG 服务端端口" "51820"
-
-    write_profile_kv "$(profile_env_path "$profile_id")" \
-        "PROFILE_ID=${profile_id}" \
-        "PROFILE_NAME=${profile_id}" \
-        "ROLE=forwarder" \
-        "ENABLED=true" \
-        "WAN_IFACE=${wan_iface}" \
-        "FORWARDER_LISTEN_PORT=${listen_port}" \
-        "SERVER_PUBLIC_IP=${server_ip}" \
-        "SERVER_WG_PORT=${server_port}" \
-        "MIMIC_KEEPALIVE=300:::" \
-        "MIMIC_XDP_MODE=native" \
-        "FW_OPEN_PORT=true"
-
-    load_profile "$profile_id"
-    apply_profile_configs
-    apply_nft_all
-    ensure_ip_forward
-
-    printf '\n═══ Forwarder 部署说明 ═══\n'
-    printf '1. 客户端（RouterOS 等）WG Endpoint → 本机公网 IP:%s\n' "$listen_port"
-    printf '2. 服务端 mimic filter → local=%s:%s\n' "$server_ip" "$server_port"
-    printf '3. 本机执行：wm start %s\n' "$profile_id"
-    printf '4. Intel 网卡丢包可改 MIMIC_XDP_MODE=skb\n'
-    printf '详见 docs/forwarder.md\n'
+    die "已移除。请使用 IX 中转 + 公网入口接入码流程（wm create-transit / import-transit-code）"
 }
 
-create_relay_interactive() {
+import_code_interactive() {
+    die "已移除。公网入口请使用：wm import-transit-code"
+}
+
+create_transit_interactive() {
     require_root
     ensure_dirs
     command_exists nft || die "需要 nftables，请 apt install nftables"
 
-    local profile_id relay_kind listen_port target_host target_port forward_proto
-    prompt profile_id "线路 ID（字母数字）" "ix-transit"
+    local profile_id listen_port reach_host target_host target_port forward_proto code
+    prompt profile_id "IX 中转线路 ID" "ix-transit"
     profile_id="$(sanitize_id "$profile_id")"
     [[ ! -f "$(profile_env_path "$profile_id")" ]] || die "线路已存在：$profile_id"
 
-    prompt relay_kind "用途 ingress=公网入口 / transit=IX中转" "transit"
-    case "$relay_kind" in
-        ingress|transit) ;;
-        *) die "用途必须是 ingress 或 transit" ;;
-    esac
+    prompt_port listen_port "IX 中转监听端口（入口机将转发到此口）" "40000"
+    prompt reach_host "IX 机对入口可达的 IP（IX 网段 IP）"
+    [[ -n "$reach_host" ]] || die "IX 可达 IP 不能为空"
 
-    prompt listen_port "本机监听端口（客户端或上一跳连此口）"
-    [[ "$listen_port" =~ ^[0-9]+$ ]] || die "端口必须是数字"
-    (( listen_port >= 1 && listen_port <= 65535 )) || die "端口范围 1-65535"
-
-    prompt target_host "转发目标 IP 或域名"
-    [[ -n "$target_host" ]] || die "目标地址不能为空"
-
-    prompt target_port "转发目标端口"
-    [[ "$target_port" =~ ^[0-9]+$ ]] || die "端口必须是数字"
-
+    prompt target_host "落地 IP"
+    [[ -n "$target_host" ]] || die "落地 IP 不能为空"
+    prompt_port target_port "落地端口"
     prompt forward_proto "协议 tcp / udp / both" "both"
     case "$forward_proto" in
         tcp|udp|both) ;;
@@ -872,9 +830,10 @@ create_relay_interactive() {
         "PROFILE_ID=${profile_id}" \
         "PROFILE_NAME=${profile_id}" \
         "ROLE=relay" \
-        "RELAY_KIND=${relay_kind}" \
+        "RELAY_KIND=transit" \
         "ENABLED=true" \
         "RELAY_LISTEN_PORT=${listen_port}" \
+        "TRANSIT_REACH_HOST=${reach_host}" \
         "RELAY_TARGET_HOST=${target_host}" \
         "RELAY_TARGET_PORT=${target_port}" \
         "FORWARD_PROTO=${forward_proto}" \
@@ -884,113 +843,71 @@ create_relay_interactive() {
     apply_nft_all
     ensure_ip_forward
 
-    printf '\n═══ Relay 部署说明 ═══\n'
-    printf '类型: %s\n' "$relay_kind"
-    printf '转发: 本机:%s (%s) → %s:%s\n' "$listen_port" "$forward_proto" "$target_host" "$target_port"
-    if [[ "$relay_kind" == "ingress" ]]; then
-        printf '客户端连接: 公网入口IP:%s\n' "$listen_port"
-        printf '目标一般为 IX 中转机的 IX 网段 IP:中转端口\n'
-    else
-        printf '上一跳一般为公网入口；目标为落地 IP:端口（落地无需 WG/Mimic）\n'
-    fi
-    printf '无需 mimic / wireguard。执行：wm start %s\n' "$profile_id"
-    printf '详见 docs/transit-topology.md\n'
+    code="$(generate_transit_code)"
+    printf '%s\n' "$code" >"${CODES_DIR}/${profile_id}.code"
+    chmod 600 "${CODES_DIR}/${profile_id}.code"
+
+    printf '\n═══ IX 中转接入码（复制到公网入口机）═══\n'
+    printf '%s\n' "$code"
+    printf '════════════════════════════════════════════\n'
+    printf '公网入口：wm import-transit-code 粘贴上方接入码\n'
+    printf 'IX 机启动：wm start %s\n' "$profile_id"
 }
 
-import_code_interactive() {
+import_transit_code_interactive() {
     require_root
-    ensure_wg_tools
     ensure_dirs
+    command_exists nft || die "需要 nftables"
 
-    local code json
-    printf '请粘贴 WMGF1: 配对码：' >&2
+    local code json profile_id transit_id listen_port reach_host tport proto
+    local target_host target_port ingress_id public_ip
+    printf '请粘贴 WMGF1: IX 中转接入码：' >&2
     read -r code </dev/tty
     code="$(trim "$code")"
-    json="$(parse_pairing_code "$code")"
+    json="$(parse_transit_code "$code")"
 
-    local schema; schema="$(json_get "$json" code_schema)"
-    [[ "$schema" == "1" || "$schema" == "2" ]] || die "不支持的 code_schema：$schema"
+    transit_id="$(json_get "$json" profile_id)"
+    reach_host="$(json_get "$json" transit_reach_host)"
+    tport="$(json_get "$json" transit_listen_port)"
+    target_host="$(json_get "$json" landing_host)"
+    target_port="$(json_get "$json" landing_port)"
+    proto="$(json_get "$json" forward_proto)"
 
-    local profile_id server_pub endpoint wg_port wg_mtu subnet client_ip server_ip keepalive wan_hint client_priv_b64
-    local ip_version subnet6 client_ip6 server_ip6
-    profile_id="$(json_get "$json" profile_id)"
-    profile_id="$(sanitize_id "$profile_id")-client"
-    server_pub="$(json_get "$json" server_pubkey)"
-    endpoint="$(json_get "$json" server_endpoint)"
-    wg_port="$(json_get "$json" wg_port)"
-    wg_mtu="$(json_get "$json" wg_mtu)"
-    ip_version="$(json_get "$json" ip_version)"
-    [[ -n "$ip_version" ]] || ip_version="4"
-    print_mtu_guide "$ip_version"
-    prompt wg_mtu "WG 隧道 MTU（配对码建议 ${wg_mtu}，可改）" "${wg_mtu:-$(suggest_wg_mtu "$ip_version")}"
-    validate_mtu "$wg_mtu"
-    subnet="$(json_get "$json" wg_ipv4_subnet)"
-    client_ip="$(json_get "$json" client_ipv4)"
-    server_ip="$(json_get "$json" server_ipv4)"
-    subnet6="$(json_get "$json" wg_ipv6_subnet)"
-    client_ip6="$(json_get "$json" client_ipv6)"
-    server_ip6="$(json_get "$json" server_ipv6)"
-    keepalive="$(json_get "$json" mimic_keepalive)"
-    wan_hint="$(json_get "$json" wan_iface_hint)"
-    client_priv_b64="$(json_get "$json" client_privkey_b64)"
+    ingress_id="${transit_id}-ingress"
+    [[ ! -f "$(profile_env_path "$ingress_id")" ]] || die "入口线路已存在：$ingress_id（可先 wm stop 后删除配置）"
 
-    [[ ! -f "$(profile_env_path "$profile_id")" ]] || die "线路已存在：$profile_id"
+    public_ip="$(detect_public_ipv4)"
+    [[ -n "$public_ip" ]] && info "检测到公网 IPv4：${public_ip}"
 
-    local priv pub
-    if [[ -n "$client_priv_b64" ]]; then
-        priv="$(printf '%s' "$client_priv_b64" | base64url_decode)"
-    else
-        priv="$(wg_genkey)"
-        warn "配对码未含客户端私钥，已本地生成新密钥；请在服务端执行 wm set-peer"
-    fi
-    pub="$(printf '%s' "$priv" | wg_pubkey)"
+    printf '\n── 接入码摘要 ──\n'
+    printf '  IX 中转: %s:%s\n' "$reach_host" "$tport"
+    printf '  落地: %s:%s (%s)\n\n' "$target_host" "$target_port" "$proto"
 
-    local wan_iface
-    wan_iface="$(detect_default_iface)"
-    wan_iface="${wan_iface:-$wan_hint}"
-    wan_iface="${wan_iface:-eth0}"
+    prompt_port listen_port "公网入口端口（客户端连此口）" "30000"
 
-    install -d -m 700 "${KEYS_DIR}/${profile_id}"
-    printf '%s' "$priv" >"${KEYS_DIR}/${profile_id}/client.key"
-    chmod 600 "${KEYS_DIR}/${profile_id}/client.key"
+    write_profile_kv "$(profile_env_path "$ingress_id")" \
+        "PROFILE_ID=${ingress_id}" \
+        "PROFILE_NAME=${ingress_id}" \
+        "ROLE=relay" \
+        "RELAY_KIND=ingress" \
+        "ENABLED=true" \
+        "RELAY_LISTEN_PORT=${listen_port}" \
+        "RELAY_TARGET_HOST=${reach_host}" \
+        "RELAY_TARGET_PORT=${tport}" \
+        "FORWARD_PROTO=${proto}" \
+        "REMOTE_TRANSIT_PROFILE_ID=${transit_id}" \
+        "INGRESS_PUBLIC_HOST=${public_ip:-}" \
+        "FW_OPEN_PORT=true"
 
-    local kv=(
-        "PROFILE_ID=${profile_id}"
-        "PROFILE_NAME=${profile_id}"
-        "ROLE=client"
-        "ENABLED=true"
-        "IP_VERSION=${ip_version}"
-        "WAN_IFACE=${wan_iface}"
-        "SERVER_ENDPOINT=${endpoint}"
-        "WG_PORT=${wg_port}"
-        "WG_MTU=${wg_mtu}"
-        "WG_IPV4_SUBNET=${subnet}"
-        "WG_CLIENT_IPV4=${client_ip}"
-        "WG_SERVER_IPV4=${server_ip}"
-        "WG_PRIVATE_KEY=${priv}"
-        "WG_PUBLIC_KEY=${pub}"
-        "WG_PEER_PUBLIC_KEY=${server_pub}"
-        "MIMIC_KEEPALIVE=${keepalive:-300:::}"
-        "MIMIC_XDP_MODE="
-        "FW_OPEN_PORT=false"
-    )
-    [[ -n "$subnet6" ]] && kv+=(
-        "WG_IPV6_SUBNET=${subnet6}"
-        "WG_CLIENT_IPV6=${client_ip6}"
-        "WG_SERVER_IPV6=${server_ip6}"
-    )
-    write_profile_kv "$(profile_env_path "$profile_id")" "${kv[@]}"
+    load_profile "$ingress_id"
+    apply_nft_all
+    ensure_ip_forward
 
-    load_profile "$profile_id"
-    apply_profile_configs
-
-    ok "已导入客户端线路：${profile_id}"
-    if [[ -z "$client_priv_b64" ]]; then
-        warn "请将客户端公钥告知服务端："
-        printf '  公钥: %s\n' "$pub"
-        printf '  服务端: wm set-peer <server-id> %s\n' "$pub"
-    fi
-    printf '\n下一步：wm start %s\n' "$profile_id"
+    printf '\n═══ 公网入口已配置 ═══\n'
+    printf '客户端连接: %s:%s\n' "${public_ip:-<公网IP>}" "$listen_port"
+    printf '转发路径: :%s → %s:%s → %s:%s\n' \
+        "$listen_port" "$reach_host" "$tport" "$target_host" "$target_port"
+    printf '\n执行：wm start %s\n' "$ingress_id"
 }
 
 set_server_peer() {
@@ -1023,6 +940,9 @@ health_profile() {
             "${RELAY_KIND:-relay}" "${RELAY_LISTEN_PORT:-?}" "${FORWARD_PROTO:-both}" \
             "${RELAY_TARGET_HOST:-?}" "${RELAY_TARGET_PORT:-?}"
         [[ "$(sysctl -n net.ipv4.ip_forward 2>/dev/null)" == "1" ]] && printf 'IP forward: on\n' || { printf 'IP forward: off\n'; status="degraded"; }
+        if [[ "${RELAY_KIND:-}" == "ingress" && -n "${INGRESS_PUBLIC_HOST:-}" ]]; then
+            printf '客户端入口: %s:%s\n' "$INGRESS_PUBLIC_HOST" "${RELAY_LISTEN_PORT:-?}"
+        fi
         [[ "${ENABLED:-true}" == "true" ]] && printf 'Relay: active\n' || { printf 'Relay: disabled\n'; status="degraded"; }
         printf 'Mimic: N/A (relay 纯转发)\n'
         printf 'WireGuard: N/A (relay 纯转发)\n'
@@ -1139,11 +1059,12 @@ EOF
 show_code() {
     local id; id="$(resolve_profile_id "${1:-}")"
     load_profile "$id"
-    [[ "${ROLE:-}" == "server" ]] || die "仅服务端可 show-code"
+    [[ "${ROLE:-}" == "relay" && "${RELAY_KIND:-}" == "transit" ]] \
+        || die "仅 IX 中转线路可 show-code（wm create-transit）"
     if [[ -f "${CODES_DIR}/${PROFILE_ID}.code" ]]; then
         cat "${CODES_DIR}/${PROFILE_ID}.code"
     else
-        generate_pairing_code | tee "${CODES_DIR}/${PROFILE_ID}.code"
+        generate_transit_code | tee "${CODES_DIR}/${PROFILE_ID}.code"
         chmod 600 "${CODES_DIR}/${PROFILE_ID}.code"
     fi
 }
@@ -1152,18 +1073,11 @@ refresh_code() {
     local id; id="$(resolve_profile_id "${1:-}")"
     require_root
     load_profile "$id"
-    [[ "${ROLE:-}" == "server" ]] || die "仅服务端可 refresh-code"
-    local client_priv client_pub
-    client_priv="$(wg_genkey)"
-    client_pub="$(printf '%s' "$client_priv" | wg_pubkey)"
-    printf '%s' "$client_priv" >"${KEYS_DIR}/${PROFILE_ID}/client.key"
-    chmod 600 "${KEYS_DIR}/${PROFILE_ID}/client.key"
-    sed -i "s/^WG_PEER_PUBLIC_KEY=.*/WG_PEER_PUBLIC_KEY=${client_pub}/" "$(profile_env_path "$PROFILE_ID")"
-    load_profile "$id"
-    apply_profile_configs
-    generate_pairing_code | tee "${CODES_DIR}/${PROFILE_ID}.code"
+    [[ "${ROLE:-}" == "relay" && "${RELAY_KIND:-}" == "transit" ]] \
+        || die "仅 IX 中转线路可 refresh-code"
+    generate_transit_code | tee "${CODES_DIR}/${PROFILE_ID}.code"
     chmod 600 "${CODES_DIR}/${PROFILE_ID}.code"
-    ok "已刷新配对码（旧客户端需重新导入）"
+    ok "已刷新接入码（公网入口需重新 import-transit-code）"
 }
 
 set_profile_mtu() {
@@ -1631,34 +1545,22 @@ WRAP
 
 usage() {
     cat <<EOF
-wg-mimic-fabric ${SCRIPT_VERSION} — WireGuard + Mimic 隧道编排
+wg-mimic-fabric ${SCRIPT_VERSION} — 公网入口 / IX 中转 / 落地 端口转发编排
 
 用法:
   wm                              交互菜单
   wm --version
-  wm install-wm-cli               安装 wm（默认同时 apt 装 mimic）
-  wm install-mimic                安装 mimic + wireguard-tools 等依赖
-  wm install-all                  安装 wm + mimic（等同 bootstrap）
-  wm install-deps                 仅打印依赖指引（不安装）
-  wm compat                       操作系统兼容性报告
-  wm create-server                创建服务端线路
-  wm create-forwarder             创建 Forwarder 旁路（RouterOS 等）
-  wm create-relay                 创建纯转发中继（IX/公网入口→落地）
-  wm import-code                  客户端导入配对码
+  wm create-transit               IX 机：创建中转线路并生成接入码
+  wm import-transit-code          公网入口：粘贴 IX 接入码并配置转发
   wm start|stop|restart <ID>      启停线路
+  wm show-code <ID>               显示 IX 接入码
+  wm refresh-code <ID>            刷新 IX 接入码
   wm list-profiles
-  wm show-config <ID>
-  wm show-code <ID>               显示配对码
-  wm refresh-code <ID>          刷新配对码（轮换客户端密钥）
-  wm set-peer <ID> <PUBKEY>     服务端更新客户端公钥
-  wm set-mtu <ID> <MTU>         修改 MTU
-  wm set-xdp-mode <ID> [skb|native]  设置 Mimic XDP 模式
-  wm apply-nft-all              重建 nft 防火墙规则
-  wm upgrade-script             升级管理脚本
-  wm uninstall                  卸载 CLI/服务（保留配置）
-  wm purge                      完全清理（含本地脚本与 mimic 包）
   wm health [ID]
-  wm diagnose [ID]
+  wm upgrade-script
+  wm uninstall / wm purge
+
+纯转发模式无需 mimic / wireguard。安装时可设 WMF_SKIP_MIMIC=1 跳过 mimic。
 
 环境变量:
   WMF_TAG=v0.3.1                  安装/升级时指定版本
@@ -1682,34 +1584,27 @@ show_menu() {
 ╔══════════════════════════════════════╗
 ║     wg-mimic-fabric 管理菜单         ║
 ╠══════════════════════════════════════╣
-║  1) 创建服务端隧道                   ║
-║  2) 客户端导入配对码                 ║
-║  3) 创建 Forwarder 旁路              ║
-║  4) 创建 Relay 中继（IX/入口→落地）  ║
-║  5) 启动线路                         ║
-║  6) 停止线路                         ║
-║  7) 健康检查                         ║
-║  8) 列出线路                         ║
-║  9) 显示配对码                       ║
-║ 10) 刷新配对码                       ║
-║ 11) 依赖安装指引 (install-deps)      ║
-║ 12) 系统兼容性 (compat)              ║
-║ 13) 升级脚本                         ║
-║ 14) 卸载 / 完全清理                  ║
-║ 15) 安装 wm CLI                      ║
+║  1) IX 创建中转线路（生成接入码）    ║
+║  2) 公网入口导入接入码               ║
+║  3) 启动线路                         ║
+║  4) 停止线路                         ║
+║  5) 健康检查                         ║
+║  6) 列出线路                         ║
+║  7) 显示接入码（IX 线路）            ║
+║  8) 刷新接入码（IX 线路）            ║
+║  9) 升级脚本                         ║
+║ 10) 卸载 / 完全清理                  ║
 ║  0) 退出                             ║
 ╚══════════════════════════════════════╝
 MENU
         local choice id
         read -r -p "选择: " choice </dev/tty
         case "$(trim "$choice")" in
-            1) create_server_interactive ;;
-            2) import_code_interactive ;;
-            3) create_forwarder_interactive ;;
-            4) create_relay_interactive ;;
-            5) read -r -p "线路 ID: " id </dev/tty; start_profile "$(sanitize_id "$(trim "$id")")" ;;
-            6) read -r -p "线路 ID: " id </dev/tty; stop_profile "$(sanitize_id "$(trim "$id")")" ;;
-            7)
+            1) create_transit_interactive ;;
+            2) import_transit_code_interactive ;;
+            3) read -r -p "线路 ID: " id </dev/tty; start_profile "$(sanitize_id "$(trim "$id")")" ;;
+            4) read -r -p "线路 ID: " id </dev/tty; stop_profile "$(sanitize_id "$(trim "$id")")" ;;
+            5)
                 if readarray -t _ids < <(list_profile_ids) && [[ "${#_ids[@]}" -eq 1 ]]; then
                     health_profile "${_ids[0]}"
                 else
@@ -1718,14 +1613,11 @@ MENU
                     health_profile "${id:-$(resolve_profile_id "")}"
                 fi
                 ;;
-            8) list_profile_ids | sed 's/^/  /' || printf '  (无线路)\n' ;;
-            9) read -r -p "服务端线路 ID: " id </dev/tty; show_code "$(sanitize_id "$(trim "$id")")" ;;
-            10) read -r -p "服务端线路 ID: " id </dev/tty; refresh_code "$(sanitize_id "$(trim "$id")")" ;;
-            11) install_deps ;;
-            12) compat_os_report ;;
-            13) upgrade_script ;;
-            14) uninstall_from_menu ;;
-            15) install_wm_cli ;;
+            6) list_profile_ids | sed 's/^/  /' || printf '  (无线路)\n' ;;
+            7) read -r -p "IX 中转线路 ID: " id </dev/tty; show_code "$(sanitize_id "$(trim "$id")")" ;;
+            8) read -r -p "IX 中转线路 ID: " id </dev/tty; refresh_code "$(sanitize_id "$(trim "$id")")" ;;
+            9) upgrade_script ;;
+            10) uninstall_from_menu ;;
             0|q|Q) exit 0 ;;
             *) warn "无效选择" ;;
         esac
@@ -1742,10 +1634,9 @@ main() {
         install-all) install_all ;;
         install-deps) install_deps ;;
         compat) compat_os_report ;;
-        create-server) create_server_interactive ;;
-        create-forwarder) create_forwarder_interactive ;;
-        create-relay) create_relay_interactive ;;
-        import-code) import_code_interactive ;;
+        create-transit) create_transit_interactive ;;
+        import-transit-code) import_transit_code_interactive ;;
+        create-server|create-forwarder|create-relay|import-code) create_server_interactive ;;
         start) start_profile "$(resolve_profile_id "${2:-}")" ;;
         stop) stop_profile "$(resolve_profile_id "${2:-}")" ;;
         restart) stop_profile "$(resolve_profile_id "${2:-}")"; start_profile "$(resolve_profile_id "${2:-}")" ;;
