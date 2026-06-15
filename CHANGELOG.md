@@ -1,5 +1,52 @@
 # Changelog
 
+## [1.0.0] - 2026-06-15
+
+首个正式版。汇总 0.6.x 全部修复与特性，并完成一轮全项目审计（去死代码/修逻辑/补健壮性）与 README 重写。
+
+### Audit / Fixed（正式版收尾）
+
+- **去除死代码**：删除从未被调用的 `assume_yes()`；删除冗余且未被引用的 `scripts/fix-wm.sh`（功能与 `wm upgrade-script` 重复）。
+- **`wm diagnose` 不再误报**：mimic ≥ 0.7 无 `run --check`，改为**先探测是否支持再调用**，否则打印配置路径跳过（消除 `[WARN] mimic --check 失败`）；内核模块判定改用 `awk $1=="mimic"` 精确匹配（修此前"已加载却报未加载"的误判）；diagnose 额外打印网卡驱动与 XDP 模式。
+- 修正 `examples/operations.md` 中 `mimic show -c eth0` 的过时语法为 `mimic show <网卡>`，并补 `wm test`。
+- 重写 `README.md`：先讲 **Mimic 的功能与系统要求**（eBPF/XDP 原理、内核 ≥6.1/BTF/DKMS、native/skb），再讲本脚本（角色/架构/部署/运维/故障排查）。
+
+### Added
+
+- **`wm test [线路] [包数]`**：一条命令测隧道**真实丢包/延迟**（ping 对端虚拟IP，默认 100 包）并给质量判定（≤2% 良好 / ≤10% 一般 / >10% 建议换中转）——快速判断"能连但卡/不显示延迟"是不是中转线路丢包。
+- **`wm set-endpoint <线路> <中转IP>`**：一条命令切换该线路用的 IX 公网/中转地址。入口侧即时重写 mimic/wg 并重启、切换后顺带报一次丢包；IX 侧则刷新接入码提示重导。
+- **自动切换**：`wm set-endpoints <入口线路> ip1,ip2,...` 设候选中转 → `wm autoswitch <线路> [阈值%]` 测当前丢包、超阈值(默认10%)自动探测并切到最优候选 → `wm autoswitch-enable/-disable` 定时(每5分钟)自动切换。专治中转线路波动丢包。
+
+### Changed
+
+- **交互菜单「规则管理」操作项改竖排**（1)新增 2)编辑 3)删除 4)设置端口池 回车)返回 各占一行）。
+
+### Fixed
+
+- **mimic 启动健壮性**：
+  - 启动后用**轮询等待**（最多 ~8s，配合单元 `Restart=on-failure`）替代单次 `sleep 1` 检查，消除"mimic 仍未启动"的虚惊误报；
+  - **检测到 virtio_net 网卡直接默认 XDP skb 模式**（`import-code` 与启动时），不再在不支持 native 的网卡上反复尝试 native、报错、甚至残留程序锁死线路；
+  - 新增 `nic_driver`/`nic_prefers_skb`/`wait_mimic_active`/`force_iface_skb` 辅助；卸载时清理 autoswitch 定时器。
+
+## [0.6.20] - 2026-06-15 (未发布，并入 1.0.0)
+
+### Added
+
+- **`wm test [线路] [包数]`**：一条命令测隧道**真实丢包/延迟**（ping 对端虚拟IP，默认 100 包）并给质量判定（≤2% 良好 / ≤10% 一般 / >10% 建议换中转）——快速判断"能连但卡/不显示延迟"是不是中转线路丢包。
+- **`wm set-endpoint <线路> <中转IP>`**：一条命令切换该线路用的 IX 公网/中转地址。入口侧即时重写 mimic/wg 并重启、切换后顺带报一次丢包；IX 侧则刷新接入码提示重导。
+- **自动切换**：`wm set-endpoints <入口线路> ip1,ip2,...` 设候选中转 → `wm autoswitch <线路> [阈值%]` 测当前丢包、超阈值(默认10%)自动探测并切到最优候选 → `wm autoswitch-enable/-disable` 定时(每5分钟)自动切换。专治中转线路波动丢包。
+
+### Changed
+
+- **交互菜单「规则管理」操作项改竖排**（1)新增 2)编辑 3)删除 4)设置端口池 回车)返回 各占一行，更清晰）。
+
+### Fixed
+
+- **mimic 启动健壮性**：
+  - 启动后用**轮询等待**（最多 ~8s，配合单元 `Restart=on-failure`）替代单次 `sleep 1` 检查，消除"mimic 仍未启动"的虚惊误报；
+  - **检测到 virtio_net 网卡直接默认 XDP skb 模式**（`import-code` 与启动时），不再在不支持 native 的网卡上反复尝试 native、报错、甚至残留程序锁死线路；
+  - 新增 `nic_driver`/`nic_prefers_skb`/`wait_mimic_active`/`force_iface_skb` 辅助；卸载时清理 autoswitch 定时器。
+
 ## [0.6.19] - 2026-06-15
 
 ### Fixed

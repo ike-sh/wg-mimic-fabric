@@ -2,7 +2,7 @@
 # wg-mimic-fabric — WireGuard + Mimic tunnel orchestrator (MVP)
 set -Eeuo pipefail
 
-SCRIPT_VERSION="0.6.19"
+SCRIPT_VERSION="1.0.0"
 MIMIC_UPSTREAM_TAG="${MIMIC_UPSTREAM_TAG:-v0.7.0}"
 APP_NAME="wg-mimic-fabric"
 WMF_PROJECT_REPO="${WMF_REPO:-ike-sh/wg-mimic-fabric}"
@@ -27,6 +27,8 @@ SYSTEMD_TUNNEL_TEMPLATE="/etc/systemd/system/wg-mimic-tunnel@.service"
 SYSCTL_FILE="/etc/sysctl.d/99-wg-mimic-fabric.conf"
 SYSTEMD_DDNS_SERVICE="/etc/systemd/system/wg-mimic-ddns.service"
 SYSTEMD_DDNS_TIMER="/etc/systemd/system/wg-mimic-ddns.timer"
+SYSTEMD_AUTOSWITCH_SERVICE="/etc/systemd/system/wg-mimic-autoswitch@.service"
+SYSTEMD_AUTOSWITCH_TIMER="/etc/systemd/system/wg-mimic-autoswitch@.timer"
 SYSTEMD_RESUME_SERVICE="/etc/systemd/system/wg-mimic-resume.service"
 RESUME_MARKER="${STATE_DIR}/resume.cmd"
 
@@ -489,7 +491,7 @@ ensure_mimic() {
     modprobe mimic 2>/dev/null || warn "mimic 内核模块未加载，请安装 mimic-dkms"
 }
 
-mimic_module_loaded() { lsmod 2>/dev/null | grep -q '^mimic '; }
+mimic_module_loaded() { lsmod 2>/dev/null | awk '$1=="mimic"{f=1} END{exit !f}'; }
 
 # True when mimic CLI is installed but the module cannot load now — typically a
 # DKMS build for a not-yet-running kernel; a reboot will usually fix it.
@@ -659,8 +661,6 @@ upgrade_script() {
     rm -f "$tmp"
     ok "已升级至 ${remote_ver:-unknown}"
 }
-
-assume_yes() { [[ "${WMF_PURGE_YES:-}${WMF_UPGRADE_YES:-}" == *1* ]]; }
 
 # ── DDNS（域名 IP 变化自动刷新）──────────────────────────────────────────────
 
@@ -1227,31 +1227,69 @@ detach_xdp() {
     ip link set dev "$iface" xdp off 2>/dev/null || true
 }
 
+# Kernel driver behind a NIC (e.g. virtio_net, e1000, ixgbe). Empty if unknown.
+nic_driver() {
+    local iface="$1" l
+    [[ -n "$iface" ]] || return 0
+    l="$(readlink "/sys/class/net/${iface}/device/driver" 2>/dev/null)" || return 0
+    printf '%s' "${l##*/}"
+}
+
+# True when this NIC should default to XDP skb mode: native XDP is unreliable on
+# virtio_net (needs GRO off and frequently still fails), so prefer skb there to
+# avoid the native-fail churn / stale-program lockups.
+nic_prefers_skb() {
+    case "$(nic_driver "$1")" in
+        virtio_net|virtio) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# Poll until mimic@<iface> is active, up to <secs> seconds. The unit has
+# Restart=on-failure (RestartSec=3), so a transient first-attach failure recovers
+# within a few seconds — a single 1s check would falsely report "未起来".
+wait_mimic_active() {
+    local iface="$1" secs="${2:-8}" i
+    for ((i = 0; i < secs; i++)); do
+        systemctl is-active --quiet "wg-mimic-mimic@${iface}.service" 2>/dev/null && return 0
+        sleep 1
+    done
+    return 1
+}
+
+# Force skb mode for every profile bound to this nic (used as the universal
+# fallback, and proactively on NICs where native is known to be unreliable).
+force_iface_skb() {
+    local iface="$1" p
+    for p in "$PROFILES_DIR"/*.env; do
+        [[ -f "$p" ]] || continue
+        grep -q "^WAN_IFACE=${iface}\$" "$p" 2>/dev/null || continue
+        grep -q '^MIMIC_XDP_MODE=skb$' "$p" 2>/dev/null || set_or_append_kv "$p" MIMIC_XDP_MODE skb
+    done
+    apply_mimic_conf_iface "$iface"
+}
+
 # Start mimic@<iface> and verify it actually came up. On failure (e.g. XDP native
 # rejected on virtio_net + GRO), force skb mode for that nic's profiles and retry.
 ensure_mimic_service_up() {
-    local iface="$1" p
+    local iface="$1"
     # Already up (shared by another profile on this nic) → leave it running.
     systemctl is-active --quiet "wg-mimic-mimic@${iface}.service" 2>/dev/null && return 0
     # Clear any stale XDP program before attaching, so a previously failed native
     # attach can't block this (re)attach.
     detach_xdp "$iface"
+    # On virtio NICs native is unreliable → start straight in skb (no native churn).
+    nic_prefers_skb "$iface" && force_iface_skb "$iface"
     systemctl enable --now "wg-mimic-mimic@${iface}.service" 2>/dev/null || true
-    sleep 1
-    systemctl is-active --quiet "wg-mimic-mimic@${iface}.service" && return 0
+    wait_mimic_active "$iface" 8 && return 0
     warn "mimic@${iface} 未起来，改用 XDP skb 模式重试..."
     # Fully stop the failed unit and clear the leftover program before retrying —
     # otherwise the stale native attach blocks the skb attach too.
     systemctl stop "wg-mimic-mimic@${iface}.service" 2>/dev/null || true
     detach_xdp "$iface"
-    for p in "$PROFILES_DIR"/*.env; do
-        [[ -f "$p" ]] || continue
-        grep -q "^WAN_IFACE=${iface}\$" "$p" 2>/dev/null && set_or_append_kv "$p" MIMIC_XDP_MODE skb
-    done
-    apply_mimic_conf_iface "$iface"
+    force_iface_skb "$iface"
     systemctl restart "wg-mimic-mimic@${iface}.service" 2>/dev/null || true
-    sleep 1
-    if systemctl is-active --quiet "wg-mimic-mimic@${iface}.service"; then
+    if wait_mimic_active "$iface" 8; then
         ok "mimic@${iface} 已用 skb 模式启动"
         return 0
     fi
@@ -1485,6 +1523,9 @@ import_code_interactive() {
     prompt public_ip "公网 IPv4（客户端连接本入口的地址）" "${prev_host:-${egress_ip:-$local_ip}}"
     wan_iface="$(detect_default_iface)"
     prompt wan_iface "Mimic 绑定网卡" "${prev_iface:-${wan_iface:-eth0}}"
+    # virtio_net native XDP 不可靠 → 默认 skb，省去 native 失败的折腾
+    local ing_xdp_mode="native"
+    nic_prefers_skb "$wan_iface" && { ing_xdp_mode="skb"; info "检测到 ${wan_iface} 为 virtio 网卡，Mimic 默认用 XDP skb 模式"; }
 
     printf '\n── 接入码摘要 ──\n'
     printf '  IX 端点: %s:%s\n' "$CODE_IX_ENDPOINT_HOST" "$CODE_WG_PORT"
@@ -1512,7 +1553,7 @@ import_code_interactive() {
         "WG_PEER_PUBLIC_KEY=${CODE_IX_WG_PUBKEY}" \
         "FORWARD_PROTO=${CODE_FORWARD_PROTO}" \
         "MIMIC_KEEPALIVE=${CODE_MIMIC_KEEPALIVE:-300:::}" \
-        "MIMIC_XDP_MODE=native" \
+        "MIMIC_XDP_MODE=${ing_xdp_mode}" \
         "FW_OPEN_PORT=true"
 
     # 更新模式：删除新接入码里已不存在的旧规则（IX 端已删的）
@@ -1786,12 +1827,19 @@ diagnose_profile() {
     command_exists nft && ok "nftables" || warn "缺少 nftables"
     command_exists wg && ok "wireguard-tools" || warn "缺少 wireguard-tools"
     command_exists mimic && ok "mimic CLI" || warn "缺少 mimic"
-    lsmod 2>/dev/null | grep -q '^mimic ' && ok "mimic kernel module" || warn "mimic 内核模块未加载"
+    mimic_module_loaded && ok "mimic kernel module" || warn "mimic 内核模块未加载"
     if kernel_ge_61; then ok "kernel >= 6.1 ($(uname -r))"; else warn "kernel < 6.1 ($(uname -r))"; fi
     [[ -f /sys/kernel/btf/vmlinux ]] && ok "BTF vmlinux" || warn "无 BTF（精简内核可能需 kprobe 编 mimic）"
     [[ "$(sysctl -n net.ipv4.ip_forward 2>/dev/null)" == "1" ]] && ok "ip_forward" || warn "ip_forward 未开启"
+    [[ -n "${WAN_IFACE:-}" ]] && printf '  Mimic 绑定网卡: %s（驱动 %s，XDP %s）\n' \
+        "$WAN_IFACE" "$(nic_driver "$WAN_IFACE")" "${MIMIC_XDP_MODE:-auto}"
     if [[ -n "${WAN_IFACE:-}" && -f "${MIMIC_CONF_DIR}/${WAN_IFACE}.conf" ]]; then
-        mimic run --check -F "${MIMIC_CONF_DIR}/${WAN_IFACE}.conf" "$WAN_IFACE" 2>&1 | sed 's/^/  /' || warn "mimic --check 失败"
+        # mimic >= 0.7 没有 run --check；仅在支持时才校验配置，否则跳过避免误报
+        if mimic run --help 2>&1 | grep -q -- '--check'; then
+            mimic run --check -F "${MIMIC_CONF_DIR}/${WAN_IFACE}.conf" "$WAN_IFACE" 2>&1 | sed 's/^/  /' || warn "mimic --check 失败"
+        else
+            printf '  mimic 配置: %s（本版 mimic 无 --check，跳过校验）\n' "${MIMIC_CONF_DIR}/${WAN_IFACE}.conf"
+        fi
     fi
     health_profile "$id"
 }
@@ -1902,6 +1950,154 @@ rotate_keys() {
     generate_code | tee "${CODES_DIR}/${PROFILE_ID}.code"
     chmod 600 "${CODES_DIR}/${PROFILE_ID}.code"
     warn "已轮换入口密钥：公网入口必须用新接入码重新 import-code（两端会短暂中断）"
+}
+
+# ── tunnel quality test / endpoint switch / auto-switch ─────────────────────
+
+# The OTHER end's mesh IP — what we ping to measure tunnel quality end-to-end.
+peer_mesh_ip() {
+    if [[ "${ROLE:-}" == "nat-ingress" ]]; then printf '%s' "${WG_IX_IP:-}"; else printf '%s' "${WG_INGRESS_IP:-}"; fi
+}
+
+# Ping the peer over the tunnel; echo integer loss%% (0-100). Empty target → 100.
+measure_tunnel_loss() {
+    local target="$1" count="${2:-20}" out loss
+    [[ -n "$target" ]] || { printf '100'; return 0; }
+    out="$(ping -c "$count" -i 0.2 -W 2 "$target" 2>/dev/null || true)"
+    loss="$(printf '%s' "$out" | sed -n 's/.* \([0-9]\{1,3\}\)% packet loss.*/\1/p' | head -1)"
+    [[ "$loss" =~ ^[0-9]+$ ]] || loss=100
+    printf '%s' "$loss"
+}
+
+# wm test [ID] [count] — measure real tunnel packet loss + rtt, with a verdict.
+test_profile() {
+    local id count; id="$(resolve_profile_id "${1:-}")"; count="${2:-100}"
+    load_profile "$id"
+    local target; target="$(peer_mesh_ip)"
+    [[ -n "$target" ]] || die "线路 ${PROFILE_ID} 无对端虚拟IP，无法测试"
+    printf '隧道测试 %s：ping 对端 %s（%s 包）...\n' "$PROFILE_ID" "$target" "$count"
+    local out loss rtt
+    out="$(ping -c "$count" -i 0.2 -W 2 "$target" 2>/dev/null || true)"
+    loss="$(printf '%s' "$out" | sed -n 's/.* \([0-9]\{1,3\}\)% packet loss.*/\1/p' | head -1)"
+    [[ "$loss" =~ ^[0-9]+$ ]] || loss=100
+    rtt="$(printf '%s' "$out" | sed -n 's#.*= [0-9.]*/\([0-9.]*\)/.*#\1#p' | head -1)"
+    printf '  丢包: %s%%   平均延迟: %s ms\n' "$loss" "${rtt:-?}"
+    if   (( loss <= 2 ));  then ok   "线路质量良好（丢包 ${loss}%）"
+    elif (( loss <= 10 )); then warn "线路质量一般（丢包 ${loss}%，TCP/延迟测速可能受影响）"
+    else                        warn "线路质量差（丢包 ${loss}%，建议换中转：wm set-endpoint ${PROFILE_ID} <新中转IP>）"
+    fi
+}
+
+# wm set-endpoint <ID> <host> — switch which IX public/中转 address is used.
+#  nat-ingress: rewrites mimic(remote=)/wg(Endpoint=) and restarts (dials the new 中转).
+#  nat-transit: only goes into the access code → refresh it so ingresses re-import.
+set_endpoint() {
+    local id host; id="$(resolve_profile_id "${1:-}")"; host="${2:-}"
+    require_root
+    [[ -n "$host" ]] || die "用法: wm set-endpoint <线路> <新IX公网地址/中转IP>"
+    load_profile "$id"
+    set_or_append_kv "$(profile_env_path "$PROFILE_ID")" IX_ENDPOINT_HOST "$host"
+    load_profile "$id"
+    if [[ "${ROLE:-}" == "nat-ingress" ]]; then
+        apply_profile_configs
+        if systemctl is-active --quiet "wg-mimic-tunnel@${PROFILE_ID}.service" 2>/dev/null; then
+            restart_profile "$PROFILE_ID"
+        fi
+        ok "入口 ${PROFILE_ID} 已切到 IX 端点 ${host}:${WG_PORT}"
+        sleep 3
+        info "切换后隧道丢包：$(measure_tunnel_loss "$(peer_mesh_ip)" 20)%（wm test ${PROFILE_ID} 看详情）"
+    else
+        regenerate_code_if_transit
+        ok "IX ${PROFILE_ID} 端点已设为 ${host}：公网入口需重新 import-code"
+    fi
+}
+
+# wm set-endpoints <ID> ip1,ip2,... — candidate 中转 IPs for auto-switch.
+set_endpoints() {
+    local id csv; id="$(resolve_profile_id "${1:-}")"; csv="${2:-}"
+    require_root
+    load_profile "$id"
+    set_or_append_kv "$(profile_env_path "$PROFILE_ID")" ENDPOINT_CANDIDATES "$csv"
+    ok "候选中转(${PROFILE_ID})已设：${csv:-（已清空）}"
+}
+
+# wm autoswitch <ID> [threshold%] — if current 中转 loss exceeds threshold, probe
+# the candidates and switch to the best one. Disruptive only when current is bad.
+autoswitch_once() {
+    local id threshold; id="$(resolve_profile_id "${1:-}")"; threshold="${2:-10}"
+    require_root
+    load_profile "$id"
+    [[ "${ROLE:-}" == "nat-ingress" ]] || die "autoswitch 仅用于公网入口(nat-ingress)线路"
+    [[ -n "${ENDPOINT_CANDIDATES:-}" ]] || die "请先设候选中转：wm set-endpoints ${PROFILE_ID} ip1,ip2,..."
+    local cur loss; cur="${IX_ENDPOINT_HOST}"
+    loss="$(measure_tunnel_loss "$(peer_mesh_ip)" 20)"
+    if (( loss <= threshold )); then
+        info "autoswitch ${PROFILE_ID}: 当前 ${cur} 丢包 ${loss}% ≤ ${threshold}%，保持"
+        return 0
+    fi
+    warn "autoswitch ${PROFILE_ID}: 当前 ${cur} 丢包 ${loss}% > ${threshold}%，探测候选..."
+    local best="$cur" best_loss="$loss" ip l _arr
+    IFS=',' read -ra _arr <<<"$ENDPOINT_CANDIDATES"
+    for ip in "${_arr[@]}"; do
+        ip="$(trim "$ip")"; [[ -n "$ip" && "$ip" != "$cur" ]] || continue
+        set_or_append_kv "$(profile_env_path "$PROFILE_ID")" IX_ENDPOINT_HOST "$ip"
+        load_profile "$id"; apply_profile_configs; restart_profile "$PROFILE_ID" >/dev/null 2>&1 || true
+        sleep 3
+        l="$(measure_tunnel_loss "$(peer_mesh_ip)" 20)"
+        info "  候选 ${ip} 丢包 ${l}%"
+        (( l < best_loss )) && { best="$ip"; best_loss="$l"; }
+        (( l <= threshold )) && break
+    done
+    set_or_append_kv "$(profile_env_path "$PROFILE_ID")" IX_ENDPOINT_HOST "$best"
+    load_profile "$id"; apply_profile_configs; restart_profile "$PROFILE_ID" >/dev/null 2>&1 || true
+    ddns_state_set "autoswitch:${PROFILE_ID}" "$best"
+    ok "autoswitch ${PROFILE_ID}: 选定 ${best}（丢包 ${best_loss}%）"
+}
+
+install_autoswitch_units() {
+    local tmp; tmp="$(mktemp)"
+    cat >"$tmp" <<EOF
+[Unit]
+Description=wg-mimic-fabric autoswitch %i
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=${WM_BIN} autoswitch %i
+EOF
+    install -m 644 "$tmp" "$SYSTEMD_AUTOSWITCH_SERVICE"
+    cat >"$tmp" <<'EOF'
+[Unit]
+Description=wg-mimic-fabric autoswitch timer %i
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=5min
+
+[Install]
+WantedBy=timers.target
+EOF
+    install -m 644 "$tmp" "$SYSTEMD_AUTOSWITCH_TIMER"
+    rm -f "$tmp"
+    systemctl daemon-reload 2>/dev/null || true
+}
+
+autoswitch_enable() {
+    local id; id="$(resolve_profile_id "${1:-}")"
+    require_root
+    load_profile "$id"
+    [[ -n "${ENDPOINT_CANDIDATES:-}" ]] || die "请先 wm set-endpoints ${PROFILE_ID} ip1,ip2,..."
+    install_autoswitch_units
+    systemctl enable --now "wg-mimic-autoswitch@${PROFILE_ID}.timer" 2>/dev/null || true
+    ok "已启用自动切换(${PROFILE_ID})：每 5 分钟测丢包，超阈值自动切候选中转"
+}
+
+autoswitch_disable() {
+    local id; id="$(resolve_profile_id "${1:-}")"
+    require_root
+    systemctl disable --now "wg-mimic-autoswitch@${id}.timer" 2>/dev/null || true
+    ok "已停用自动切换(${id})"
 }
 
 set_profile_mtu() {
@@ -2324,7 +2520,11 @@ uninstall_wm_core() {
     fi
     systemctl disable --now wg-mimic-ddns.timer 2>/dev/null || true
     systemctl disable wg-mimic-resume.service 2>/dev/null || true
-    rm -f "$WM_BIN" "$SYSTEMD_MIMIC_TEMPLATE" "$SYSTEMD_TUNNEL_TEMPLATE" "$SYSTEMD_DDNS_SERVICE" "$SYSTEMD_DDNS_TIMER" "$SYSTEMD_RESUME_SERVICE"
+    local _asw
+    for _asw in $(systemctl list-units --all --no-legend 'wg-mimic-autoswitch@*.timer' 2>/dev/null | awk '{print $1}'); do
+        systemctl disable --now "$_asw" 2>/dev/null || true
+    done
+    rm -f "$WM_BIN" "$SYSTEMD_MIMIC_TEMPLATE" "$SYSTEMD_TUNNEL_TEMPLATE" "$SYSTEMD_DDNS_SERVICE" "$SYSTEMD_DDNS_TIMER" "$SYSTEMD_AUTOSWITCH_SERVICE" "$SYSTEMD_AUTOSWITCH_TIMER" "$SYSTEMD_RESUME_SERVICE"
     # 大写别名（若存在）
     rm -f "/usr/local/bin/WM" 2>/dev/null || true
     if [[ "$remove_configs" == "true" ]]; then
@@ -2410,6 +2610,11 @@ wg-mimic-fabric ${SCRIPT_VERSION} — 公网入口 ⇄ IX WireGuard 组网 + Mim
   wm apply-rules [ID]             重建 nft 规则
   wm set-pool <ID> [端口池]        IX 中转端口池(如 40000-40010,40050；留空=清除，规则自动分配)
   wm health [ID] / wm diagnose [ID] / wm health-all
+  wm test [ID] [包数]             测隧道真实丢包/延迟（判断中转线路质量；默认100包）
+  wm set-endpoint <ID> <中转IP>    切换该线路用的 IX 公网/中转地址（入口侧即时生效）
+  wm set-endpoints <ID> ip1,ip2,..  设置自动切换的候选中转列表
+  wm autoswitch <ID> [阈值%]       测当前丢包，超阈值(默认10%)自动切到最优候选中转
+  wm autoswitch-enable|autoswitch-disable <ID>   定时自动切换(每5分钟)
   wm ddns-enable|ddns-disable|ddns-status|ddns-refresh   域名 IP 变化自动刷新(每3分钟)
   wm set-group <ID> <组名> [primary|backup|standalone] [优先级]
   wm list-groups / switch-line <组名> <目标ID> / primary-backup-check <组名>
@@ -2420,7 +2625,7 @@ wg-mimic-fabric ${SCRIPT_VERSION} — 公网入口 ⇄ IX WireGuard 组网 + Mim
 架构: 客户端 → 公网入口:client_port → WG(Mimic 伪TCP) → IX 虚拟IP:transit_port → 落地
 
 环境变量:
-  WMF_TAG=v0.6.0                  安装/升级时指定版本
+  WMF_TAG=v1.0.0                  安装/升级时指定版本
   WMF_REPO=ike-sh/wg-mimic-fabric GitHub 仓库
   WMF_UPGRADE_YES=1               升级跳过确认
   WMF_PURGE_YES=1                 purge 跳过确认
@@ -2483,7 +2688,12 @@ MENU
                         read -r -p "选择线路 ID: " id </dev/tty; id="$(sanitize_id "$(trim "$id")")"
                     fi
                     if [[ -n "$id" ]]; then
-                        printf '  操作: 1)新增规则  2)编辑规则  3)删除规则  4)设置端口池  回车)返回\n'
+                        printf '  操作:\n'
+                        printf '    1) 新增规则\n'
+                        printf '    2) 编辑规则\n'
+                        printf '    3) 删除规则\n'
+                        printf '    4) 设置端口池\n'
+                        printf '    回车) 返回\n'
                         read -r -p "选择操作: " rid </dev/tty
                         case "$(trim "$rid")" in
                             1|add) add_rule "$id" ;;
@@ -2541,6 +2751,12 @@ main() {
         switch-line) switch_line "${2:-}" "${3:-}" ;;
         primary-backup-check) primary_backup_check "${2:-}" ;;
         health-all) health_all ;;
+        test) test_profile "${2:-}" "${3:-}" ;;
+        set-endpoint) set_endpoint "${2:-}" "${3:-}" ;;
+        set-endpoints) set_endpoints "${2:-}" "${3:-}" ;;
+        autoswitch) autoswitch_once "${2:-}" "${3:-}" ;;
+        autoswitch-enable) autoswitch_enable "${2:-}" ;;
+        autoswitch-disable) autoswitch_disable "${2:-}" ;;
         set-pool) set_transit_pool "${2:-}" "${3:-}" ;;
         set-mtu) set_profile_mtu "${2:-}" "${3:-}" ;;
         set-xdp-mode) set_profile_xdp_mode "${2:-}" "${3:-}" ;;

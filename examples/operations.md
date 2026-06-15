@@ -54,8 +54,9 @@ wm list-rules ix-nat
 
 ```bash
 wm diagnose ix-nat
-wg show wm-ix-nat             # WG 握手与流量
-mimic show -c eth0           # Mimic 连接状态
+wm test ix-nat               # 隧道真实丢包/延迟（判断中转线路质量）
+wg show                      # WG 握手与流量
+mimic show eth0              # Mimic 连接状态（参数为绑定网卡）
 ping -c3 10.88.0.2           # 入口 ping IX 虚拟 IP
 wm rotate-keys ix-nat        # 密钥泄露后轮换密钥（会重启IX，公网入口需重新 import-code）
 WMF_PURGE_YES=1 wm purge     # 完全清理
