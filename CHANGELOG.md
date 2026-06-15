@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.1.0-beta.15] - 2026-06-16
+
+### Fixed（relay 全局出口漏配对端 mesh 路由 → `wm test` / A↔B mesh ping 100% 丢包；真机定位）
+
+- **relay 全局出口补对端 mesh 路由**：`relay` 角色在 `EXIT_MODE=global` 下用 `Table = off`（避免 wg-quick 把 `0.0.0.0/0` 塞进主表劫持 A 自身 SSH/现有线路），但**只为客户端子网建了策略路由，漏了到对端 mesh IP（B=`WG_IX_IP`）的隧道路由**。结果主表里 `10.90.0.2` 落到物理网卡默认路由（`ip route get 10.90.0.2 → via <gw> dev eth0/ens5`），mesh 流量根本没进隧道 → `wm test` / `ping 对端` 100% 丢包（而隧道握手与 keepalive 其实正常、收发计数对等，极具迷惑性）。现 relay 全局出口的 PostUp 显式 `ip route replace <对端 mesh IP>/32 dev %i`（IPv6 用 `ip -6` 同理），PostDown 清理。**真机实测**：加这条路由后 `ping 10.90.0.2` 从 100% 丢包变为 0% 丢包、延迟 ~32ms。
+- 说明：此前 beta.14 修的 swgp `.tar.zst` / `Exec format error`、以及 GSO 排查都是真实问题，但都不是 mesh ping 不通的根因——真正拦路的是这条漏掉的路由（数据包压根没进隧道）。
+- 验证：`bash -n` 通过；`smoke nopy` 全 10 项通过；relay 全局出口渲染实测 `wg.conf` 含 `PostUp = ip route replace <peer-mesh-ip>/32 dev %i`。
+
 ## [1.1.0-beta.14] - 2026-06-16
 
 ### Fixed（swgp-go 被装成损坏文件导致 `Exec format error`，A↔B 骨干 100% 丢包的真正根因）

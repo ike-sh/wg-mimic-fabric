@@ -2,7 +2,7 @@
 # wg-mimic-fabric — WireGuard + Mimic tunnel orchestrator (MVP)
 set -Eeuo pipefail
 
-SCRIPT_VERSION="1.1.0-beta.14"
+SCRIPT_VERSION="1.1.0-beta.15"
 MIMIC_UPSTREAM_TAG="${MIMIC_UPSTREAM_TAG:-v0.7.0}"
 APP_NAME="wg-mimic-fabric"
 WMF_PROJECT_REPO="${WMF_REPO:-ike-sh/wg-mimic-fabric}"
@@ -1192,6 +1192,14 @@ EOF
             # 改用「仅客户端子网」策略路由，A 自身流量保持原默认路由不变。
             peerb_allowed="0.0.0.0/0"; [[ -n "${WG_IX_IP6:-}" ]] && peerb_allowed="0.0.0.0/0, ::/0"
             extra="${extra}Table = off"$'\n'
+            # Table=off 时 wg-quick 不会把对端 mesh 路由放进主表 → 必须显式把对端 mesh IP 指到隧道。
+            # 否则 wm test / A↔B mesh 流量会漏到物理网卡默认路由（真机实测 ping 对端 100% 丢包的根因）。
+            extra="${extra}PostUp = ip route replace ${WG_IX_IP}/32 dev %i"$'\n'
+            extra="${extra}PostDown = ip route del ${WG_IX_IP}/32 dev %i 2>/dev/null || true"$'\n'
+            if [[ -n "${WG_IX_IP6:-}" ]]; then
+                extra="${extra}PostUp = ip -6 route replace ${WG_IX_IP6}/128 dev %i"$'\n'
+                extra="${extra}PostDown = ip -6 route del ${WG_IX_IP6}/128 dev %i 2>/dev/null || true"$'\n'
+            fi
             if [[ -n "${CLIENT_SUBNET:-}" ]]; then
                 local _t; _t=$(( 8000 + $(printf '%s' "$PROFILE_ID" | cksum | cut -d' ' -f1) % 1000 ))
                 extra="${extra}PostUp = ip route replace default dev %i table ${_t}; ip rule del from ${CLIENT_SUBNET} lookup ${_t} 2>/dev/null || true; ip rule add from ${CLIENT_SUBNET} lookup ${_t}"$'\n'
