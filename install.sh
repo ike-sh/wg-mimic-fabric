@@ -2,7 +2,7 @@
 # wg-mimic-fabric — WireGuard + Mimic tunnel orchestrator (MVP)
 set -Eeuo pipefail
 
-SCRIPT_VERSION="0.6.8"
+SCRIPT_VERSION="0.6.9"
 MIMIC_UPSTREAM_TAG="${MIMIC_UPSTREAM_TAG:-v0.7.0}"
 APP_NAME="wg-mimic-fabric"
 WMF_PROJECT_REPO="${WMF_REPO:-ike-sh/wg-mimic-fabric}"
@@ -99,7 +99,20 @@ sanitize_id() {
     printf '%s' "$s"
 }
 
-wg_iface_for() { printf 'wm-%s' "$(sanitize_id "$1")"; }
+wg_iface_for() {
+    local id name h
+    id="$(sanitize_id "$1")"
+    name="wm-${id}"
+    if [[ "${#name}" -le 15 ]]; then
+        printf '%s' "$name"
+    else
+        # Linux caps network interface names at 15 chars (IFNAMSIZ-1); a longer
+        # name makes wg-quick fail. Derive a stable short name for long ids.
+        h="$(printf '%s' "$id" | md5sum 2>/dev/null | cut -c1-11)"
+        [[ -n "$h" ]] || h="$(printf '%s' "$id" | cksum | tr -cd '0-9' | cut -c1-11)"
+        printf 'wm-%s' "$h"
+    fi
+}
 
 ensure_dirs() {
     install -d -m 700 "$CONFIG_DIR" "$PROFILES_DIR" "$CODES_DIR" "$KEYS_DIR" "$STATE_DIR"
@@ -1130,11 +1143,22 @@ write_tunnel_mimic_dropin() {
     local profile_id="$1" iface="$2"
     [[ -n "$profile_id" && -n "$iface" ]] || return 0
     local dir="/etc/systemd/system/wg-mimic-tunnel@${profile_id}.service.d"
+    local wgi wgq
+    wgi="$(wg_iface_for "$profile_id")"
+    wgq="$(resolve_bin wg-quick /usr/bin/wg-quick)"
     local tmp; tmp="$(mktemp)"
+    # Also override ExecStart to the (possibly shortened) interface's conf path, so
+    # a long profile id never yields an interface name > 15 chars.
     cat >"$tmp" <<EOF
 [Unit]
 After=wg-mimic-mimic@${iface}.service
 Requires=wg-mimic-mimic@${iface}.service
+
+[Service]
+ExecStart=
+ExecStart=${wgq} up ${WG_CONF_DIR}/${wgi}.conf
+ExecStop=
+ExecStop=${wgq} down ${WG_CONF_DIR}/${wgi}.conf
 EOF
     install -d -m 755 "$dir"
     install -m 644 "$tmp" "${dir}/10-mimic-dep.conf"
@@ -1339,9 +1363,12 @@ create_transit_interactive() {
     printf '════════════════════════════════════════════\n'
     printf '公网入口：wm import-code 粘贴上方接入码\n'
     printf 'IX 机启动：wm start %s\n' "$profile_id"
-    if mimic_needs_reboot; then
-        offer_reboot "start ${profile_id}"
-    fi
+    local _autostart=""
+    prompt _autostart "现在就启动该线路吗？[Y/n]" "Y"
+    case "$_autostart" in
+        [Nn]*) info "稍后手动启动：wm start ${profile_id}" ;;
+        *) start_profile "$profile_id" ;;
+    esac
 }
 
 import_code_interactive() {
@@ -1426,9 +1453,12 @@ import_code_interactive() {
     printf '\n═══ 公网入口已配置 ═══\n'
     show_port_map "$ingress_id"
     printf '\n执行：wm start %s\n' "$ingress_id"
-    if mimic_needs_reboot; then
-        offer_reboot "start ${ingress_id}"
-    fi
+    local _autostart=""
+    prompt _autostart "现在就启动该线路吗？[Y/n]" "Y"
+    case "$_autostart" in
+        [Nn]*) info "稍后手动启动：wm start ${ingress_id}" ;;
+        *) start_profile "$ingress_id" ;;
+    esac
 }
 
 regenerate_code_if_transit() {
@@ -2292,8 +2322,8 @@ MENU
         case "$(trim "$choice")" in
             1) create_transit_interactive ;;
             2) import_code_interactive ;;
-            3) read -r -p "线路 ID: " id </dev/tty; start_profile "$(sanitize_id "$(trim "$id")")" ;;
-            4) read -r -p "线路 ID: " id </dev/tty; stop_profile "$(sanitize_id "$(trim "$id")")" ;;
+            3) read -r -p "线路 ID（回车=唯一）: " id </dev/tty; start_profile "$(resolve_profile_id "$(trim "$id")")" ;;
+            4) read -r -p "线路 ID（回车=唯一）: " id </dev/tty; stop_profile "$(resolve_profile_id "$(trim "$id")")" ;;
             5) read -r -p "线路 ID（回车=唯一）: " id </dev/tty; health_profile "$(trim "$id")" ;;
             6) list_profile_ids | sed 's/^/  /' || printf '  (无线路)\n' ;;
             7) read -r -p "IX 线路 ID: " id </dev/tty; show_code "$(sanitize_id "$(trim "$id")")" ;;

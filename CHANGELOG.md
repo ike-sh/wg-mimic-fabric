@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.6.9] - 2026-06-15
+
+### Fixed
+
+- **公网入口隧道起不来的真因**：WireGuard 接口名取自 `wm-<线路ID>`，入口线路 `ix-nat-ingress` → `wm-ix-nat-ingress` 共 **17 字符 > Linux 接口名上限 15（IFNAMSIZ）**，`wg-quick` 直接失败（IX 的 `wm-ix-nat` 9 字符正常）。`wg_iface_for` 现在**超过 15 字符就用哈希压到 `wm-<11hex>`**；并通过 per-profile drop-in **覆盖 tunnel 单元的 ExecStart** 指向该短接口的 conf（systemd 实例仍按线路ID，改动面最小）
+
+### Added
+
+- `create-transit` / `import-code` 末尾**询问「现在就启动该线路吗？[Y/n]」并默认自动 `wm start`**（之前必须手动 start，易遗漏）
+- 交互菜单「启动/停止线路」回车默认**唯一线路**（不再因留空报「无效的 PROFILE_ID」）
+
 ## [0.6.8] - 2026-06-15
 
 ### Fixed

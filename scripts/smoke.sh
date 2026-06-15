@@ -151,6 +151,14 @@ test_mimic() {
     echo "MIMIC OK"
 }
 
+test_iface() {
+    [[ "$(wg_iface_for ix-nat)" == "wm-ix-nat" ]] || fail "short iface: $(wg_iface_for ix-nat)"
+    local long; long="$(wg_iface_for ix-nat-ingress)"   # wm-ix-nat-ingress = 17 chars
+    [[ "${#long}" -le 15 ]] || fail "iface not capped (${#long}): $long"
+    [[ "$long" == wm-* ]] || fail "iface prefix: $long"
+    echo "IFACE OK"
+}
+
 case "${1:-all}" in
     rule) test_rule ;;
     code) test_code ;;
@@ -160,7 +168,8 @@ case "${1:-all}" in
     group) test_group ;;
     pool) test_pool ;;
     mimic) test_mimic ;;
-    nopy) test_rule; test_wgconf; test_nft; test_ipv6; test_group; test_pool; test_mimic; echo "NOPY OK" ;;
-    all) test_rule; test_code; test_wgconf; test_nft; test_ipv6; test_group; test_pool; test_mimic; echo "ALL OK" ;;
-    *) echo "usage: smoke.sh [rule|code|wgconf|nft|ipv6|group|pool|mimic|nopy|all]"; exit 1 ;;
+    iface) test_iface ;;
+    nopy) test_rule; test_wgconf; test_nft; test_ipv6; test_group; test_pool; test_mimic; test_iface; echo "NOPY OK" ;;
+    all) test_rule; test_code; test_wgconf; test_nft; test_ipv6; test_group; test_pool; test_mimic; test_iface; echo "ALL OK" ;;
+    *) echo "usage: smoke.sh [rule|code|wgconf|nft|ipv6|group|pool|mimic|iface|nopy|all]"; exit 1 ;;
 esac
