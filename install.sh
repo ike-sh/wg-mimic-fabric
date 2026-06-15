@@ -2,7 +2,7 @@
 # wg-mimic-fabric — WireGuard + Mimic tunnel orchestrator (MVP)
 set -Eeuo pipefail
 
-SCRIPT_VERSION="1.1.0-beta.3"
+SCRIPT_VERSION="1.1.0-beta.4"
 MIMIC_UPSTREAM_TAG="${MIMIC_UPSTREAM_TAG:-v0.7.0}"
 APP_NAME="wg-mimic-fabric"
 WMF_PROJECT_REPO="${WMF_REPO:-ike-sh/wg-mimic-fabric}"
@@ -1060,9 +1060,16 @@ EOF
         extra=""
         [[ -n "${CLIENT_WG_PORT:-}" ]] && extra="${extra}ListenPort = ${CLIENT_WG_PORT}"$'\n'
         if [[ "${EXIT_MODE:-global}" == "global" ]]; then
-            # 全局出口：peer B 收所有目的地；FwMark 让 A 自身/swgp 到 B 的流量避开 WG 默认路由(防环)
+            # 全局出口：peer B 收所有目的地（crypto-routing）。
+            # 关键：Table=off 让 wg-quick 不把 0/0 塞进主表（否则劫持 A 自身 SSH/现有线路）；
+            # 改用「仅客户端子网」策略路由，A 自身流量保持原默认路由不变。
             peerb_allowed="0.0.0.0/0"; [[ -n "${WG_IX_IP6:-}" ]] && peerb_allowed="0.0.0.0/0, ::/0"
-            extra="${extra}FwMark = ${WMF_FWMARK}"$'\n'
+            extra="${extra}Table = off"$'\n'
+            if [[ -n "${CLIENT_SUBNET:-}" ]]; then
+                local _t; _t=$(( 8000 + $(printf '%s' "$PROFILE_ID" | cksum | cut -d' ' -f1) % 1000 ))
+                extra="${extra}PostUp = ip route replace default dev %i table ${_t}; ip rule del from ${CLIENT_SUBNET} lookup ${_t} 2>/dev/null; ip rule add from ${CLIENT_SUBNET} lookup ${_t}"$'\n'
+                extra="${extra}PostDown = ip rule del from ${CLIENT_SUBNET} lookup ${_t} 2>/dev/null; ip route flush table ${_t} 2>/dev/null; true"$'\n'
+            fi
         else
             peerb_allowed="${ix_allowed}"
         fi

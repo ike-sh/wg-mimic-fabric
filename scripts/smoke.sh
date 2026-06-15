@@ -245,7 +245,9 @@ test_client() {
     load_profile gw
     local w; w="$(render_wg_conf)"
     grep -q 'ListenPort = 51820' <<<"$w" || fail "relay listenport: $w"
-    grep -qF "FwMark = ${WMF_FWMARK}" <<<"$w" || fail "relay fwmark"
+    grep -qF 'Table = off' <<<"$w" || fail "relay table off (avoid main-route hijack)"
+    grep -q 'PostUp = ip route replace default dev %i table' <<<"$w" || fail "relay policy route"
+    grep -q 'ip rule add from 10.89.0.0/24 lookup' <<<"$w" || fail "relay client rule"
     grep -qF 'AllowedIPs = 0.0.0.0/0' <<<"$w" || fail "relay peerB 0/0"
     grep -qF 'Address = 10.89.0.1/24' <<<"$w" || fail "relay client subnet addr"
     grep -qF 'PublicKey = CPUB' <<<"$w" || fail "client peer pubkey"

@@ -1,5 +1,16 @@
 # Changelog
 
+## [1.1.0-beta.4] - 2026-06-15
+
+### Fixed（严重：全局出口劫持网关自身默认路由）
+
+- **relay(A) 全局出口不再劫持 A 自身路由**：之前 peer B 用 `AllowedIPs=0.0.0.0/0` 时，wg-quick 默认把 `0/0` 装进主路由表，导致 **A 的 SSH 与现有 nat-ingress 线路一起断**。
+- 现改为 **`Table = off` + 按客户端子网的策略路由**：`PostUp` 把默认路由只写进**每条线路独立的路由表**（`8000+hash(profile)%1000`），并 `ip rule from <客户端子网> lookup <表>`；`PostDown` 清理。**A 自身流量保持原默认路由不变**，只有客户端子网经隧道出 B。
+- 移除 relay 接口上的 `FwMark`（策略路由已替代其防环作用；swgp 的 `proxyFwmark` 保留无害）。
+- smoke `client` 用例改断言 `Table = off` + 策略路由规则。
+
+> ⚠️ 升级后需在 A 上 `wm stop exit-relay` 再 `wm start exit-relay`（或重新 import）以重渲染配置。
+
 ## [1.1.0-beta.3] - 2026-06-15
 
 ### Fixed（国内服务器拉取 GitHub release）
