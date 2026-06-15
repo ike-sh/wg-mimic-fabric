@@ -7,14 +7,29 @@ set -euo pipefail
 REPO="${WMF_REPO:-ike-sh/wg-mimic-fabric}"
 TAG="${WMF_TAG:-}"
 TS="$(date +%s)"
+DEFAULT_MIRRORS="https://gh.ddlc.top/,https://gh-proxy.com/,https://ghproxy.net/"
 
+# 国内可达：直连 GitHub 失败时，逐个镜像轮询拉取 install.sh
 fetch_repo_file() {
-    local relpath="$1" dest="$2" ref="${3:-main}"
+    local relpath="$1" dest="$2" ref="${3:-main}" m url mirrors=()
     if curl -fsSL -H "Accept: application/vnd.github.raw+json" \
-        -o "$dest" "https://api.github.com/repos/${REPO}/contents/${relpath}?ref=${ref}" 2>/dev/null; then
+        -o "$dest" "https://api.github.com/repos/${REPO}/contents/${relpath}?ref=${ref}" 2>/dev/null \
+        && [[ -s "$dest" ]]; then
         return 0
     fi
-    curl -fsSL -o "$dest" "https://raw.githubusercontent.com/${REPO}/${ref}/${relpath}?ts=${TS}"
+    IFS=',' read -ra mirrors <<< "${WMF_GITHUB_MIRRORS:-$DEFAULT_MIRRORS}"
+    for m in "${mirrors[@]}" "" ; do
+        if [[ -n "$m" ]]; then
+            url="${m%/}/https://raw.githubusercontent.com/${REPO}/${ref}/${relpath}"
+        else
+            url="https://raw.githubusercontent.com/${REPO}/${ref}/${relpath}?ts=${TS}"
+        fi
+        if curl -fsSL --connect-timeout 10 --max-time 120 -o "$dest" "$url" 2>/dev/null \
+            && [[ -s "$dest" ]]; then
+            return 0
+        fi
+    done
+    return 1
 }
 
 tmp="$(mktemp /tmp/wg-mimic-install.XXXXXX)"

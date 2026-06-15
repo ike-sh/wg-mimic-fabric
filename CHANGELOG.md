@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.1.0-beta.5] - 2026-06-15
+
+### Fixed（国内服务器一键引导拉取 install.sh）
+
+- **引导脚本 `scripts/bootstrap.sh` 拉取 install.sh 改走镜像轮询**：之前 `fetch_repo_file` 仅「GitHub API raw → 直连 `raw.githubusercontent.com`」两步，国内（中国大陆）直连常超时/被墙，导致 `curl -fsSL .../bootstrap.sh | sudo bash` 一键安装在**第一步下载**就卡死。
+- 现新增镜像兜底：API 失败后按 `WMF_GITHUB_MIRRORS`（默认 `gh.ddlc.top / gh-proxy.com / ghproxy.net`）逐个镜像拉取，最后回退直连；每次下载加 `[[ -s ]]` 非空校验 + `--connect-timeout 10 --max-time 120`，全部失败才 `return 1` 报错退出。
+- 与 beta.3 给 install.sh 内部 release 下载加 `gh_curl` 镜像同思路，至此整条安装链路（引导脚本 → install.sh → swgp-go/mimic 资产）国内全程可达。
+
 ## [1.1.0-beta.4] - 2026-06-15
 
 ### Fixed（严重：全局出口劫持网关自身默认路由）
