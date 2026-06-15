@@ -1,5 +1,23 @@
 # Changelog
 
+## [1.2.1] - 2026-06-16
+
+维护版：提升 README 可用性并清理孤立代码。**无功能行为变更**。
+
+### Changed（文档）
+
+- **README 置顶「快速开始」**：将一键安装命令（`curl … | sudo bash`）提到文档顶部独立成节并加入目录。此前安装命令位于较靠后的「安装」节、首屏不可见，易被误以为缺失。
+
+### Changed（代码清理）
+
+- 删除 3 个零引用的孤立变量：`APP_NAME`、`WMF_PROJECT_REPO`（下载逻辑实际内联 `${WMF_REPO:-…}`，`WMF_REPO` 覆盖功能不受影响）、`install_mimic_github_deb` 内未使用的 `arch`（mimic 仅发布 amd64 `.deb`，无多架构歧义，非 BUG）。
+- `delete-line` 的 `rm -rf` 加 `${PROFILES_DIR:?}/${id:?}` 兜底（`id` 上游已守空，纯防御加固）。
+- `wm automtu` 探测用的 `ping -M do` 改为 `ping -M "do"`，消除 shellcheck SC1010 误报。
+
+### Verified
+
+- `shellcheck -S warning` 0 告警；`bash -n`（install.sh + smoke.sh）通过；`smoke nopy` 回归全 11 项通过。
+
 ## [1.2.0] - 2026-06-16
 
 正式发布版：在 `1.1.x` 功能稳定的基础上，对交互体验与项目文档进行专业化打磨。**无功能行为变更**（菜单编号、CLI 子命令、接入码 schema 均保持兼容）。

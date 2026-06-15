@@ -2,10 +2,8 @@
 # wg-mimic-fabric — WireGuard + Mimic tunnel orchestrator (MVP)
 set -Eeuo pipefail
 
-SCRIPT_VERSION="1.2.0"
+SCRIPT_VERSION="1.2.1"
 MIMIC_UPSTREAM_TAG="${MIMIC_UPSTREAM_TAG:-v0.7.0}"
-APP_NAME="wg-mimic-fabric"
-WMF_PROJECT_REPO="${WMF_REPO:-ike-sh/wg-mimic-fabric}"
 
 CONFIG_DIR="/etc/wg-mimic-fabric"
 PROFILES_DIR="${CONFIG_DIR}/profiles"
@@ -1698,7 +1696,7 @@ delete_profile() {
     systemctl disable --now "wg-mimic-swgp@${id}.service" 2>/dev/null || true
     rm -f "$(profile_env_path "$id")" "${WG_CONF_DIR}/${wgi}.conf" \
         "${CODES_DIR}/${id}.code" "${SWGP_CONF_DIR}/${id}.json"
-    rm -rf "${PROFILES_DIR}/${id}" "/etc/systemd/system/wg-mimic-tunnel@${id}.service.d"
+    rm -rf "${PROFILES_DIR:?}/${id:?}" "/etc/systemd/system/wg-mimic-tunnel@${id}.service.d"
     systemctl daemon-reload 2>/dev/null || true
     apply_nft_all
     if [[ -n "$iface" ]]; then
@@ -2754,7 +2752,7 @@ auto_mtu() {
     local lo=1252 hi=$((probe_ceiling - 28)) mid best=0
     while (( lo <= hi )); do
         mid=$(( (lo + hi) / 2 ))
-        if ping -c1 -W2 -M do -s "$mid" "$peer" >/dev/null 2>&1; then
+        if ping -c1 -W2 -M "do" -s "$mid" "$peer" >/dev/null 2>&1; then
             best=$mid; lo=$(( mid + 1 ))
         else
             hi=$(( mid - 1 ))
@@ -2773,7 +2771,7 @@ auto_mtu() {
     fi
     set_profile_mtu "$id" "$new_mtu"
     sleep 2
-    if ping -c4 -W2 -M do -s "$(( new_mtu - 28 ))" "$peer" >/dev/null 2>&1; then
+    if ping -c4 -W2 -M "do" -s "$(( new_mtu - 28 ))" "$peer" >/dev/null 2>&1; then
         ok "已自适应 WG_MTU=${new_mtu}（满包复测通过）"
     else
         warn "设为 ${new_mtu} 后满包复测仍丢包，可手动再降：wm set-mtu ${id} $(( new_mtu - 20 ))"
@@ -2931,8 +2929,7 @@ install_mimic_github_deb() {
     local codename="${VERSION_CODENAME:-}"
     [[ -n "$codename" ]] || return 1
     command_exists apt-get || return 1
-    local arch tmpd mimic_deb dkms_deb url
-    arch="$(dpkg --print-architecture 2>/dev/null || echo amd64)"
+    local tmpd mimic_deb dkms_deb url
     tmpd="$(mktemp -d)"
     info "尝试从 GitHub Releases 下载 ${codename} .deb (${MIMIC_UPSTREAM_TAG})..."
     gh_curl "https://api.github.com/repos/hack3ric/mimic/releases/tags/${MIMIC_UPSTREAM_TAG}" "$tmpd/rel.json" \

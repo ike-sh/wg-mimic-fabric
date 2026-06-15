@@ -4,9 +4,21 @@
 
 | | |
 |------|------|
-| **版本** | `v1.2.0` |
+| **版本** | `v1.2.1` |
 | **仓库** | https://github.com/ike-sh/wg-mimic-fabric |
 | **许可** | MIT |
+
+---
+
+## 快速开始
+
+在**两端服务器**上分别执行一键安装（场景一：IX 与公网入口；场景二：国内网关 A 与国外出口 B）。需 **root**、内核 **≥ 6.1**，脚本会自动安装并按当前内核编译 mimic 模块：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/ike-sh/wg-mimic-fabric/main/scripts/bootstrap.sh | sudo bash
+```
+
+安装完成后运行 `wm` 进入交互菜单，按下文 [场景一：IX 中转组网](#场景一ix-中转组网) 或 [场景二：混淆全局出口](#场景二混淆全局出口) 操作；升级使用 `wm upgrade-script`。
 
 ---
 
@@ -26,6 +38,7 @@ wg-mimic-fabric 以 **WireGuard** 为底层组网，使用 **Mimic** 将 WireGua
 
 ## 目录
 
+- [快速开始](#快速开始)
 - [核心组件](#核心组件)
   - [Mimic](#mimic)
   - [swgp-go](#swgp-go)
@@ -394,7 +407,7 @@ wm health-all
 
 | 变量 | 说明 |
 |------|------|
-| `WMF_TAG=v1.2.0` | 安装 / 升级时指定版本 |
+| `WMF_TAG=v1.2.1` | 安装 / 升级时指定版本 |
 | `WMF_REPO` | GitHub 仓库（默认 `ike-sh/wg-mimic-fabric`） |
 | `WMF_SKIP_MIMIC=1` | 跳过 mimic 自动安装 |
 | `WMF_AUTO_MIMIC=0` | 执行 `install-wm-cli` 时不自动安装 mimic |
