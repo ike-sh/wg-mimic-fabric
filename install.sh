@@ -2,7 +2,7 @@
 # wg-mimic-fabric — WireGuard + Mimic tunnel orchestrator (MVP)
 set -Eeuo pipefail
 
-SCRIPT_VERSION="0.3.3"
+SCRIPT_VERSION="0.3.4"
 MIMIC_UPSTREAM_TAG="${MIMIC_UPSTREAM_TAG:-v0.7.0}"
 APP_NAME="wg-mimic-fabric"
 WMF_PROJECT_REPO="${WMF_REPO:-ike-sh/wg-mimic-fabric}"
@@ -1094,25 +1094,38 @@ ensure_debian_kernel_headers() {
     pkg="linux-headers-${kver}"
     info "安装内核头文件：${pkg} ..."
     if DEBIAN_FRONTEND=noninteractive apt-get install -y "$pkg" 2>/dev/null; then
-        return 0
+        [[ -d "/lib/modules/${kver}/build" ]] && return 0
     fi
-    warn "精确头文件 ${pkg} 不可用，尝试 linux-headers-$(dpkg --print-architecture) ..."
+    warn "运行内核 ${kver} 的精确头文件不可用"
+    info "尝试 linux-headers-$(dpkg --print-architecture 2>/dev/null || echo amd64)（安装后可能需要 reboot）..."
     DEBIAN_FRONTEND=noninteractive apt-get install -y \
-        "linux-headers-$(dpkg --print-architecture 2>/dev/null || echo amd64)" \
-        || return 1
+        "linux-headers-$(dpkg --print-architecture 2>/dev/null || echo amd64)" || return 1
+    if [[ ! -d "/lib/modules/${kver}/build" ]]; then
+        warn "头文件与运行内核 ${kver} 不匹配 — 请 reboot 到新内核后再 wm install-mimic"
+        return 1
+    fi
 }
 
 ensure_mimic_kmod_loaded() {
+    local kver dkms_ver
+    kver="$(uname -r)"
     if modprobe mimic 2>/dev/null; then
-        ok "mimic 内核模块已加载"
+        ok "mimic 内核模块已加载（内核 ${kver}）"
         return 0
     fi
     if command_exists dkms; then
-        info "尝试 dkms 编译 mimic 内核模块..."
-        dkms autoinstall 2>/dev/null || true
+        dkms_ver="$(dkms status mimic 2>/dev/null | head -1 | awk -F, '{gsub(/^ +| +$/,"",$2); print $2}')"
+        [[ -n "$dkms_ver" ]] || dkms_ver="0.7.0+ds"
+        if [[ -d "/lib/modules/${kver}/build" ]]; then
+            info "为当前内核 ${kver} 编译 mimic 模块..."
+            dkms install "mimic/${dkms_ver}" -k "$kver" 2>/dev/null || dkms autoinstall 2>/dev/null || true
+        else
+            warn "内核 ${kver} 无 build 目录，DKMS 无法为当前内核编译"
+            warn "请执行：sudo reboot  或  sudo apt install linux-headers-${kver}"
+        fi
         modprobe mimic 2>/dev/null && { ok "mimic 内核模块已加载"; return 0; }
     fi
-    warn "mimic 内核模块未加载。请运行：apt install linux-headers-\$(uname -r) && dkms autoinstall && modprobe mimic"
+    warn "mimic 内核模块未加载。运行：uname -r && lsmod | grep mimic"
     return 1
 }
 
@@ -1212,8 +1225,7 @@ install_mimic_packages() {
     local id; id="$(detect_os_id)"
     if command_exists mimic; then
         ok "mimic 已安装：$(mimic --version 2>/dev/null || command -v mimic)"
-        modprobe mimic 2>/dev/null || insmod /lib/modules/"$(uname -r)"/extra/mimic.ko 2>/dev/null \
-            || warn "mimic 内核模块未加载"
+        ensure_mimic_kmod_loaded || true
         return 0
     fi
     if ! kernel_ge_61; then

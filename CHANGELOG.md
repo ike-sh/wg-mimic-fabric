@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.4] - 2026-06-15
+
+### Fixed
+
+- DKMS 优先为**当前运行内核** `uname -r` 编译 mimic，避免头文件装到新内核但尚未 reboot 导致 modprobe 失败
+- 头文件与运行内核不匹配时给出明确 reboot 指引
+
 ## [0.3.3] - 2026-06-15
 
 ### Fixed

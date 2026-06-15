@@ -1,6 +1,6 @@
 # wg-mimic-fabric
 
-**当前版本**：[`v0.3.3`](https://github.com/ike-sh/wg-mimic-fabric/releases/tag/v0.3.3)  
+**当前版本**：[`v0.3.4`](https://github.com/ike-sh/wg-mimic-fabric/releases/tag/v0.3.4)  
 **仓库**：https://github.com/ike-sh/wg-mimic-fabric  
 **定位**：WireGuard + [Mimic](https://github.com/hack3ric/mimic) 伪 TCP 隧道编排器，对标 [ix-transit-fabric](https://github.com/ike-sh/ix-transit-fabric) 的运维体验。
 
