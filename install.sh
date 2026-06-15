@@ -2,7 +2,7 @@
 # wg-mimic-fabric — WireGuard + Mimic tunnel orchestrator (MVP)
 set -Eeuo pipefail
 
-SCRIPT_VERSION="1.1.0-beta.9"
+SCRIPT_VERSION="1.1.0-beta.10"
 MIMIC_UPSTREAM_TAG="${MIMIC_UPSTREAM_TAG:-v0.7.0}"
 APP_NAME="wg-mimic-fabric"
 WMF_PROJECT_REPO="${WMF_REPO:-ike-sh/wg-mimic-fabric}"
@@ -1616,6 +1616,33 @@ stop_profile() {
             || detach_xdp "$WAN_IFACE"
     fi
     ok "已停止线路：${PROFILE_ID}"
+}
+
+# 删除整条线路（保留同机其它线路）：停服务 → 删 conf/env/code/clients/drop-in → 重渲染
+# nft + 该网卡 mimic。WMF_DELETE_YES=1 跳过确认。
+delete_profile() {
+    local id; id="$(sanitize_id "${1:-}")"
+    [[ -n "$id" ]] || die "用法: wm delete-line <线路ID>（先 wm list-profiles 查看）"
+    require_root
+    [[ -f "$(profile_env_path "$id")" ]] || die "线路不存在：${id}"
+    local _c="N"
+    [[ "${WMF_DELETE_YES:-}" == "1" ]] || prompt _c "确认删除线路 ${id}（配置/密钥/接入码/客户端全部删除,不可恢复）？[y/N]" "N"
+    case "$_c" in [Yy]*) ;; *) die "已取消" ;; esac
+    load_profile "$id" 2>/dev/null || true
+    local iface="${WAN_IFACE:-}" wgi; wgi="$(wg_iface_for "$id")"
+    systemctl disable --now "wg-mimic-tunnel@${id}.service" 2>/dev/null || true
+    systemctl disable --now "wg-mimic-swgp@${id}.service" 2>/dev/null || true
+    rm -f "$(profile_env_path "$id")" "${WG_CONF_DIR}/${wgi}.conf" \
+        "${CODES_DIR}/${id}.code" "${SWGP_CONF_DIR}/${id}.json"
+    rm -rf "${PROFILES_DIR}/${id}" "/etc/systemd/system/wg-mimic-tunnel@${id}.service.d"
+    systemctl daemon-reload 2>/dev/null || true
+    apply_nft_all
+    if [[ -n "$iface" ]]; then
+        apply_mimic_conf_iface "$iface"
+        systemctl try-restart "wg-mimic-mimic@${iface}.service" 2>/dev/null || true
+        systemctl is-active --quiet "wg-mimic-mimic@${iface}.service" 2>/dev/null || detach_xdp "$iface"
+    fi
+    ok "已删除线路：${id}"
 }
 
 # ── create server / import code ────────────────────────────────────────────
@@ -3325,6 +3352,7 @@ wg-mimic-fabric ${SCRIPT_VERSION} — 公网入口 ⇄ IX WireGuard 组网 + Mim
   wm add-client <网关> <名>        A：生成客户端 WG 配置+二维码（官方App/小火箭/mihomo/sing-box）
   wm list-clients [网关] / wm del-client <网关> <名>
   wm start|stop|restart [ID]      启停线路（两端均需 WG+Mimic）
+  wm delete-line <ID>             删除整条线路（保留同机其它线路；WMF_DELETE_YES=1 跳过确认）
   wm list-profiles
   wm show-config [ID]
   wm show-code [ID]               显示 IX 接入码
@@ -3491,6 +3519,7 @@ main() {
         start) start_profile "$(resolve_profile_id "${2:-}")" ;;
         stop) stop_profile "$(resolve_profile_id "${2:-}")" ;;
         restart) restart_profile "${2:-}" ;;
+        delete-line|remove) delete_profile "${2:-}" ;;
         list-profiles) list_profile_ids ;;
         show-config) load_profile "$(resolve_profile_id "${2:-}")"; cat "$(profile_env_path "$PROFILE_ID")" ;;
         show-code) show_code "${2:-}" ;;

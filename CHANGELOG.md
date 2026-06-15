@@ -1,6 +1,12 @@
 # Changelog
 
-## [1.1.0-beta.9] - 2026-06-15
+## [1.1.0-beta.10] - 2026-06-15
+
+### Added（安全删除整条线路，便于反复建/删测试）
+
+- **新增 `wm delete-line <ID>`（别名 `remove`）安全删除单条线路**：此前只有 `delete-rule` 删单条转发规则，**没有删除整条线路的命令**——反复测试混淆出口/组网时只能手动 `rm` 配置/密钥/接入码/客户端，极易误删，且在「同一网卡多线路共用 mimic」的机器上贸然删除会波及其它线路。新命令一条龙：停并 disable 该线路的 tunnel/swgp 服务 → 删除 `profiles/<id>.env`、`/etc/wireguard/<wg-iface>.conf`、`codes/<id>.code`、`swgp/<id>.json`、`profiles/<id>/`（含 clients）、tunnel 的 systemd drop-in → `daemon-reload` → **重渲染 nft 与该网卡 mimic（保留同机其它线路，按当前 filter 重新挂载，无残留 XDP）**。默认二次确认，`WMF_DELETE_YES=1` 跳过确认（脚本化）。已接入 CLI 分发与 `usage`。
+
+
 
 ### Fixed（relay 全局出口隧道 wg-quick 启动失败 status=2,却无报错）
 
