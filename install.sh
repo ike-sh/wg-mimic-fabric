@@ -2,7 +2,7 @@
 # wg-mimic-fabric — WireGuard + Mimic tunnel orchestrator (MVP)
 set -Eeuo pipefail
 
-SCRIPT_VERSION="1.3.1"
+SCRIPT_VERSION="1.3.2"
 MIMIC_UPSTREAM_TAG="${MIMIC_UPSTREAM_TAG:-v0.7.0}"
 
 CONFIG_DIR="/etc/wg-mimic-fabric"
@@ -18,7 +18,7 @@ DEFAULT_GITHUB_MIRRORS="https://gh.ddlc.top/,https://gh-proxy.com/,https://ghpro
 LIBEXEC_DIR="/usr/local/libexec/wg-mimic-fabric"
 WM_CLI_INSTALL_SH="${LIBEXEC_DIR}/install.sh"
 WM_BIN="/usr/local/bin/wm"
-WG_ALIAS="/usr/local/bin/WG"
+WM_ALIAS="/usr/local/bin/WM"
 MIMIC_CONF_DIR="/etc/mimic"
 WG_CONF_DIR="/etc/wireguard"
 SYSTEMD_MIMIC_TEMPLATE="/etc/systemd/system/wg-mimic-mimic@.service"
@@ -1969,7 +1969,7 @@ create_transit_interactive() {
     local transit_pool="" tp_default="40000"
     printf '\n── 创建中转线路（模式一 · IX 中转组网）──\n'
     printf '在 IX/落地侧创建 WireGuard 组网并生成「接入码」；随后到公网入口执行「导入接入码」即可打通。\n\n'
-    prompt profile_id "中转线路名称（IX 侧节点，便于区分多条线路）" "ix"
+    prompt profile_id "中转线路名称（IX 侧节点，便于区分多条线路）" "transit"
     profile_id="$(sanitize_id "$profile_id")"
     [[ ! -f "$(profile_env_path "$profile_id")" ]] || die "线路已存在：$profile_id"
 
@@ -3423,7 +3423,7 @@ uninstall_wm_core() {
     done
     rm -f "$WM_BIN" "$SYSTEMD_MIMIC_TEMPLATE" "$SYSTEMD_TUNNEL_TEMPLATE" "$SYSTEMD_SWGP_TEMPLATE" "$SYSTEMD_DDNS_SERVICE" "$SYSTEMD_DDNS_TIMER" "$SYSTEMD_AUTOSWITCH_SERVICE" "$SYSTEMD_AUTOSWITCH_TIMER" "$SYSTEMD_RESUME_SERVICE"
     # 大写别名（若存在）
-    rm -f "/usr/local/bin/WM" "$WG_ALIAS" 2>/dev/null || true
+    rm -f "$WM_ALIAS" "/usr/local/bin/WG" 2>/dev/null || true
     if [[ "$remove_configs" == "true" ]]; then
         rmdir "$LIBEXEC_DIR" 2>/dev/null || true
     fi
@@ -3466,10 +3466,11 @@ EOF
 
 # ── CLI install ────────────────────────────────────────────────────────────
 
-# 大写 WG 快捷入口（symlink → wm）。小写 wg 会与 wireguard-tools 的 wg 命令冲突，故不创建。
+# 大写 WM 快捷入口（symlink → wm，误按 Shift 也能进菜单）。小写 wm 即主命令本身。
 ensure_cli_aliases() {
     [[ -e "$WM_BIN" ]] || return 0
-    ln -sf "$WM_BIN" "$WG_ALIAS" 2>/dev/null || true
+    rm -f "/usr/local/bin/WG" 2>/dev/null || true   # 清理旧的 WG 别名（≤1.3.1）
+    ln -sf "$WM_BIN" "$WM_ALIAS" 2>/dev/null || true
 }
 
 install_wm_cli() {
@@ -3484,7 +3485,7 @@ WRAP
     chmod 755 "$WM_BIN"
     ensure_cli_aliases
     install_systemd_units
-    ok "已安装 wm 命令：$WM_BIN（含大写别名 WG）"
+    ok "已安装 wm 命令：$WM_BIN（含大写别名 WM）"
     if [[ "${WMF_AUTO_MIMIC:-1}" == "1" && "${WMF_SKIP_MIMIC:-}" != "1" ]]; then
         install_mimic_packages 2>/dev/null || warn "mimic 未自动装上，请运行：wm install-mimic"
     fi
@@ -3563,11 +3564,11 @@ show_menu() {
 
  ▸ 模式一：IX 中转组网（端口转发 / 中转加速）
      1) 创建中转线路（IX 侧，生成接入码）
-     2) 导入接入码（公网入口接入）
+     2) 导入接入码（公网服务器入口接入）
 
  ▸ 模式二：全局出口（混淆翻墙，国内 A → 国外 B）
     11) 创建国外出口 B（生成出口接入码）
-    12) 导入出口接入码（国内网关 A 接入）
+    12) 导入出口接入码（国内服务器 A 接入）
     13) 客户端管理（新增 / 列出 / 删除，自动出二维码）
 
  ▸ 线路运维（两种模式通用）

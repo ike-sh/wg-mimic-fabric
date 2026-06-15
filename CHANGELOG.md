@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.3.2] - 2026-06-16
+
+### Changed
+
+- **快捷命令大写别名 `WG` 改为 `WM`**：与主命令 `wm` 仅大小写之差，更直观；`install` 与 `wm upgrade-script` 自动创建 `/usr/local/bin/WM` 并清理旧的 `WG`，卸载时一并移除。小写仍用 `wm`。
+- **菜单文案更清晰**：`2) 导入接入码（公网入口接入 → 公网服务器入口接入）`；`12) 导入出口接入码（国内网关 A 接入 → 国内服务器 A 接入）`。
+- **默认线路名美化**：`create-transit` 默认线路名 `ix` → `transit`（派生公网入口 `ix-ingress` → `transit-ingress`），与 `exit` / `exit-relay` 构成清晰的「transit / exit」角色命名对；仅影响新建默认值，不影响既有线路。README `set-pool` 示例同步为 `transit`。
+
+### Verified
+
+- `shellcheck -S warning` 0 告警；`bash -n`（install.sh + smoke.sh）通过；`smoke nopy` 回归全 11 项通过。
+
 ## [1.3.1] - 2026-06-16
 
 ### Fixed

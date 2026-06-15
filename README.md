@@ -4,7 +4,7 @@
 
 | | |
 |------|------|
-| **版本** | `v1.3.1` |
+| **版本** | `v1.3.2` |
 | **仓库** | https://github.com/ike-sh/wg-mimic-fabric |
 | **许可** | MIT |
 
@@ -269,8 +269,8 @@ wm apply-rules <ID>              # 重建 nft
 IDC / 运营商分配的 IX 端口通常数量有限。为 IX 线路设置**中转端口池**后，`create-transit` 与 `add-rule` 将自动从池中取下一个空闲端口作为默认中转端口，并强制端口落在池内、禁止重复；池耗尽时报错。端口池仅作为 IX 侧的分配状态，**不写入接入码、不影响公网入口**。
 
 ```bash
-wm set-pool ix 18300-18399        # 设置端口池
-wm set-pool ix                    # 留空以清除，恢复手动指定
+wm set-pool transit 18300-18399   # 设置端口池
+wm set-pool transit               # 留空以清除，恢复手动指定
 ```
 
 ---
@@ -407,7 +407,7 @@ wm health-all
 
 | 变量 | 说明 |
 |------|------|
-| `WMF_TAG=v1.3.1` | 安装 / 升级时指定版本 |
+| `WMF_TAG=v1.3.2` | 安装 / 升级时指定版本 |
 | `WMF_REPO` | GitHub 仓库（默认 `ike-sh/wg-mimic-fabric`） |
 | `WMF_SKIP_MIMIC=1` | 跳过 mimic 自动安装 |
 | `WMF_AUTO_MIMIC=0` | 执行 `install-wm-cli` 时不自动安装 mimic |
