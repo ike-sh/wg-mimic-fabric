@@ -25,6 +25,8 @@ WG_CONF_DIR="/etc/wireguard"
 SYSTEMD_MIMIC_TEMPLATE="/etc/systemd/system/wg-mimic-mimic@.service"
 SYSTEMD_TUNNEL_TEMPLATE="/etc/systemd/system/wg-mimic-tunnel@.service"
 SYSCTL_FILE="/etc/sysctl.d/99-wg-mimic-fabric.conf"
+SYSTEMD_DDNS_SERVICE="/etc/systemd/system/wg-mimic-ddns.service"
+SYSTEMD_DDNS_TIMER="/etc/systemd/system/wg-mimic-ddns.timer"
 
 # ── OS / kernel compatibility ──────────────────────────────────────────────
 
@@ -69,12 +71,11 @@ compat_os_report() {
 
 ensure_ip_forward() {
     sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
-    if [[ -f "$SYSCTL_FILE" ]]; then
-        grep -q 'net.ipv4.ip_forward' "$SYSCTL_FILE" 2>/dev/null || \
-            echo 'net.ipv4.ip_forward=1' >>"$SYSCTL_FILE"
-    else
-        printf 'net.ipv4.ip_forward=1\n' >"$SYSCTL_FILE"
-    fi
+    sysctl -w net.ipv6.conf.all.forwarding=1 >/dev/null 2>&1 || true
+    {
+        printf 'net.ipv4.ip_forward=1\n'
+        printf 'net.ipv6.conf.all.forwarding=1\n'
+    } >"$SYSCTL_FILE"
 }
 
 # ── utilities ──────────────────────────────────────────────────────────────
@@ -281,10 +282,12 @@ render_code_json() {
     python3 - "$PROFILE_ID" "${PROFILE_NAME:-$PROFILE_ID}" "$WG_MESH_SUBNET" \
         "$WG_IX_IP" "$WG_INGRESS_IP" "$WG_PUBLIC_KEY" "$INGRESS_PRIVKEY_B64" \
         "$IX_ENDPOINT_HOST" "$WG_PORT" "$WG_MTU" "${MIMIC_KEEPALIVE:-300:::}" \
-        "${FORWARD_PROTO:-both}" "$rules_b64" "$created" <<'PY'
+        "${FORWARD_PROTO:-both}" "$rules_b64" "$created" \
+        "${IP_VERSION:-4}" "${WG_MESH_SUBNET6:-}" "${WG_IX_IP6:-}" "${WG_INGRESS_IP6:-}" <<'PY'
 import base64, json, sys
 ( pid, pname, subnet, ix_ip, ing_ip, ix_pub, ing_priv_b64, endpoint,
-  wg_port, wg_mtu, keepalive, fproto, rules_b64, created ) = sys.argv[1:15]
+  wg_port, wg_mtu, keepalive, fproto, rules_b64, created,
+  ip_version, subnet6, ix_ip6, ing_ip6 ) = sys.argv[1:19]
 def decode_tsv(b):
     b = b + "=" * (-len(b) % 4)
     return base64.urlsafe_b64decode(b.encode()).decode()
@@ -305,12 +308,17 @@ for line in decode_tsv(rules_b64).splitlines():
 obj = {
     "version": 1, "code_schema": 5, "project": "wg-mimic-fabric",
     "role": "nat-transit-code", "profile_id": pid, "profile_name": pname,
+    "ip_version": ip_version or "4",
     "wg_mesh_subnet": subnet, "ix_wg_ip": ix_ip, "ingress_wg_ip": ing_ip,
     "ix_wg_pubkey": ix_pub, "ingress_wg_privkey_b64": ing_priv_b64,
     "ix_endpoint_host": endpoint, "wg_port": int(wg_port), "wg_mtu": int(wg_mtu),
     "mimic_keepalive": keepalive, "forward_proto": fproto,
     "rules": rules, "rules_b64": rules_b64, "created_at": created,
 }
+if subnet6:
+    obj["wg_mesh_subnet6"] = subnet6
+    obj["ix_wg_ip6"] = ix_ip6
+    obj["ingress_wg_ip6"] = ing_ip6
 print(json.dumps(obj, separators=(",", ":")))
 PY
 }
@@ -337,6 +345,10 @@ parse_code() {
     CODE_WG_MTU="$(json_get "$json" wg_mtu)"
     CODE_MIMIC_KEEPALIVE="$(json_get "$json" mimic_keepalive)"
     CODE_FORWARD_PROTO="$(json_get "$json" forward_proto)"
+    CODE_IP_VERSION="$(json_get "$json" ip_version)"
+    CODE_WG_MESH_SUBNET6="$(json_get "$json" wg_mesh_subnet6)"
+    CODE_IX_WG_IP6="$(json_get "$json" ix_wg_ip6)"
+    CODE_INGRESS_WG_IP6="$(json_get "$json" ingress_wg_ip6)"
     CODE_RULES_TSV="$(json_get "$json" rules_b64 | base64url_decode)"
 }
 
@@ -347,6 +359,25 @@ ensure_mimic() {
 
 detect_default_iface() {
     ip -4 route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}'
+}
+
+# Resolve a host to an IP. Literal IPv4/IPv6 pass through unchanged; hostnames
+# are resolved (getent, then python3 fallback). Used by nft render + DDNS so
+# domain landings/endpoints work and IP changes can be detected.
+resolve_host_ip() {
+    local h="$1" ip=""
+    [[ -z "$h" ]] && return 0
+    if [[ "$h" == *:* ]] || [[ "$h" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        printf '%s' "$h"; return 0
+    fi
+    ip="$(getent ahostsv4 "$h" 2>/dev/null | awk 'NR==1{print $1; exit}')"
+    [[ -z "$ip" ]] && ip="$(getent ahosts "$h" 2>/dev/null | awk 'NR==1{print $1; exit}')"
+    if [[ -z "$ip" ]] && command_exists python3; then
+        ip="$(python3 -c 'import socket,sys
+try: print(socket.getaddrinfo(sys.argv[1],None)[0][4][0])
+except Exception: pass' "$h" 2>/dev/null)"
+    fi
+    printf '%s' "$ip"
 }
 
 validate_mtu() {
@@ -417,6 +448,209 @@ upgrade_script() {
 
 assume_yes() { [[ "${WMF_PURGE_YES:-}${WMF_UPGRADE_YES:-}" == *1* ]]; }
 
+# ── DDNS（域名 IP 变化自动刷新）──────────────────────────────────────────────
+
+ddns_state_file() { printf '%s/ddns.state' "$STATE_DIR"; }
+
+ddns_state_get() {
+    local k="$1" f; f="$(ddns_state_file)"
+    [[ -f "$f" ]] || return 0
+    grep -m1 "^${k}=" "$f" 2>/dev/null | cut -d= -f2-
+}
+
+ddns_state_set() {
+    local k="$1" v="$2" f; f="$(ddns_state_file)"
+    install -d -m 700 "$STATE_DIR"
+    [[ -f "$f" ]] || : >"$f"
+    if grep -q "^${k}=" "$f" 2>/dev/null; then
+        sed -i "s|^${k}=.*|${k}=${v}|" "$f"
+    else
+        printf '%s=%s\n' "$k" "$v" >>"$f"
+    fi
+    chmod 600 "$f"
+}
+
+# Re-resolve ingress WG endpoints; on change update the live peer endpoint.
+# Landing domains follow automatically because apply_nft_all re-resolves them.
+ddns_refresh() {
+    require_root
+    ensure_dirs
+    local p
+    for p in "$PROFILES_DIR"/*.env; do
+        [[ -f "$p" ]] || continue
+        (
+            # shellcheck disable=SC1090
+            source "$p"
+            [[ "${ENABLED:-true}" == "true" ]] || exit 0
+            [[ "${ROLE:-}" == "nat-ingress" && -n "${IX_ENDPOINT_HOST:-}" ]] || exit 0
+            [[ "$IX_ENDPOINT_HOST" =~ [a-zA-Z] ]] || exit 0
+            local newip key old wg_iface
+            newip="$(resolve_host_ip "$IX_ENDPOINT_HOST")"
+            [[ -n "$newip" ]] || exit 0
+            key="endpoint:${PROFILE_ID}"
+            old="$(ddns_state_get "$key")"
+            if [[ "$newip" != "$old" ]]; then
+                wg_iface="$(wg_iface_for "$PROFILE_ID")"
+                wg set "$wg_iface" peer "$WG_PEER_PUBLIC_KEY" \
+                    endpoint "$(format_mimic_ip "$newip"):${WG_PORT}" 2>/dev/null || true
+                ddns_state_set "$key" "$newip"
+                info "DDNS ${PROFILE_ID}: ${IX_ENDPOINT_HOST} ${old:-?} → ${newip}"
+            fi
+        )
+    done
+    apply_nft_all
+    ok "DDNS 刷新完成"
+}
+
+install_ddns_timer() {
+    local tmp; tmp="$(mktemp)"
+    cat >"$tmp" <<EOF
+[Unit]
+Description=wg-mimic-fabric DDNS refresh
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=${WM_BIN} ddns-refresh
+EOF
+    install -m 644 "$tmp" "$SYSTEMD_DDNS_SERVICE"
+    cat >"$tmp" <<'EOF'
+[Unit]
+Description=wg-mimic-fabric DDNS timer
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=3min
+
+[Install]
+WantedBy=timers.target
+EOF
+    install -m 644 "$tmp" "$SYSTEMD_DDNS_TIMER"
+    rm -f "$tmp"
+    systemctl daemon-reload 2>/dev/null || true
+}
+
+ddns_enable() {
+    require_root
+    install_ddns_timer
+    systemctl enable --now wg-mimic-ddns.timer 2>/dev/null || true
+    ok "DDNS 定时已启用（每 3 分钟）"
+}
+
+ddns_disable() {
+    require_root
+    systemctl disable --now wg-mimic-ddns.timer 2>/dev/null || true
+    ok "DDNS 定时已停用"
+}
+
+ddns_status() {
+    systemctl list-timers wg-mimic-ddns.timer --no-pager 2>/dev/null || true
+    if [[ -f "$(ddns_state_file)" ]]; then
+        printf '── 已解析 ──\n'; cat "$(ddns_state_file)"
+    else
+        printf '（无 DDNS 状态）\n'
+    fi
+}
+
+# ── 主备（手动切换，对标 ix-transit「不自动切换」安全边界）─────────────────────
+
+set_or_append_kv() {
+    local f="$1" k="$2" v="$3"
+    if grep -q "^${k}=" "$f" 2>/dev/null; then
+        sed -i "s|^${k}=.*|${k}=${v}|" "$f"
+    else
+        printf '%s=%s\n' "$k" "$v" >>"$f"
+    fi
+}
+
+group_members() {
+    local grp="$1" p
+    for p in "$PROFILES_DIR"/*.env; do
+        [[ -f "$p" ]] || continue
+        (
+            # shellcheck disable=SC1090
+            source "$p"
+            [[ "${LINE_GROUP:-}" == "$grp" ]] && printf '%s\n' "$PROFILE_ID"
+        )
+    done
+}
+
+set_line_group() {
+    local id grp role pri; id="$(resolve_profile_id "${1:-}")"; grp="${2:-}"; role="${3:-backup}"; pri="${4:-100}"
+    require_root
+    [[ -n "$grp" ]] || die "用法: wm set-group <ID> <组名> [primary|backup|standalone] [优先级]"
+    case "$role" in primary|backup|standalone) ;; *) die "角色只能 primary/backup/standalone" ;; esac
+    load_profile "$id"
+    local path; path="$(profile_env_path "$PROFILE_ID")"
+    set_or_append_kv "$path" LINE_GROUP "$grp"
+    set_or_append_kv "$path" LINE_ROLE "$role"
+    set_or_append_kv "$path" LINE_PRIORITY "$pri"
+    ok "已设置 ${PROFILE_ID}: group=${grp} role=${role} pri=${pri}"
+}
+
+list_groups() {
+    printf '线路分组：\n'
+    local p out
+    out="$(
+        for p in "$PROFILES_DIR"/*.env; do
+            [[ -f "$p" ]] || continue
+            (
+                # shellcheck disable=SC1090
+                source "$p"
+                [[ -n "${LINE_GROUP:-}" ]] || exit 0
+                printf '%s\t%s\t%s\t%s\t%s\n' "$LINE_GROUP" "$PROFILE_ID" \
+                    "${LINE_ROLE:-standalone}" "${LINE_PRIORITY:-100}" "${ENABLED:-true}"
+            )
+        done | sort
+    )"
+    [[ -n "$out" ]] || { printf '  (无分组线路；用 wm set-group 设置)\n'; return; }
+    printf '%s\n' "$out" | awk -F'\t' '{printf "  [%s] %s  role=%s pri=%s enabled=%s\n",$1,$2,$3,$4,$5}'
+}
+
+switch_line() {
+    local grp target members m found=0; grp="${1:-}"; target="$(sanitize_id "${2:-}")"
+    require_root
+    [[ -n "$grp" && -n "${2:-}" ]] || die "用法: wm switch-line <组名> <目标线路ID>"
+    members="$(group_members "$grp")"
+    [[ -n "$members" ]] || die "分组无成员：$grp"
+    while IFS= read -r m; do [[ "$m" == "$target" ]] && found=1; done <<<"$members"
+    [[ "$found" == "1" ]] || die "目标不在分组 ${grp}：${target}"
+    while IFS= read -r m; do
+        [[ -n "$m" ]] || continue
+        if [[ "$m" == "$target" ]]; then start_profile "$m"; else stop_profile "$m" 2>/dev/null || true; fi
+    done <<<"$members"
+    ddns_state_set "active:${grp}" "$target"
+    ok "已切换分组 ${grp} → ${target}"
+}
+
+health_all() {
+    local id
+    for id in $(list_profile_ids 2>/dev/null || true); do
+        printf '──────── %s ────────\n' "$id"
+        health_profile "$id" 2>/dev/null || true
+    done
+}
+
+primary_backup_check() {
+    local grp="${1:-}" active m
+    [[ -n "$grp" ]] || die "用法: wm primary-backup-check <组名>"
+    active="$(ddns_state_get "active:${grp}")"
+    printf '分组 %s（active=%s）：\n' "$grp" "${active:-未记录}"
+    while IFS= read -r m; do
+        [[ -n "$m" ]] || continue
+        (
+            load_profile "$m"
+            local st mark=""
+            st="$(health_profile "$m" 2>/dev/null | sed -n 's/^HEALTH_STATUS=//p')"
+            [[ "$m" == "$active" ]] && mark=" [active]"
+            printf '  %s  role=%s pri=%s enabled=%s health=%s%s\n' \
+                "$m" "${LINE_ROLE:-standalone}" "${LINE_PRIORITY:-100}" "${ENABLED:-true}" "${st:-unknown}" "$mark"
+        )
+    done <<<"$(group_members "$grp")"
+    printf '主备为手动切换：wm switch-line %s <目标线路ID>\n' "$grp"
+}
+
 # ── render configs ─────────────────────────────────────────────────────────
 
 render_mimic_conf_for_profile() {
@@ -460,18 +694,26 @@ apply_mimic_conf_iface() {
 }
 
 render_wg_conf() {
+    local ix_addr ing_addr ix_allowed ing_allowed endpoint
+    ix_addr="Address = ${WG_IX_IP}/32"
+    [[ -n "${WG_IX_IP6:-}" ]] && ix_addr="${ix_addr}"$'\n'"Address = ${WG_IX_IP6}/128"
+    ing_addr="Address = ${WG_INGRESS_IP}/32"
+    [[ -n "${WG_INGRESS_IP6:-}" ]] && ing_addr="${ing_addr}"$'\n'"Address = ${WG_INGRESS_IP6}/128"
+    ix_allowed="${WG_IX_IP}/32"; [[ -n "${WG_IX_IP6:-}" ]] && ix_allowed="${ix_allowed}, ${WG_IX_IP6}/128"
+    ing_allowed="${WG_INGRESS_IP}/32"; [[ -n "${WG_INGRESS_IP6:-}" ]] && ing_allowed="${ing_allowed}, ${WG_INGRESS_IP6}/128"
+    endpoint="$(format_mimic_ip "${IX_ENDPOINT_HOST}"):${WG_PORT}"
     if [[ "${ROLE:-}" == "nat-transit" ]]; then
         cat <<EOF
 # Generated by wg-mimic-fabric — nat-transit ${PROFILE_ID}
 [Interface]
 PrivateKey = ${WG_PRIVATE_KEY}
-Address = ${WG_IX_IP}/32
+${ix_addr}
 ListenPort = ${WG_PORT}
 MTU = ${WG_MTU}
 
 [Peer]
 PublicKey = ${WG_PEER_PUBLIC_KEY}
-AllowedIPs = ${WG_INGRESS_IP}/32
+AllowedIPs = ${ing_allowed}
 PersistentKeepalive = 25
 EOF
     else
@@ -479,13 +721,13 @@ EOF
 # Generated by wg-mimic-fabric — nat-ingress ${PROFILE_ID}
 [Interface]
 PrivateKey = ${WG_PRIVATE_KEY}
-Address = ${WG_INGRESS_IP}/32
+${ing_addr}
 MTU = ${WG_MTU}
 
 [Peer]
 PublicKey = ${WG_PEER_PUBLIC_KEY}
-Endpoint = ${IX_ENDPOINT_HOST}:${WG_PORT}
-AllowedIPs = ${WG_IX_IP}/32
+Endpoint = ${endpoint}
+AllowedIPs = ${ix_allowed}
 PersistentKeepalive = 25
 EOF
     fi
@@ -514,21 +756,25 @@ collect_dnat_entries() {
             # shellcheck disable=SC1090
             source "$p"
             [[ "${ENABLED:-true}" == "true" ]] || exit 0
-            local rid
+            local rid fam mesh_ip landing_ip
             for rid in $(list_rule_ids "$PROFILE_ID"); do
                 (
                     load_rule "$PROFILE_ID" "$rid" || exit 0
                     [[ "${RULE_ENABLED:-true}" == "true" ]] || exit 0
+                    landing_ip="$(resolve_host_ip "$LANDING_HOST")"
+                    [[ -n "$landing_ip" ]] || exit 0
+                    if [[ "$landing_ip" == *:* ]]; then fam="ip6"; mesh_ip="${WG_IX_IP6:-}"; else fam="ip"; mesh_ip="${WG_IX_IP:-}"; fi
+                    [[ -n "$mesh_ip" ]] || exit 0
                     if [[ "${ROLE:-}" == "nat-transit" ]]; then
                         [[ -n "$TRANSIT_PORT" && -n "$LANDING_HOST" && -n "$LANDING_PORT" ]] || exit 0
-                        printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
-                            "$WG_IX_IP" "${FORWARD_PROTO:-both}" "$TRANSIT_PORT" \
-                            "$LANDING_HOST" "$LANDING_PORT" "${PROFILE_ID}-${rid}"
+                        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+                            "$fam" "$mesh_ip" "${FORWARD_PROTO:-both}" "$TRANSIT_PORT" \
+                            "$landing_ip" "$LANDING_PORT" "${PROFILE_ID}-${rid}"
                     elif [[ "${ROLE:-}" == "nat-ingress" ]]; then
                         [[ -n "${CLIENT_PORT:-}" && -n "$TRANSIT_PORT" ]] || exit 0
-                        printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
-                            "-" "${FORWARD_PROTO:-both}" "$CLIENT_PORT" \
-                            "$WG_IX_IP" "$TRANSIT_PORT" "${PROFILE_ID}-${rid}"
+                        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+                            "$fam" "-" "${FORWARD_PROTO:-both}" "$CLIENT_PORT" \
+                            "$mesh_ip" "$TRANSIT_PORT" "${PROFILE_ID}-${rid}"
                     fi
                 )
             done
@@ -562,37 +808,43 @@ collect_input_ports() {
 }
 
 nft_emit_dnat() {
-    local entries="$1" daddr proto dport tip tport tag match
+    local entries="$1" fam daddr proto dport tip tport tag match tgt
     [[ -n "$entries" ]] || return 0
-    while IFS=$'\t' read -r daddr proto dport tip tport tag; do
+    while IFS=$'\t' read -r fam daddr proto dport tip tport tag; do
         [[ -n "$dport" && -n "$tip" && -n "$tport" ]] || continue
-        match=""
-        [[ "$daddr" != "-" && -n "$daddr" ]] && match="ip daddr ${daddr} "
+        if [[ "$fam" == "ip6" ]]; then tgt="[${tip}]:${tport}"; else tgt="${tip}:${tport}"; fi
+        if [[ "$daddr" != "-" && -n "$daddr" ]]; then
+            match="${fam} daddr ${daddr} "
+        elif [[ "$fam" == "ip6" ]]; then
+            match="meta nfproto ipv6 "
+        else
+            match="meta nfproto ipv4 "
+        fi
         case "$proto" in
             tcp)
-                printf '        %stcp dport %s counter dnat to %s:%s comment "wm-%s"\n' "$match" "$dport" "$tip" "$tport" "$tag" ;;
+                printf '        %stcp dport %s counter dnat to %s comment "wm-%s"\n' "$match" "$dport" "$tgt" "$tag" ;;
             udp)
-                printf '        %sudp dport %s counter dnat to %s:%s comment "wm-%s"\n' "$match" "$dport" "$tip" "$tport" "$tag" ;;
+                printf '        %sudp dport %s counter dnat to %s comment "wm-%s"\n' "$match" "$dport" "$tgt" "$tag" ;;
             *)
-                printf '        %stcp dport %s counter dnat to %s:%s comment "wm-%s-tcp"\n' "$match" "$dport" "$tip" "$tport" "$tag"
-                printf '        %sudp dport %s counter dnat to %s:%s comment "wm-%s-udp"\n' "$match" "$dport" "$tip" "$tport" "$tag" ;;
+                printf '        %stcp dport %s counter dnat to %s comment "wm-%s-tcp"\n' "$match" "$dport" "$tgt" "$tag"
+                printf '        %sudp dport %s counter dnat to %s comment "wm-%s-udp"\n' "$match" "$dport" "$tgt" "$tag" ;;
         esac
     done <<<"$entries"
 }
 
 nft_emit_masq() {
-    local entries="$1" daddr proto dport tip tport tag
+    local entries="$1" fam daddr proto dport tip tport tag
     [[ -n "$entries" ]] || return 0
-    while IFS=$'\t' read -r daddr proto dport tip tport tag; do
+    while IFS=$'\t' read -r fam daddr proto dport tip tport tag; do
         [[ -n "$tip" && -n "$tport" ]] || continue
         case "$proto" in
             tcp)
-                printf '        ip daddr %s tcp dport %s counter masquerade comment "wm-%s"\n' "$tip" "$tport" "$tag" ;;
+                printf '        %s daddr %s tcp dport %s counter masquerade comment "wm-%s"\n' "$fam" "$tip" "$tport" "$tag" ;;
             udp)
-                printf '        ip daddr %s udp dport %s counter masquerade comment "wm-%s"\n' "$tip" "$tport" "$tag" ;;
+                printf '        %s daddr %s udp dport %s counter masquerade comment "wm-%s"\n' "$fam" "$tip" "$tport" "$tag" ;;
             *)
-                printf '        ip daddr %s tcp dport %s counter masquerade comment "wm-%s-tcp"\n' "$tip" "$tport" "$tag"
-                printf '        ip daddr %s udp dport %s counter masquerade comment "wm-%s-udp"\n' "$tip" "$tport" "$tag" ;;
+                printf '        %s daddr %s tcp dport %s counter masquerade comment "wm-%s-tcp"\n' "$fam" "$tip" "$tport" "$tag"
+                printf '        %s daddr %s udp dport %s counter masquerade comment "wm-%s-udp"\n' "$fam" "$tip" "$tport" "$tag" ;;
         esac
     done <<<"$entries"
 }
@@ -770,7 +1022,7 @@ create_transit_interactive() {
     command_exists wg || die "需要 wireguard-tools，请 apt install wireguard-tools"
 
     local profile_id endpoint_host wg_port wg_mtu ix_public_ip wan_iface
-    local subnet ix_ip ingress_ip transit_port landing_host landing_port proto
+    local subnet ix_ip ingress_ip transit_port landing_host landing_port proto ip_version
     prompt profile_id "IX 中转线路 ID" "ix-nat"
     profile_id="$(sanitize_id "$profile_id")"
     [[ ! -f "$(profile_env_path "$profile_id")" ]] || die "线路已存在：$profile_id"
@@ -792,7 +1044,16 @@ create_transit_interactive() {
     validate_ipv4 "$ix_ip" || die "IX 虚拟 IP 非法"
     validate_ipv4 "$ingress_ip" || die "入口虚拟 IP 非法"
 
-    info "首条转发规则："
+    prompt ip_version "IP 版本 4 / 6 / dual" "4"
+    case "$ip_version" in 4|6|dual) ;; *) die "IP_VERSION 只能是 4/6/dual" ;; esac
+    local subnet6="" ix_ip6="" ingress_ip6=""
+    if [[ "$ip_version" == "6" || "$ip_version" == "dual" ]]; then
+        prompt subnet6 "IPv6 组网网段" "fd88:6d6d::/64"
+        prompt ix_ip6 "IX 虚拟 IPv6" "fd88:6d6d::2"
+        prompt ingress_ip6 "公网入口虚拟 IPv6" "fd88:6d6d::1"
+    fi
+
+    info "首条转发规则（落地可填 IPv6）："
     prompt_port transit_port "中转端口（IX 虚拟IP 上的端口）" "40000"
     prompt landing_host "落地 IP/域名"
     [[ -n "$landing_host" ]] || die "落地地址不能为空"
@@ -814,6 +1075,10 @@ create_transit_interactive() {
         "WG_MESH_SUBNET=${subnet}" \
         "WG_IX_IP=${ix_ip}" \
         "WG_INGRESS_IP=${ingress_ip}" \
+        "IP_VERSION=${ip_version}" \
+        "WG_MESH_SUBNET6=${subnet6}" \
+        "WG_IX_IP6=${ix_ip6}" \
+        "WG_INGRESS_IP6=${ingress_ip6}" \
         "WG_PORT=${wg_port}" \
         "WG_MTU=${wg_mtu}" \
         "IX_ENDPOINT_HOST=${endpoint_host}" \
@@ -891,6 +1156,10 @@ import_code_interactive() {
         "WG_MESH_SUBNET=${CODE_WG_MESH_SUBNET}" \
         "WG_IX_IP=${CODE_IX_WG_IP}" \
         "WG_INGRESS_IP=${CODE_INGRESS_WG_IP}" \
+        "IP_VERSION=${CODE_IP_VERSION:-4}" \
+        "WG_MESH_SUBNET6=${CODE_WG_MESH_SUBNET6}" \
+        "WG_IX_IP6=${CODE_IX_WG_IP6}" \
+        "WG_INGRESS_IP6=${CODE_INGRESS_WG_IP6}" \
         "WG_PORT=${CODE_WG_PORT}" \
         "WG_MTU=${CODE_WG_MTU}" \
         "IX_ENDPOINT_HOST=${CODE_IX_ENDPOINT_HOST}" \
@@ -1614,7 +1883,8 @@ uninstall_wm_core() {
         rm -f "$NFT_FILE" "$SYSCTL_FILE"
         rm -rf "$CONFIG_DIR" "$LIBEXEC_DIR"
     fi
-    rm -f "$WM_BIN" "$SYSTEMD_MIMIC_TEMPLATE" "$SYSTEMD_TUNNEL_TEMPLATE"
+    systemctl disable --now wg-mimic-ddns.timer 2>/dev/null || true
+    rm -f "$WM_BIN" "$SYSTEMD_MIMIC_TEMPLATE" "$SYSTEMD_TUNNEL_TEMPLATE" "$SYSTEMD_DDNS_SERVICE" "$SYSTEMD_DDNS_TIMER"
     # 大写别名（若存在）
     rm -f "/usr/local/bin/WM" 2>/dev/null || true
     if [[ "$remove_configs" == "true" ]]; then
@@ -1697,7 +1967,10 @@ wg-mimic-fabric ${SCRIPT_VERSION} — 公网入口 ⇄ IX WireGuard 组网 + Mim
   wm delete-rule <ID> <规则ID>
   wm enable-rule|disable-rule <ID> <规则ID>
   wm apply-rules [ID]             重建 nft 规则
-  wm health [ID] / wm diagnose [ID]
+  wm health [ID] / wm diagnose [ID] / wm health-all
+  wm ddns-enable|ddns-disable|ddns-status|ddns-refresh   域名 IP 变化自动刷新(每3分钟)
+  wm set-group <ID> <组名> [primary|backup|standalone] [优先级]
+  wm list-groups / switch-line <组名> <目标ID> / primary-backup-check <组名>
   wm set-mtu <ID> <MTU> / wm set-xdp-mode <ID> [skb|native]
   wm install-all|install-mimic|install-deps|compat
   wm upgrade-script / wm uninstall / wm purge
@@ -1797,6 +2070,15 @@ main() {
         enable-rule) enable_rule "${2:-}" "${3:-}" ;;
         disable-rule) disable_rule "${2:-}" "${3:-}" ;;
         apply-rules) apply_rules "${2:-}" ;;
+        ddns-refresh) ddns_refresh ;;
+        ddns-enable) ddns_enable ;;
+        ddns-disable) ddns_disable ;;
+        ddns-status) ddns_status ;;
+        set-group) set_line_group "${2:-}" "${3:-}" "${4:-}" "${5:-}" ;;
+        list-groups) list_groups ;;
+        switch-line) switch_line "${2:-}" "${3:-}" ;;
+        primary-backup-check) primary_backup_check "${2:-}" ;;
+        health-all) health_all ;;
         set-mtu) set_profile_mtu "${2:-}" "${3:-}" ;;
         set-xdp-mode) set_profile_xdp_mode "${2:-}" "${3:-}" ;;
         apply-nft-all) require_root; apply_nft_all; ok "nft 规则已重建" ;;

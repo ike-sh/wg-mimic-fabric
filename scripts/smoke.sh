@@ -83,11 +83,47 @@ test_nft() {
     echo "NFT OK"
 }
 
+seed_transit6() {
+    write_profile_kv "$(profile_env_path ix6)" \
+        "PROFILE_ID=ix6" "ROLE=nat-transit" "ENABLED=true" "WAN_IFACE=eth0" \
+        "IP_VERSION=dual" "WG_MESH_SUBNET=10.88.0.0/24" "WG_IX_IP=10.88.0.2" "WG_INGRESS_IP=10.88.0.1" \
+        "WG_MESH_SUBNET6=fd88::/64" "WG_IX_IP6=fd88::2" "WG_INGRESS_IP6=fd88::1" \
+        "WG_PORT=51820" "WG_MTU=1420" "IX_ENDPOINT_HOST=nat.example" \
+        "WG_PRIVATE_KEY=k" "WG_PUBLIC_KEY=p" "WG_PEER_PUBLIC_KEY=q" "INGRESS_PRIVKEY_B64=x" \
+        "FORWARD_PROTO=both" "FW_OPEN_PORT=true"
+    write_rule ix6 r6 "RULE_ID=r6" "RULE_ENABLED=true" "TRANSIT_PORT=40010" \
+        "LANDING_HOST=2606:4700:4700::1111" "LANDING_PORT=443" "FORWARD_PROTO=tcp"
+}
+
+test_ipv6() {
+    seed_transit6
+    load_profile ix6
+    local wg; wg="$(render_wg_conf)"
+    grep -q 'Address = fd88::2/128' <<<"$wg" || fail "wg ipv6 addr"
+    grep -q 'AllowedIPs = 10.88.0.1/32, fd88::1/128' <<<"$wg" || fail "wg ipv6 allowed"
+    local out; out="$(render_nft_all)"
+    grep -q 'ip6 daddr fd88::2 tcp dport 40010' <<<"$out" || fail "ipv6 dnat match"
+    grep -qF 'dnat to [2606:4700:4700::1111]:443' <<<"$out" || fail "ipv6 dnat target"
+    echo "IPV6 OK"
+}
+
+test_group() {
+    seed_transit
+    set_or_append_kv "$(profile_env_path ix-nat)" LINE_GROUP grpA
+    set_or_append_kv "$(profile_env_path ix-nat)" LINE_ROLE primary
+    grep -q 'grpA' <<<"$(list_groups)" || fail "group listing"
+    [[ "$(group_members grpA | tr -d '[:space:]')" == "ix-nat" ]] || fail "group members"
+    echo "GROUP OK"
+}
+
 case "${1:-all}" in
     rule) test_rule ;;
     code) test_code ;;
     wgconf) test_wgconf ;;
     nft) test_nft ;;
-    all) test_rule; test_code; test_wgconf; test_nft; echo "ALL OK" ;;
-    *) echo "usage: smoke.sh [rule|code|wgconf|nft|all]"; exit 1 ;;
+    ipv6) test_ipv6 ;;
+    group) test_group ;;
+    nopy) test_rule; test_wgconf; test_nft; test_ipv6; test_group; echo "NOPY OK" ;;
+    all) test_rule; test_code; test_wgconf; test_nft; test_ipv6; test_group; echo "ALL OK" ;;
+    *) echo "usage: smoke.sh [rule|code|wgconf|nft|ipv6|group|nopy|all]"; exit 1 ;;
 esac
