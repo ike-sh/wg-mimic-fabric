@@ -208,6 +208,28 @@ test_swgp() {
     echo "SWGP OK"
 }
 
+test_obfs() {
+    seed_exit; load_profile ex
+    # exit + swgp+mimic → mimic filter 对准 SWGP_PORT(18443)
+    local m; m="$(render_mimic_conf_for_profile)"
+    grep -q 'local=' <<<"$m" || fail "exit mimic local: $m"
+    grep -q ':18443' <<<"$m" || fail "exit mimic wire port: $m"
+    # relay：swgp 时 WG endpoint 拨本机 swgp，mimic remote 对准 B:SWGP_PORT
+    write_profile_kv "$(profile_env_path rl)" \
+        "PROFILE_ID=rl" "ROLE=relay" "ENABLED=true" "WAN_IFACE=eth0" \
+        "WG_MESH_SUBNET=10.88.0.0/24" "WG_IX_IP=10.88.0.2" "WG_INGRESS_IP=10.88.0.1" \
+        "WG_PORT=51820" "WG_MTU=1420" "IX_ENDPOINT_HOST=1.2.3.4" \
+        "WG_PRIVATE_KEY=k" "WG_PUBLIC_KEY=p" "WG_PEER_PUBLIC_KEY=BPUB" \
+        "OBFS_MODE=swgp+mimic" "SWGP_MODE=zero-overhead-2026" "SWGP_PSK=x" "SWGP_PORT=18443"
+    load_profile rl
+    local w; w="$(render_wg_conf)"
+    grep -q 'Endpoint = 127.0.0.1:18443' <<<"$w" || fail "relay swgp endpoint: $w"
+    grep -qF 'relay rl' <<<"$w" || fail "relay header"
+    local mr; mr="$(render_mimic_conf_for_profile)"
+    grep -q 'remote=1.2.3.4:18443' <<<"$mr" || fail "relay mimic remote: $mr"
+    echo "OBFS OK"
+}
+
 case "${1:-all}" in
     rule) test_rule ;;
     code) test_code ;;
@@ -220,7 +242,8 @@ case "${1:-all}" in
     iface) test_iface ;;
     swgp) test_swgp ;;
     code6) test_code6 ;;
-    nopy) test_rule; test_wgconf; test_nft; test_ipv6; test_group; test_pool; test_mimic; test_iface; echo "NOPY OK" ;;
-    all) test_rule; test_code; test_code6; test_swgp; test_wgconf; test_nft; test_ipv6; test_group; test_pool; test_mimic; test_iface; echo "ALL OK" ;;
-    *) echo "usage: smoke.sh [rule|code|code6|swgp|wgconf|nft|ipv6|group|pool|mimic|iface|nopy|all]"; exit 1 ;;
+    obfs) test_obfs ;;
+    nopy) test_rule; test_wgconf; test_nft; test_ipv6; test_group; test_pool; test_mimic; test_iface; test_obfs; echo "NOPY OK" ;;
+    all) test_rule; test_code; test_code6; test_swgp; test_obfs; test_wgconf; test_nft; test_ipv6; test_group; test_pool; test_mimic; test_iface; echo "ALL OK" ;;
+    *) echo "usage: smoke.sh [rule|code|code6|swgp|obfs|wgconf|nft|ipv6|group|pool|mimic|iface|nopy|all]"; exit 1 ;;
 esac
