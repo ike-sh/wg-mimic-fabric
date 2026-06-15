@@ -1,5 +1,20 @@
 # Changelog
 
+## [1.3.1] - 2026-06-16
+
+### Fixed
+
+- **purge / 卸载补全 swgp 清理**：此前「完全清理 purge」仅移除配置、wm 脚本与 mimic 系统包，遗留 swgp-go 二进制、`wg-mimic-swgp@` systemd 模板与服务。现新增 `stop_swgp_services` 停用所有 swgp 服务、卸载时移除 swgp systemd 模板、purge 额外删除 `/usr/local/bin/swgp-go`；purge 确认文案与卸载菜单文案同步标注。
+
+### Added
+
+- **大写快捷命令 `WG`**：等价 `wm` 的快捷入口（`/usr/local/bin/WG` 符号链接至 `wm`），`install-wm-cli` 与 `wm upgrade-script` 均自动创建，卸载时一并清理。小写 `wg` 会与 wireguard-tools 的 `wg` 命令冲突（脚本与 wg-quick 依赖它），故不提供小写别名。
+- **菜单署名**：交互菜单顶部 banner 展示「作者 ike · github.com/ike-sh/wg-mimic-fabric」。
+
+### Verified
+
+- `shellcheck -S warning` 0 告警；`bash -n`（install.sh + smoke.sh）通过；`smoke nopy` 回归全 11 项通过。
+
 ## [1.3.0] - 2026-06-16
 
 ### Added（交互菜单）

@@ -2,7 +2,7 @@
 # wg-mimic-fabric — WireGuard + Mimic tunnel orchestrator (MVP)
 set -Eeuo pipefail
 
-SCRIPT_VERSION="1.3.0"
+SCRIPT_VERSION="1.3.1"
 MIMIC_UPSTREAM_TAG="${MIMIC_UPSTREAM_TAG:-v0.7.0}"
 
 CONFIG_DIR="/etc/wg-mimic-fabric"
@@ -18,6 +18,7 @@ DEFAULT_GITHUB_MIRRORS="https://gh.ddlc.top/,https://gh-proxy.com/,https://ghpro
 LIBEXEC_DIR="/usr/local/libexec/wg-mimic-fabric"
 WM_CLI_INSTALL_SH="${LIBEXEC_DIR}/install.sh"
 WM_BIN="/usr/local/bin/wm"
+WG_ALIAS="/usr/local/bin/WG"
 MIMIC_CONF_DIR="/etc/mimic"
 WG_CONF_DIR="/etc/wireguard"
 SYSTEMD_MIMIC_TEMPLATE="/etc/systemd/system/wg-mimic-mimic@.service"
@@ -825,6 +826,7 @@ upgrade_script() {
     [[ -f "$WM_CLI_INSTALL_SH" ]] && cp -a "$WM_CLI_INSTALL_SH" "${BACKUP_DIR}/install.sh.bak.$(date +%Y%m%d%H%M%S)"
     install -m 755 "$tmp" "$WM_CLI_INSTALL_SH"
     rm -f "$tmp"
+    ensure_cli_aliases
     ok "已升级至 ${remote_ver:-unknown}"
 }
 
@@ -2835,6 +2837,14 @@ stop_mimic_services() {
     done
 }
 
+stop_swgp_services() {
+    local u
+    for u in $(systemctl list-units --all --no-legend 'wg-mimic-swgp@*' 2>/dev/null | awk '{print $1}'); do
+        systemctl stop "$u" 2>/dev/null || true
+        systemctl disable "$u" 2>/dev/null || true
+    done
+}
+
 install_base_packages() {
     local id; id="$(detect_os_id)"
     info "安装基础依赖（wireguard-tools 等）..."
@@ -3351,6 +3361,7 @@ purge_installation() {
   - wm 管理脚本 (/usr/local/bin/wm, libexec)
   - WireGuard / Mimic 生成的配置
   - nft 防火墙规则
+  - swgp-go 二进制 (/usr/local/bin/swgp-go) 与其 systemd 单元
   - mimic 与 mimic-dkms 系统包（apt/pacman）
 
 EOF
@@ -3378,10 +3389,12 @@ uninstall_wm_core() {
     local ids=() ifaces=() id iface wg_iface
     while IFS= read -r id; do [[ -n "$id" ]] && ids+=("$id"); done < <(list_profile_ids 2>/dev/null || true)
     stop_mimic_services
+    stop_swgp_services
     stop_all_profiles 2>/dev/null || true
     for id in "${ids[@]}"; do
         wg_iface="$(wg_iface_for "$id")"
         systemctl disable "wg-mimic-tunnel@${id}.service" 2>/dev/null || true
+        systemctl disable "wg-mimic-swgp@${id}.service" 2>/dev/null || true
         remove_tunnel_mimic_dropin "$id"
         load_profile "$id" 2>/dev/null && ifaces+=("$WAN_IFACE") || true
         if [[ "$remove_configs" == "true" ]]; then
@@ -3399,7 +3412,7 @@ uninstall_wm_core() {
         if nft list table inet "$NFT_TABLE" >/dev/null 2>&1; then
             nft delete table inet "$NFT_TABLE" 2>/dev/null || true
         fi
-        rm -f "$NFT_FILE" "$SYSCTL_FILE"
+        rm -f "$NFT_FILE" "$SYSCTL_FILE" "$SWGP_BIN"
         rm -rf "$CONFIG_DIR" "$LIBEXEC_DIR"
     fi
     systemctl disable --now wg-mimic-ddns.timer 2>/dev/null || true
@@ -3408,9 +3421,9 @@ uninstall_wm_core() {
     for _asw in $(systemctl list-units --all --no-legend 'wg-mimic-autoswitch@*.timer' 2>/dev/null | awk '{print $1}'); do
         systemctl disable --now "$_asw" 2>/dev/null || true
     done
-    rm -f "$WM_BIN" "$SYSTEMD_MIMIC_TEMPLATE" "$SYSTEMD_TUNNEL_TEMPLATE" "$SYSTEMD_DDNS_SERVICE" "$SYSTEMD_DDNS_TIMER" "$SYSTEMD_AUTOSWITCH_SERVICE" "$SYSTEMD_AUTOSWITCH_TIMER" "$SYSTEMD_RESUME_SERVICE"
+    rm -f "$WM_BIN" "$SYSTEMD_MIMIC_TEMPLATE" "$SYSTEMD_TUNNEL_TEMPLATE" "$SYSTEMD_SWGP_TEMPLATE" "$SYSTEMD_DDNS_SERVICE" "$SYSTEMD_DDNS_TIMER" "$SYSTEMD_AUTOSWITCH_SERVICE" "$SYSTEMD_AUTOSWITCH_TIMER" "$SYSTEMD_RESUME_SERVICE"
     # 大写别名（若存在）
-    rm -f "/usr/local/bin/WM" 2>/dev/null || true
+    rm -f "/usr/local/bin/WM" "$WG_ALIAS" 2>/dev/null || true
     if [[ "$remove_configs" == "true" ]]; then
         rmdir "$LIBEXEC_DIR" 2>/dev/null || true
     fi
@@ -3439,7 +3452,7 @@ uninstall_from_menu() {
 卸载 wg-mimic-fabric
 
   1) 卸载服务（保留 /etc/wg-mimic-fabric 配置）
-  2) 完全清理 purge（配置+本地脚本+mimic 包）
+  2) 完全清理 purge（配置+本地脚本+mimic/swgp）
   0) 取消
 EOF
     local mode; read -r -p "请选择: " mode </dev/tty
@@ -3453,6 +3466,12 @@ EOF
 
 # ── CLI install ────────────────────────────────────────────────────────────
 
+# 大写 WG 快捷入口（symlink → wm）。小写 wg 会与 wireguard-tools 的 wg 命令冲突，故不创建。
+ensure_cli_aliases() {
+    [[ -e "$WM_BIN" ]] || return 0
+    ln -sf "$WM_BIN" "$WG_ALIAS" 2>/dev/null || true
+}
+
 install_wm_cli() {
     require_root
     ensure_dirs
@@ -3463,8 +3482,9 @@ install_wm_cli() {
 exec /usr/local/libexec/wg-mimic-fabric/install.sh "$@"
 WRAP
     chmod 755 "$WM_BIN"
+    ensure_cli_aliases
     install_systemd_units
-    ok "已安装 wm 命令：$WM_BIN"
+    ok "已安装 wm 命令：$WM_BIN（含大写别名 WG）"
     if [[ "${WMF_AUTO_MIMIC:-1}" == "1" && "${WMF_SKIP_MIMIC:-}" != "1" ]]; then
         install_mimic_packages 2>/dev/null || warn "mimic 未自动装上，请运行：wm install-mimic"
     fi
@@ -3538,6 +3558,7 @@ show_menu() {
         printf '   wg-mimic-fabric · 管理控制台    v%s\n' "$SCRIPT_VERSION"
         cat <<'MENU'
    WireGuard 组网 · Mimic 伪 TCP 伪装 · swgp 流量混淆
+   作者 ike · github.com/ike-sh/wg-mimic-fabric
 ════════════════════════════════════════════════
 
  ▸ 模式一：IX 中转组网（端口转发 / 中转加速）
