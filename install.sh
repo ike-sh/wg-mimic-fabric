@@ -2,7 +2,7 @@
 # wg-mimic-fabric — WireGuard + Mimic tunnel orchestrator (MVP)
 set -Eeuo pipefail
 
-SCRIPT_VERSION="0.6.1"
+SCRIPT_VERSION="0.6.2"
 MIMIC_UPSTREAM_TAG="${MIMIC_UPSTREAM_TAG:-v0.7.0}"
 APP_NAME="wg-mimic-fabric"
 WMF_PROJECT_REPO="${WMF_REPO:-ike-sh/wg-mimic-fabric}"
@@ -27,6 +27,8 @@ SYSTEMD_TUNNEL_TEMPLATE="/etc/systemd/system/wg-mimic-tunnel@.service"
 SYSCTL_FILE="/etc/sysctl.d/99-wg-mimic-fabric.conf"
 SYSTEMD_DDNS_SERVICE="/etc/systemd/system/wg-mimic-ddns.service"
 SYSTEMD_DDNS_TIMER="/etc/systemd/system/wg-mimic-ddns.timer"
+SYSTEMD_RESUME_SERVICE="/etc/systemd/system/wg-mimic-resume.service"
+RESUME_MARKER="${STATE_DIR}/resume.cmd"
 
 # ── OS / kernel compatibility ──────────────────────────────────────────────
 
@@ -355,6 +357,78 @@ parse_code() {
 ensure_mimic() {
     command_exists mimic || die "未找到 mimic，请安装：apt install mimic mimic-dkms"
     modprobe mimic 2>/dev/null || warn "mimic 内核模块未加载，请安装 mimic-dkms"
+}
+
+mimic_module_loaded() { lsmod 2>/dev/null | grep -q '^mimic '; }
+
+# True when mimic CLI is installed but the module cannot load now — typically a
+# DKMS build for a not-yet-running kernel; a reboot will usually fix it.
+mimic_needs_reboot() {
+    mimic_module_loaded && return 1
+    command_exists mimic || return 1
+    modprobe mimic 2>/dev/null && return 1
+    return 0
+}
+
+# Install a one-shot unit that, on next boot, loads mimic and resumes the
+# pending command (e.g. "start ix-nat"), then removes itself.
+install_resume_unit() {
+    local cmd="$1"
+    ensure_dirs
+    printf '%s\n' "$cmd" >"$RESUME_MARKER"
+    chmod 600 "$RESUME_MARKER"
+    local tmp; tmp="$(mktemp)"
+    cat >"$tmp" <<EOF
+[Unit]
+Description=wg-mimic-fabric post-reboot resume
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=${WM_BIN} resume
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    install -m 644 "$tmp" "$SYSTEMD_RESUME_SERVICE"
+    rm -f "$tmp"
+    systemctl daemon-reload 2>/dev/null || true
+    systemctl enable wg-mimic-resume.service 2>/dev/null || true
+}
+
+resume_after_boot() {
+    require_root
+    modprobe mimic 2>/dev/null || true
+    local cmd=""
+    [[ -f "$RESUME_MARKER" ]] && cmd="$(cat "$RESUME_MARKER" 2>/dev/null || true)"
+    systemctl disable wg-mimic-resume.service 2>/dev/null || true
+    rm -f "$SYSTEMD_RESUME_SERVICE" "$RESUME_MARKER"
+    systemctl daemon-reload 2>/dev/null || true
+    if [[ -n "$cmd" ]]; then
+        info "开机自动继续：wm ${cmd}"
+        # shellcheck disable=SC2086
+        main $cmd
+    fi
+}
+
+# Interactive: offer to reboot now (optionally auto-resuming a command on boot).
+offer_reboot() {
+    local resume_cmd="${1:-}"
+    if [[ ! -e /dev/tty ]]; then
+        warn "mimic 内核模块未加载，需重启后生效：sudo reboot（之后 wm ${resume_cmd:-start <ID>}）"
+        return 0
+    fi
+    printf '\n检测到 mimic 内核模块需重启后才能加载（运行内核与已编译模块不一致）。\n' >&2
+    [[ -n "$resume_cmd" ]] && printf '  1) 现在重启，开机后自动继续：wm %s\n' "$resume_cmd" >&2
+    printf '  2) 现在重启（开机后手动操作）\n' >&2
+    printf '  0) 暂不重启\n' >&2
+    local ans=""; read -r -p "选择: " ans </dev/tty || ans=""
+    case "$(trim "$ans")" in
+        1) [[ -n "$resume_cmd" ]] && install_resume_unit "$resume_cmd"; warn "正在重启..."; reboot ;;
+        2) warn "正在重启..."; reboot ;;
+        *) warn "未重启；稍后 sudo reboot 后再执行 wm ${resume_cmd:-start <ID>}" ;;
+    esac
 }
 
 detect_default_iface() {
@@ -970,6 +1044,9 @@ start_profile() {
     local path; path="$(profile_env_path "$PROFILE_ID")"
     grep -q '^ENABLED=' "$path" 2>/dev/null && sed -i 's/^ENABLED=.*/ENABLED=true/' "$path"
     load_profile "$1"
+    if mimic_needs_reboot; then
+        offer_reboot "start ${PROFILE_ID}"
+    fi
     ensure_mimic
     apply_profile_configs
     apply_nft_all
@@ -1884,7 +1961,8 @@ uninstall_wm_core() {
         rm -rf "$CONFIG_DIR" "$LIBEXEC_DIR"
     fi
     systemctl disable --now wg-mimic-ddns.timer 2>/dev/null || true
-    rm -f "$WM_BIN" "$SYSTEMD_MIMIC_TEMPLATE" "$SYSTEMD_TUNNEL_TEMPLATE" "$SYSTEMD_DDNS_SERVICE" "$SYSTEMD_DDNS_TIMER"
+    systemctl disable wg-mimic-resume.service 2>/dev/null || true
+    rm -f "$WM_BIN" "$SYSTEMD_MIMIC_TEMPLATE" "$SYSTEMD_TUNNEL_TEMPLATE" "$SYSTEMD_DDNS_SERVICE" "$SYSTEMD_DDNS_TIMER" "$SYSTEMD_RESUME_SERVICE"
     # 大写别名（若存在）
     rm -f "/usr/local/bin/WM" 2>/dev/null || true
     if [[ "$remove_configs" == "true" ]]; then
@@ -2053,6 +2131,7 @@ main() {
         install-all) install_all ;;
         install-deps) install_deps ;;
         compat) compat_os_report ;;
+        resume) resume_after_boot ;;
         create-transit) create_transit_interactive ;;
         import-code) import_code_interactive ;;
         start) start_profile "$(resolve_profile_id "${2:-}")" ;;

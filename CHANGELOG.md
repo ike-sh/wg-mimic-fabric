@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.2] - 2026-06-15
+
+### Added
+
+- `wm start` 检测到 mimic 内核模块需重启才能生效（DKMS 为非运行内核编译）时，**交互询问是否现在重启并开机自动继续**：写入一次性 `wg-mimic-resume` systemd 单元，开机 `modprobe mimic` + 续跑 `wm start <ID>` 后自删
+- 新增 `wm resume`（一次性恢复命令，主要由上面的开机单元调用）
+
 ## [0.6.1] - 2026-06-15
 
 ### Fixed
