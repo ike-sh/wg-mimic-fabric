@@ -1,58 +1,56 @@
-# 公网入口 → IX 中转 → 落地
+# 公网入口 ⇄ IX（WireGuard 组网）→ 落地
 
-对标 [ix-transit-fabric](https://github.com/ike-sh/ix-transit-fabric)：**IX 生成接入码 → 公网入口粘贴接入码**。落地无需 WG / Mimic，仅 `IP:端口`。
+对标 [ix-transit-fabric](https://github.com/ike-sh/ix-transit-fabric)，但组网改用 **WireGuard**：公网入口与 IX 经 WG 点对点互联，链路由 **Mimic** 伪装成 TCP；IX 经 nft 转发到落地。
 
 ## 架构
 
 ```text
-客户端 → 公网入口 Debian  公网IP:LOCAL_PORT
-       → IX 中转 Debian    IX_IP:TRANSIT_PORT
-       → 落地              LANDING_IP:PORT
+客户端
+  → 公网入口 公网IP:client_port
+  → 公网入口 nft DNAT → IX虚拟IP:transit_port
+  → WireGuard 隧道（入口 10.88.0.1 ⇄ IX 10.88.0.2，Mimic 伪 TCP 承载 WG 的 UDP）
+  → IX nft DNAT → 落地 landing_host:landing_port
 ```
 
-## 1. IX 中转机（Debian 12）
+一条 WG 隧道承载所有规则；每条规则差异仅在两端 nft DNAT 与入口 `client_port`。
+
+## 1. IX / 落地侧（nat-transit）
 
 ```bash
-# 纯转发可跳过 mimic
-WMF_SKIP_MIMIC=1 curl -fsSL .../bootstrap.sh | sudo bash
-
+curl -fsSL .../bootstrap.sh | sudo bash
 sudo wm create-transit
-# IX 中转监听端口: 40000
-# IX 对入口可达 IP: 10.x.x.x（IX 网段）
-# 落地 IP / 端口
-
-sudo wm start ix-transit
+# 公网入口可达的 IX 地址（域名/IP）、WG 端口、落地 IP/端口
+sudo wm start ix-nat
 # 复制 WMGF1: 接入码
 ```
 
-## 2. 公网入口（Debian 12/13）
+## 2. 公网入口（nat-ingress）
 
 ```bash
-WMF_SKIP_MIMIC=1 curl -fsSL .../bootstrap.sh | sudo bash
-
-sudo wm import-transit-code
-# 粘贴 IX 接入码
-# 公网入口端口: 30000（客户端连此口）
-
-sudo wm start ix-transit-ingress
+curl -fsSL .../bootstrap.sh | sudo bash
+sudo wm import-code
+# 粘贴接入码；为每条规则分配客户端入口端口
+sudo wm start ix-nat-ingress
 ```
 
 ## 3. 客户端
 
-连接：`公网入口IP:30000`
+连接：`公网入口IP:<client_port>`（`wm show-port-map`）
 
-## 命令
+## 端口术语
 
-| 命令 | 机器 |
+| 名称 | 说明 |
 |------|------|
-| `wm create-transit` | IX |
-| `wm import-transit-code` | 公网入口 |
-| `wm show-code` / `refresh-code` | IX |
+| client_port | 客户端连接公网入口的端口 |
+| transit_port | IX 虚拟 IP 上的中转端口（WG 内网） |
+| landing_host:landing_port | 落地业务地址 |
+| WG_PORT | IX 的 WireGuard 监听端口（Mimic 伪 TCP 绑定，需对入口放行 TCP+UDP） |
 
 ## 前提
 
-公网入口须能路由到 IX 机的 `transit_reach_host`（IX 网段互通）。
+- 公网入口能路由到 `IX_ENDPOINT_HOST:WG_PORT`。
+- 两端内核 ≥ 6.1 且 Mimic 可用（`wm compat`）。
 
 ## 变更记录
 
-v0.5.0 移除 WG/Mimic/Forwarder 菜单，统一为接入码流程。
+v0.6.0：EasyTier/relay 模型 → WireGuard 组网 + Mimic 伪 TCP，接入码 schema=5（含规则/落地/MTU）。

@@ -1,9 +1,9 @@
-# wg-mimic-fabric 运维示例
+# wg-mimic-fabric 运维示例（v0.6）
 
 ## 依赖
 
 ```bash
-# Debian / Ubuntu
+# Debian 13 / Ubuntu 24.04（内核 ≥ 6.1）
 apt install wireguard-tools mimic mimic-dkms python3 nftables
 modprobe mimic
 ```
@@ -11,54 +11,59 @@ modprobe mimic
 ## 安装
 
 ```bash
-# 本地开发（自动装 mimic，Debian/Ubuntu）
-sudo bash install.sh install-all
-
-# 仅装 wm，不装 mimic
-WMF_SKIP_MIMIC=1 sudo bash install.sh install-wm-cli
-
-# 一行安装（需推送到 GitHub 后）
 curl -fsSL https://raw.githubusercontent.com/ike-sh/wg-mimic-fabric/main/scripts/bootstrap.sh | sudo bash
+# 仅装 wm（跳过 mimic）：WMF_SKIP_MIMIC=1 sudo bash install.sh install-wm-cli
 ```
 
-## 服务端
+## IX / 落地侧（nat-transit）
 
 ```bash
-wm create-server
-# 复制输出的 WMGF1: 配对码
+wm create-transit
+# 填：公网入口可达的 IX 地址、WG 端口(默认51820)、落地 IP/端口
+# 复制输出的 WMGF1: 接入码
 
-wm start my-tunnel
-wm health my-tunnel
-wm show-code my-tunnel
+wm start ix-nat
+wm show-code ix-nat
+wm health ix-nat
 ```
 
-## 客户端
+## 公网入口（nat-ingress）
 
 ```bash
 wm import-code
-# 粘贴 WMGF1: 配对码
+# 粘贴接入码；为每条规则分配客户端入口端口
 
-wm start my-tunnel-client
-wm health my-tunnel-client
+wm start ix-nat-ingress
+wm show-port-map ix-nat-ingress
+wm health ix-nat-ingress
+```
+
+## 多规则
+
+```bash
+wm add-rule ix-nat            # IX 新增落地规则
+wm refresh-code ix-nat        # 刷新接入码（公网入口需重新 import-code）
+wm list-rules ix-nat
+wm apply-rules ix-nat-ingress # 重建 nft
 ```
 
 ## 验证
 
 ```bash
-wm diagnose my-tunnel
-ping -c 3 10.66.66.1    # 从客户端 ping 服务端隧道 IP
-mimic show -c eth0      # 查看 Mimic 连接状态
-wm refresh-code my-tunnel   # 泄露后轮换密钥
-wm set-xdp-mode my-tunnel skb   # Intel 网卡丢包时
-wm upgrade-script
-WMF_PURGE_YES=1 wm purge    # 完全清理
+wm diagnose ix-nat
+wg show wm-ix-nat             # WG 握手与流量
+mimic show -c eth0           # Mimic 连接状态
+ping -c3 10.88.0.2           # 入口 ping IX 虚拟 IP
+wm refresh-code ix-nat       # 密钥泄露后轮换并重新导入
+WMF_PURGE_YES=1 wm purge     # 完全清理
 ```
 
 ## 故障排查
 
 | 现象 | 处理 |
 |------|------|
-| Intel 网卡丢包 | profile 设 `MIMIC_XDP_MODE=skb` 后 `wm restart <id>` |
-| WG 握手失败 | 确认防火墙 TCP+UDP 51820 放行 |
+| WG 不握手 | 确认入口能到 `IX_ENDPOINT_HOST:WG_PORT`；两端 Mimic 均 active |
+| Intel 网卡丢包 | `wm set-xdp-mode <ID> skb` 后 `wm restart <ID>` |
 | mimic 模块缺失 | `apt install mimic-dkms && modprobe mimic` |
-| MTU 问题 | IPv6 用 1408，IPv4 用 1420 |
+| 客户端连不上 | `wm show-port-map`，确认 `client_port` 已放行、IX 落地可达 |
+| MTU 异常 | `wm set-mtu <ID> 1420`（有额外封装再减 12） |
