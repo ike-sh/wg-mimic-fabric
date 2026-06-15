@@ -2,7 +2,7 @@
 # wg-mimic-fabric — WireGuard + Mimic tunnel orchestrator (MVP)
 set -Eeuo pipefail
 
-SCRIPT_VERSION="0.6.3"
+SCRIPT_VERSION="0.6.4"
 MIMIC_UPSTREAM_TAG="${MIMIC_UPSTREAM_TAG:-v0.7.0}"
 APP_NAME="wg-mimic-fabric"
 WMF_PROJECT_REPO="${WMF_REPO:-ike-sh/wg-mimic-fabric}"
@@ -1279,6 +1279,9 @@ create_transit_interactive() {
     printf '════════════════════════════════════════════\n'
     printf '公网入口：wm import-code 粘贴上方接入码\n'
     printf 'IX 机启动：wm start %s\n' "$profile_id"
+    if mimic_needs_reboot; then
+        offer_reboot "start ${profile_id}"
+    fi
 }
 
 import_code_interactive() {
@@ -1338,7 +1341,8 @@ import_code_interactive() {
     local client_port=30000 rid note tport lhost lport rproto
     while IFS=$'\t' read -r rid note tport lhost lport rproto; do
         [[ -n "$rid" ]] || continue
-        prompt_port client_port "规则 ${rid}（${note:-}）客户端入口端口" "$client_port"
+        # 默认与落地端口一致（客户端用同一端口号），回车即可；可手动改
+        prompt_port client_port "规则 ${rid}（${note:-}）客户端入口端口" "${lport:-$client_port}"
         write_rule "$ingress_id" "$rid" \
             "RULE_ID=${rid}" \
             "RULE_NOTE=${note}" \
@@ -1358,6 +1362,9 @@ import_code_interactive() {
     printf '\n═══ 公网入口已配置 ═══\n'
     show_port_map "$ingress_id"
     printf '\n执行：wm start %s\n' "$ingress_id"
+    if mimic_needs_reboot; then
+        offer_reboot "start ${ingress_id}"
+    fi
 }
 
 regenerate_code_if_transit() {

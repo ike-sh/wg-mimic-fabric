@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.4] - 2026-06-15
+
+### Fixed
+
+- `import-code` 导入时「客户端入口端口」默认值改为该规则的**落地端口**（多数场景客户端与落地用同一端口号），直接回车即可，仍可手动指定
+- `create-transit` / `import-code` 完成后，若检测到 mimic 内核模块因运行内核与已编译模块不一致而未加载（`mimic_needs_reboot`），主动给出**重启提示**并可选「开机自动续跑 `wm start <ID>`」；此前仅 `wm start` 阶段提示，create/import 阶段易被忽略
+
 ## [0.6.3] - 2026-06-15
 
 ### Added
