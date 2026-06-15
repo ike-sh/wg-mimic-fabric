@@ -2,7 +2,7 @@
 # wg-mimic-fabric — WireGuard + Mimic tunnel orchestrator (MVP)
 set -Eeuo pipefail
 
-SCRIPT_VERSION="1.1.0-beta.5"
+SCRIPT_VERSION="1.1.0-beta.6"
 MIMIC_UPSTREAM_TAG="${MIMIC_UPSTREAM_TAG:-v0.7.0}"
 APP_NAME="wg-mimic-fabric"
 WMF_PROJECT_REPO="${WMF_REPO:-ike-sh/wg-mimic-fabric}"
@@ -181,11 +181,25 @@ resolve_profile_id() {
 # so menu actions skip gracefully instead of aborting the whole script with
 # "无效的 PROFILE_ID".
 menu_pick_profile() {
+    local want_role="${1:-}"
     local ids=() id role path sel
     while IFS= read -r id; do [[ -n "$id" ]] && ids+=("$id"); done \
         < <(list_profile_ids 2>/dev/null || true)
+    if [[ -n "$want_role" && "${#ids[@]}" -gt 0 ]]; then
+        local filtered=()
+        for id in "${ids[@]}"; do
+            path="$(profile_env_path "$id")"
+            role="$(grep -m1 '^ROLE=' "$path" 2>/dev/null | cut -d= -f2- | tr -d '"' || true)"
+            [[ "$role" == "$want_role" ]] && filtered+=("$id")
+        done
+        ids=(${filtered[@]+"${filtered[@]}"})
+    fi
     if [[ "${#ids[@]}" -eq 0 ]]; then
-        warn "暂无线路，请先用 1)IX 创建组网线路 或 2)公网入口导入接入码"
+        if [[ -n "$want_role" ]]; then
+            warn "暂无 ${want_role} 线路（relay 先 wm import-exit-code；exit 先 wm create-exit）"
+        else
+            warn "暂无线路，请先用 1)IX 创建组网线路 或 2)公网入口导入接入码"
+        fi
         return 1
     fi
     printf '现有线路：\n' >&2
@@ -995,11 +1009,45 @@ render_mimic_conf_iface() {
                 source "$p"
                 [[ "${WAN_IFACE:-}" == "$iface" ]] || exit 0
                 [[ "${ENABLED:-true}" == "true" ]] || exit 0
-                [[ -n "${MIMIC_XDP_MODE:-}" ]] && printf 'xdp_mode = %s\n' "$MIMIC_XDP_MODE"
                 render_mimic_conf_for_profile
             )
         done
     }
+}
+
+# mimic 的 XDP attach 模式只能用命令行 -x 传:mimic 0.7.0 的配置文件不支持
+# xdp_mode 键,写进 .conf 会让 mimic 解析失败、丢掉 filter（隧道直接不通）。
+# 取该网卡上 enabled profile 选定的模式（skb 优先，virtio 上 native 常挂）。
+iface_xdp_mode() {
+    local iface="$1" p mode="" any=""
+    for p in "$PROFILES_DIR"/*.env; do
+        [[ -f "$p" ]] || continue
+        mode="$(
+            # shellcheck disable=SC1090
+            source "$p" 2>/dev/null
+            [[ "${WAN_IFACE:-}" == "$iface" ]] || exit 0
+            [[ "${ENABLED:-true}" == "true" ]] || exit 0
+            printf '%s' "${MIMIC_XDP_MODE:-}"
+        )"
+        [[ "$mode" == "skb" ]] && { printf 'skb'; return 0; }
+        [[ -n "$mode" ]] && any="$mode"
+    done
+    [[ -n "$any" ]] && printf '%s' "$any"
+    return 0
+}
+
+# 把网卡的 XDP 模式落到 EnvironmentFile，由 mimic@.service 注入 `-x <mode>`。
+# 空模式 → 删除文件 → mimic 自动选择（native 支持则 native，否则 skb）。
+write_mimic_xdp_env() {
+    local iface="${1:-}"; [[ -n "$iface" ]] || return 0
+    local envf="${MIMIC_CONF_DIR}/${iface}.xdp" mode
+    mode="$(iface_xdp_mode "$iface")"
+    if [[ "$mode" == "skb" || "$mode" == "native" ]]; then
+        printf 'MIMIC_XDP_ARGS=-x %s\n' "$mode" >"$envf"
+        chmod 644 "$envf" 2>/dev/null || true
+    else
+        rm -f "$envf"
+    fi
 }
 
 apply_mimic_conf_iface() {
@@ -1009,6 +1057,7 @@ apply_mimic_conf_iface() {
     backup_file "$path"
     render_mimic_conf_iface "$iface" >"$path"
     chmod 644 "$path"
+    write_mimic_xdp_env "$iface"
 }
 
 render_wg_conf() {
@@ -1348,7 +1397,8 @@ Wants=network-online.target
 [Service]
 Type=simple
 ExecStartPre=-${modprobe_bin} mimic
-ExecStart=${mimic_bin} run %i -F /etc/mimic/%i.conf
+EnvironmentFile=-/etc/mimic/%i.xdp
+ExecStart=${mimic_bin} run %i \$MIMIC_XDP_ARGS -F /etc/mimic/%i.conf
 Restart=on-failure
 RestartSec=3
 
@@ -2544,6 +2594,62 @@ set_profile_mtu() {
     ok "MTU 已设为 ${mtu}"
 }
 
+# 自动探测隧道可用 MTU：临时把 WG 接口 MTU 抬到探测上限，带 DF 二分 ping 对端虚拟IP，
+# 找出封装(mimic+WG)后能过中转线路的最大内层包，据此 set-mtu。换中转线路后跑一下即
+# 自适应；MSS 钳制(nft rt mtu)随 WG_MTU 自动跟随，无需手算。
+auto_mtu() {
+    local id; id="$(resolve_profile_id "${1:-}")"
+    require_root
+    load_profile "$id"
+    command_exists ping || die "需要 ping (iputils-ping)"
+    local peer wgi
+    case "${ROLE:-}" in
+        nat-transit|exit)  peer="${WG_INGRESS_IP:-}" ;;
+        nat-ingress|relay) peer="${WG_IX_IP:-}" ;;
+        *) die "automtu 仅支持 nat-transit/nat-ingress/exit/relay 线路" ;;
+    esac
+    [[ -n "$peer" ]] || die "线路缺少对端虚拟IP"
+    wgi="$(wg_iface_for "$id")"
+    [[ -d "/sys/class/net/${wgi}" ]] || die "隧道接口 ${wgi} 未就绪，先 wm start ${id}"
+    ping -c1 -W2 "$peer" >/dev/null 2>&1 \
+        || die "隧道不通（ping ${peer} 失败）——先确保 wm test ${id} 能通再 automtu"
+
+    local orig_mtu probe_ceiling=1440
+    orig_mtu="$(cat "/sys/class/net/${wgi}/mtu" 2>/dev/null || echo 1420)"
+    info "探测线路 ${id} 隧道 MTU（对端 ${peer}，接口 ${wgi}）..."
+    ip link set dev "$wgi" mtu "$probe_ceiling" 2>/dev/null || true
+
+    # 二分内层 ping 负载 N（实际内层 IP 包 = N + 28）。下限 1252→新 MTU≥1280(WG下限)。
+    local lo=1252 hi=$((probe_ceiling - 28)) mid best=0
+    while (( lo <= hi )); do
+        mid=$(( (lo + hi) / 2 ))
+        if ping -c1 -W2 -M do -s "$mid" "$peer" >/dev/null 2>&1; then
+            best=$mid; lo=$(( mid + 1 ))
+        else
+            hi=$(( mid - 1 ))
+        fi
+    done
+    ip link set dev "$wgi" mtu "$orig_mtu" 2>/dev/null || true
+
+    if (( best == 0 )); then
+        die "探测失败：内层 1280 字节都过不去，隧道路径 MTU < 1280(WG下限)。保持 MTU ${orig_mtu}，请排查中转线路"
+    fi
+    local new_mtu=$(( best + 28 ))
+    info "探测结果：最大可过内层包 ${new_mtu} 字节"
+    if (( new_mtu == orig_mtu )); then
+        ok "当前 MTU ${orig_mtu} 已是最优，无需调整"
+        return 0
+    fi
+    set_profile_mtu "$id" "$new_mtu"
+    sleep 2
+    if ping -c4 -W2 -M do -s "$(( new_mtu - 28 ))" "$peer" >/dev/null 2>&1; then
+        ok "已自适应 WG_MTU=${new_mtu}（满包复测通过）"
+    else
+        warn "设为 ${new_mtu} 后满包复测仍丢包，可手动再降：wm set-mtu ${id} $(( new_mtu - 20 ))"
+    fi
+    info "⚠️ 对端需设同值：在对端机执行 wm set-mtu <对端线路ID> ${new_mtu}（或对端也跑 wm automtu）"
+}
+
 set_profile_xdp_mode() {
     local id mode; id="$(resolve_profile_id "${1:-}")"; mode="${2:-}"
     require_root
@@ -3220,6 +3326,7 @@ wg-mimic-fabric ${SCRIPT_VERSION} — 公网入口 ⇄ IX WireGuard 组网 + Mim
   wm set-group <ID> <组名> [primary|backup|standalone] [优先级]
   wm list-groups / switch-line <组名> <目标ID> / primary-backup-check <组名>
   wm set-mtu <ID> <MTU> / wm set-xdp-mode <ID> [skb|native]
+  wm automtu <ID>                 自动探测隧道可用 MTU 并设置（换中转线路后跑一下即自适应；两端各跑）
   wm install-all|install-mimic|install-deps|compat
   wm update-mimic [版本]           升级 mimic 到 apt 最新或指定版本（重载模块+重启线路）
   wm install-swgp                  安装 swgp-go（WireGuard 混淆，过墙用）
@@ -3259,8 +3366,13 @@ show_menu() {
 ║  8) 刷新接入码（IX）                 ║
 ║  9) 端口地图                         ║
 ║ 10) 规则管理（列出/增/删）           ║
-║ 11) 升级脚本                         ║
-║ 12) 卸载 / 完全清理                  ║
+╟─── 混淆组网 / 全局出口 ──────────────╢
+║ 11) 创建国外出口 B（create-exit）    ║
+║ 12) 导入出口接入码 A                 ║
+║ 13) 客户端管理（增/列/删）           ║
+╟──────────────────────────────────────╢
+║ 14) 升级脚本                         ║
+║ 15) 卸载 / 完全清理                  ║
 ║  0) 退出                             ║
 ╚══════════════════════════════════════╝
 MENU
@@ -3308,8 +3420,26 @@ MENU
                     fi
                 fi
                 ;;
-            11) upgrade_script; ok "重新加载菜单以应用新版本..."; exec "$WM_BIN" ;;
-            12) uninstall_from_menu ;;
+            11) create_exit_interactive ;;
+            12) import_exit_code ;;
+            13)
+                if id="$(menu_pick_profile relay)"; then
+                    printf '  操作:\n'
+                    printf '    1) 新增客户端\n'
+                    printf '    2) 列出客户端\n'
+                    printf '    3) 删除客户端\n'
+                    printf '    回车) 返回\n'
+                    read -r -p "选择操作: " rid </dev/tty
+                    case "$(trim "$rid")" in
+                        1) read -r -p "客户端名: " rid </dev/tty; add_client "$id" "$(trim "$rid")" ;;
+                        2) list_clients "$id" ;;
+                        3) read -r -p "要删除的客户端名: " rid </dev/tty; del_client "$id" "$(trim "$rid")" ;;
+                        *) : ;;
+                    esac
+                fi
+                ;;
+            14) upgrade_script; ok "重新加载菜单以应用新版本..."; exec "$WM_BIN" ;;
+            15) uninstall_from_menu ;;
             0|q|Q) exit 0 ;;
             *) warn "无效选择" ;;
         esac
@@ -3369,6 +3499,7 @@ main() {
         autoswitch-disable) autoswitch_disable "${2:-}" ;;
         set-pool) set_transit_pool "${2:-}" "${3:-}" ;;
         set-mtu) set_profile_mtu "${2:-}" "${3:-}" ;;
+        automtu) auto_mtu "${2:-}" ;;
         set-xdp-mode) set_profile_xdp_mode "${2:-}" "${3:-}" ;;
         apply-nft-all) require_root; apply_nft_all; ok "nft 规则已重建" ;;
         upgrade-script) upgrade_script ;;

@@ -1,5 +1,19 @@
 # Changelog
 
+## [1.1.0-beta.6] - 2026-06-15
+
+### Fixed（严重：virtio 网卡上 mimic 丢 filter 导致隧道在 XDP 层不通）
+
+- **mimic 的 XDP attach 模式改用命令行 `-x` 传递，不再写进 `.conf`**：此前 `MIMIC_XDP_MODE`（virtio 网卡自动置 skb，或手动 `wm set-xdp-mode`）会以 `xdp_mode = skb` 写入 `/etc/mimic/<iface>.conf`，但 **mimic 0.7.0 的配置文件并没有 `xdp_mode` 这个键**（XDP 模式只能用命令行 `-x/--xdp-mode`）。mimic 读到这行非法配置即**中断解析、丢弃后面的 `filter = ...` 行** → 以默认值（native、无 filter）运行 → 不处理任何流量 → **隧道在 XDP 层完全不通**。virtio 网卡上尤其致命：`wm set-mtu` / `set-xdp-mode` / `restart` 任一操作触发自动 skb 后，这条 conf 就把线路打断。典型表现：**WG 能握手、`wm test` 100% 丢包、`mimic show` 显示 `Filter: none` / `XDP Attach Mode: native`（即使设了 skb）**。
+  - `render_mimic_conf_iface` 不再输出 `xdp_mode` 行（conf 只保留 mimic 认识的 `filter` / `log.verbosity` / `keepalive`）。
+  - 新增 `iface_xdp_mode` / `write_mimic_xdp_env`：把网卡选定的模式落到 `/etc/mimic/<iface>.xdp`（`MIMIC_XDP_ARGS=-x <mode>`），由 mimic 单元新增的 `EnvironmentFile=-/etc/mimic/%i.xdp` 注入 `ExecStart=… mimic run %i $MIMIC_XDP_ARGS -F …`。模式为空时删除该文件 → mimic 自动选择（native 支持则 native，否则 skb）。
+  - 升级后两端 `wm restart <ID>` 重渲染即生效（单元模板会在 `wm start`/`restart` 时自动重建）。
+
+### Added
+
+- **`wm automtu <ID>` 自动探测隧道可用 MTU**：换中转线路后线上可用 MTU 常变小，导致"能连但卡/不显示延迟"（小握手包通、大数据包黑洞）。此前只能手动二分 `ping -M do` 再 `wm set-mtu`。新命令隧道起来后**自动**带 DF 二分 ping 对端虚拟 IP，找到封装(mimic+WG)后能过线路的最大内层包 → `WG_MTU = 该值`，自动 set-mtu 并满包复测；nft 的 MSS 钳制(`rt mtu`)随 WG_MTU 自动跟随，无需手算 MSS。路径对称，两端各跑一次（命令行，和 `wm test`/`set-mtu` 一样）。
+- **交互菜单接入「混淆组网 / 全局出口」模式**：`create-exit` / `import-exit-code` / 客户端管理（增/列/删）此前只有 CLI 与 `usage` 入口，`show_menu()` 漏接，敲 `wm` 进菜单点不到、无法测试。现菜单新增分区 `11) 创建国外出口 B` `12) 导入出口接入码 A` `13) 客户端管理`（升级/卸载顺延 14/15）；`menu_pick_profile` 增可选角色过滤，客户端管理只列 `relay` 网关线路。
+
 ## [1.1.0-beta.5] - 2026-06-15
 
 ### Fixed（国内服务器一键引导拉取 install.sh）
