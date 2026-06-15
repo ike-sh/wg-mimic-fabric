@@ -2,7 +2,7 @@
 # wg-mimic-fabric — WireGuard + Mimic tunnel orchestrator (MVP)
 set -Eeuo pipefail
 
-SCRIPT_VERSION="1.0.2"
+SCRIPT_VERSION="1.0.3"
 MIMIC_UPSTREAM_TAG="${MIMIC_UPSTREAM_TAG:-v0.7.0}"
 APP_NAME="wg-mimic-fabric"
 WMF_PROJECT_REPO="${WMF_REPO:-ike-sh/wg-mimic-fabric}"
@@ -651,9 +651,19 @@ upgrade_script() {
         return 0
     fi
     if [[ "${WMF_UPGRADE_YES:-}" != "1" ]]; then
-        printf '当前 %s → 远端 %s。确认升级？[y/N] ' "$cur" "${remote_ver:-?}" >&2
-        local ans; read -r ans </dev/tty
-        [[ "$(trim "${ans:-n}")" =~ ^[yY] ]] || { rm -f "$tmp"; die "已取消"; }
+        [[ -e /dev/tty ]] || { rm -f "$tmp"; die "非交互环境，请用 WMF_UPGRADE_YES=1 wm upgrade-script"; }
+        # 循环读取 + 容错：读空（SSH 偶发漏键）就重问，而不是直接按 N 取消
+        local ans=""
+        while true; do
+            printf '当前 %s → 远端 %s。确认升级？[y/N] ' "$cur" "${remote_ver:-?}" >&2
+            read -r ans </dev/tty || { rm -f "$tmp"; die "无法读取确认输入，请用 WMF_UPGRADE_YES=1 wm upgrade-script"; }
+            case "$(trim "$ans")" in
+                [yY]|[yY][eE][sS]) break ;;
+                [nN]|[nN][oO])     rm -f "$tmp"; die "已取消" ;;
+                "")               warn "读到空输入，请重新输入 y 或 n（Ctrl-C 退出）" ;;
+                *)                warn "请输入 y 或 n" ;;
+            esac
+        done
     fi
     install -d -m 755 "$BACKUP_DIR"
     [[ -f "$WM_CLI_INSTALL_SH" ]] && cp -a "$WM_CLI_INSTALL_SH" "${BACKUP_DIR}/install.sh.bak.$(date +%Y%m%d%H%M%S)"

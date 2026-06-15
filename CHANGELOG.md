@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.0.3] - 2026-06-15
+
+### Fixed
+
+- **`wm upgrade-script` 确认输了 y 仍被取消**：此前确认是单次 `read`，SSH 下偶发漏键/读空就按默认 N 取消。改为**循环读取 + 容错**：读空重问（不再直接取消）、`y`/`yes` 继续、`n`/`no` 取消、其它重问；非交互或读取失败时明确提示用 `WMF_UPGRADE_YES=1 wm upgrade-script`。
+
 ## [1.0.2] - 2026-06-15
 
 ### Fixed
