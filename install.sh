@@ -2,7 +2,7 @@
 # wg-mimic-fabric — WireGuard + Mimic tunnel orchestrator (MVP)
 set -Eeuo pipefail
 
-SCRIPT_VERSION="0.6.6"
+SCRIPT_VERSION="0.6.7"
 MIMIC_UPSTREAM_TAG="${MIMIC_UPSTREAM_TAG:-v0.7.0}"
 APP_NAME="wg-mimic-fabric"
 WMF_PROJECT_REPO="${WMF_REPO:-ike-sh/wg-mimic-fabric}"
@@ -514,7 +514,8 @@ detect_default_iface() {
 # First global IPv4 bound to the default interface — the inbound/bindable IP,
 # which (unlike curl's egress IP) is what Mimic must bind and clients reach.
 detect_local_ipv4() {
-    local iface; iface="$(detect_default_iface)"
+    local iface="${1:-}"
+    [[ -n "$iface" ]] || iface="$(detect_default_iface)"
     [[ -n "$iface" ]] || return 0
     ip -4 addr show dev "$iface" scope global 2>/dev/null \
         | awk '/inet /{print $2}' | cut -d/ -f1 | head -1
@@ -815,16 +816,17 @@ primary_backup_check() {
 render_mimic_conf_for_profile() {
     local role="${ROLE:-}" port="${WG_PORT:-}"
     if [[ "$role" == "nat-transit" ]]; then
-        # IX = WG listener (server). Match the local listen port on ANY local IP:
-        # 0.0.0.0 (or [::]) is NAT-safe — the public/floating IP is frequently not
-        # on the NIC, so a specific local IP would never match what XDP/TC sees.
-        # handshake=0 keeps this side passive; the ingress (client) initiates the
-        # fake-TCP handshake (mimic still runs on BOTH ends, encoding+decoding).
-        local wild="0.0.0.0"
-        [[ "${IX_ENDPOINT_HOST:-}" == *:* ]] && wild="[::]"
-        printf 'filter = local=%s:%s,handshake=0\n' "$wild" "$port"
+        # IX = WG listener. Mimic does EXACT IP matching and XDP/TC see the address
+        # actually on the NIC — on NAT/floating-IP VPS that is the private NIC IP, NOT
+        # the public endpoint (mimic#43). So match the WG port on the real local NIC IP
+        # (auto-detected from WAN_IFACE; override via MIMIC_LOCAL_IP). The 0.0.0.0/[::]
+        # wildcard only works on mimic builds >= 2025-11 (mimic#32) → last-resort only.
+        local lip="${MIMIC_LOCAL_IP:-}"
+        [[ -n "$lip" ]] || lip="$(detect_local_ipv4 "${WAN_IFACE:-}")"
+        [[ -n "$lip" ]] || lip="0.0.0.0"
+        printf 'filter = local=%s:%s\n' "$(format_mimic_ip "$lip")" "$port"
     elif [[ "$role" == "nat-ingress" ]]; then
-        # ingress = WG dialer (client) → match the remote IX endpoint; active handshake
+        # ingress = WG dialer → match the remote IX endpoint IP it connects to
         printf 'filter = remote=%s:%s\n' "$(format_mimic_ip "${IX_ENDPOINT_HOST:-}")" "$port"
     fi
 }

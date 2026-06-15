@@ -139,8 +139,9 @@ test_pool() {
 test_mimic() {
     seed_transit   # nat-transit, WG_PORT=51820, IX_ENDPOINT_HOST=nat.example
     load_profile ix-nat
-    local out; out="$(render_mimic_conf_for_profile)"
-    grep -qxF 'filter = local=0.0.0.0:51820,handshake=0' <<<"$out" || fail "transit mimic filter: $out"
+    local out
+    out="$(export MIMIC_LOCAL_IP=203.0.113.9; render_mimic_conf_for_profile)"
+    grep -qxF 'filter = local=203.0.113.9:51820' <<<"$out" || fail "transit mimic filter: $out"
     write_profile_kv "$(profile_env_path ing)" \
         "PROFILE_ID=ing" "ROLE=nat-ingress" "ENABLED=true" "WAN_IFACE=eth0" \
         "WG_PORT=51820" "IX_ENDPOINT_HOST=203.0.113.5" "WG_IX_IP=10.88.0.2" "WG_INGRESS_IP=10.88.0.1"

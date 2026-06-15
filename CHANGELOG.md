@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.6.7] - 2026-06-15
+
+### Fixed
+
+- **隧道仍不通的真正根因**（与 mimic#43 同款）：Mimic 做**精确 IP 匹配**，XDP/TC 看到的是**网卡上的真实 IP**；NAT/浮动IP 机器网卡上是内网 IP，而 0.6.6 用的 `local=0.0.0.0` 通配**只有 2025-11 之后的 mimic 才支持**（mimic#32），用户的 mimic 0.7.0 不识别 → IX 侧 mimic 不匹配 → server 端 `mimic show -c` 无连接、入口一直 SYN 重试。改为 **IX filter 用自动探测的 `WAN_IFACE` 网卡真实 IP**（精确匹配、全版本通用）；可用 `MIMIC_LOCAL_IP` 覆盖；`0.0.0.0` 仅作探测失败兜底
+- 去掉 0.6.6 加的 `handshake=0`，与 mimic 维护者确认可用的 server 配置（默认 active）对齐
+
+### Note
+
+- 仍需确认云安全组放行 IX 公网/浮动IP 的 **TCP + UDP `WG_PORT`**（mimic 链路上是 TCP，netfilter 入站识别为 TCP、出站为 UDP，两者都要放行）
+
 ## [0.6.6] - 2026-06-15
 
 ### Fixed
