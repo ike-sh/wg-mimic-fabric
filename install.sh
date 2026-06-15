@@ -2,7 +2,7 @@
 # wg-mimic-fabric — WireGuard + Mimic tunnel orchestrator (MVP)
 set -Eeuo pipefail
 
-SCRIPT_VERSION="1.1.1"
+SCRIPT_VERSION="1.2.0"
 MIMIC_UPSTREAM_TAG="${MIMIC_UPSTREAM_TAG:-v0.7.0}"
 APP_NAME="wg-mimic-fabric"
 WMF_PROJECT_REPO="${WMF_REPO:-ike-sh/wg-mimic-fabric}"
@@ -1733,31 +1733,34 @@ create_exit_interactive() {
 
     local profile_id endpoint_host wg_port wg_mtu wan_iface
     local subnet ix_ip ingress_ip obfs_mode swgp_mode swgp_port swgp_psk
-    prompt profile_id "出口线路 ID（B 国外）" "exit"
+    printf '\n── 创建国外出口 B（模式二 · 混淆全局出口）──\n'
+    printf '在国外服务器 B 上生成 WireGuard 出口与「出口接入码」；随后到国内网关 A 执行「导入出口接入码」即可打通。\n\n'
+    prompt profile_id "出口线路名称（国外 B 节点，便于区分多条线路）" "exit"
     profile_id="$(sanitize_id "$profile_id")"
     [[ ! -f "$(profile_env_path "$profile_id")" ]] || die "线路已存在：$profile_id"
-    info "填「A(国内网关)能连到本机 B 的公网/中转地址」（中转机填入口IP）"
-    prompt endpoint_host "A 可达的 B 公网/中转地址（域名或IP）" ""
+    info "下面填「国内网关 A 能访问到的本机 B 地址」——中转/NAT 机请填中转入口 IP，不要填出网 IP"
+    prompt endpoint_host "B 的公网地址（IP 或域名，A 用它连接 B）" ""
     [[ -n "$endpoint_host" ]] || die "B 可达地址不能为空"
-    prompt_port wg_port "WireGuard 监听端口" "51820"
-    prompt obfs_mode "混淆方式 direct/mimic/swgp/swgp+mimic" "swgp+mimic"
+    prompt_port wg_port "WireGuard 监听端口（B 本机内部端口，swgp 模式下保持默认即可）" "51820"
+    prompt obfs_mode "混淆方式（direct=不混淆 / mimic=伪TCP / swgp=加密 / swgp+mimic=双层最强，推荐）" "swgp+mimic"
     case "$obfs_mode" in direct|mimic|swgp|swgp+mimic) ;; *) die "混淆方式只能 direct/mimic/swgp/swgp+mimic" ;; esac
     swgp_port=0; swgp_mode=""; swgp_psk=""
     if [[ "$obfs_mode" == *swgp* ]]; then
-        prompt_port swgp_port "swgp-go 线上端口（A 连这个）" "$((wg_port + 1))"
+        info "swgp 对外端口 = A 经公网真正连接的端口；NAT/中转机请填「服务商转发给你的端口段内的空闲端口」，否则 A 连不上 B"
+        prompt_port swgp_port "swgp 对外端口（A 连接此端口）" "$((wg_port + 1))"
         [[ "$swgp_port" != "$wg_port" ]] || die "swgp 端口不能与 WG 端口相同"
-        prompt swgp_mode "swgp 模式 zero-overhead-2026/paranoid-2026" "zero-overhead-2026"
+        prompt swgp_mode "swgp 混淆强度（zero-overhead-2026=低开销 / paranoid-2026=更隐蔽）" "zero-overhead-2026"
         install_swgp
         swgp_psk="$(swgp_genpsk)"
     fi
     local mtu_def=1400; [[ "$obfs_mode" == *paranoid* ]] && mtu_def=1360; [[ "$obfs_mode" == direct ]] && mtu_def=1420
-    prompt wg_mtu "WG 隧道 MTU" "$mtu_def"
+    prompt wg_mtu "WG 隧道 MTU（已按混淆方式自动给出建议值，回车即可）" "$mtu_def"
     validate_mtu "$wg_mtu"
     wan_iface="$(detect_default_iface)"
-    prompt wan_iface "Mimic/出网绑定网卡" "${wan_iface:-eth0}"
-    prompt subnet "组网网段" "$(next_free_mesh_subnet)"
-    prompt ix_ip "B 虚拟 IP" "$(mesh_host_ip "$subnet" 2)"
-    prompt ingress_ip "A 虚拟 IP" "$(mesh_host_ip "$subnet" 1)"
+    prompt wan_iface "出网网卡（Mimic 绑定 + 出口 NAT 出网用）" "${wan_iface:-eth0}"
+    prompt subnet "内部组网网段（A↔B 私有网段，已自动避让已用段）" "$(next_free_mesh_subnet)"
+    prompt ix_ip "B 隧道内 IP" "$(mesh_host_ip "$subnet" 2)"
+    prompt ingress_ip "A 隧道内 IP" "$(mesh_host_ip "$subnet" 1)"
     validate_ipv4 "$ix_ip" || die "B 虚拟 IP 非法"
     validate_ipv4 "$ingress_ip" || die "A 虚拟 IP 非法"
 
@@ -1791,7 +1794,9 @@ import_exit_code() {
     command_exists nft || die "需要 nftables"
     command_exists wg || die "需要 wireguard-tools"
     local code relay_id wan_iface a_priv a_pub xdp
-    printf '请粘贴 WMGF1: 出口接入码：' >&2
+    printf '\n── 导入出口接入码（模式二 · 国内网关 A 接入）──\n' >&2
+    printf '把国外出口 B「创建国外出口」时生成的 WMGF1 出口接入码粘贴到此处，A 将自动建立到 B 的混淆隧道。\n\n' >&2
+    printf '请粘贴出口接入码（WMGF1: 开头）：' >&2
     read -r code </dev/tty; code="$(trim "$code")"
     parse_code "$code"
     [[ "${CODE_KIND:-}" == "exit" ]] || die "这不是出口接入码（需 nat-exit-code）；普通中转码请用 wm import-code"
@@ -1808,7 +1813,7 @@ import_exit_code() {
     a_pub="$(wg_pubkey_of "$a_priv")"
     [[ "$CODE_OBFS_MODE" == *swgp* ]] && install_swgp
     wan_iface="$(detect_default_iface)"
-    prompt wan_iface "Mimic/绑定网卡" "${wan_iface:-eth0}"
+    prompt wan_iface "出网网卡（Mimic 绑定）" "${wan_iface:-eth0}"
     xdp="native"; nic_prefers_skb "$wan_iface" && xdp="skb"
 
     printf '\n── 出口接入码摘要 ──\n  B 端点: %s:%s\n  混淆: %s  swgp端口: %s\n  组网: A %s ⇄ B %s\n\n' \
@@ -1820,8 +1825,8 @@ import_exit_code() {
     egress_ip="$(detect_public_ipv4)"; local_ip="$(detect_local_ipv4)"
     [[ -n "$egress_ip" ]] && info "出网 IPv4：${egress_ip}"
     [[ -n "$local_ip" ]] && info "本机网卡 IPv4：${local_ip}（NAT 机此为内网IP）"
-    prompt a_public "A 公网IP（客户端连接本网关的地址）" "${prev_ahost:-${egress_ip:-$local_ip}}"
-    prompt_port client_port "客户端 WG 入口端口" "${prev_cport:-51820}"
+    prompt a_public "A 的公网地址（手机/设备连接本网关用的 IP/域名）" "${prev_ahost:-${egress_ip:-$local_ip}}"
+    prompt_port client_port "客户端 WireGuard 接入端口（设备连 A 用）" "${prev_cport:-51820}"
 
     write_profile_kv "$(profile_env_path "$relay_id")" \
         "PROFILE_ID=${relay_id}" "PROFILE_NAME=${relay_id}" "ROLE=relay" "ENABLED=true" \
@@ -1962,7 +1967,9 @@ create_transit_interactive() {
     local profile_id endpoint_host wg_port wg_mtu wan_iface
     local subnet ix_ip ingress_ip transit_port landing_host landing_port proto ip_version
     local transit_pool="" tp_default="40000"
-    prompt profile_id "IX 中转线路 ID" "ix"
+    printf '\n── 创建中转线路（模式一 · IX 中转组网）──\n'
+    printf '在 IX/落地侧创建 WireGuard 组网并生成「接入码」；随后到公网入口执行「导入接入码」即可打通。\n\n'
+    prompt profile_id "中转线路名称（IX 侧节点，便于区分多条线路）" "ix"
     profile_id="$(sanitize_id "$profile_id")"
     [[ ! -f "$(profile_env_path "$profile_id")" ]] || die "线路已存在：$profile_id"
 
@@ -1970,7 +1977,7 @@ create_transit_interactive() {
     prompt endpoint_host "公网入口可达的 IX 公网地址（域名或IP）" ""
     [[ -n "$endpoint_host" ]] || die "IX 可达地址不能为空"
     prompt_port wg_port "WireGuard 监听端口（Mimic 伪 TCP 绑定）" "51820"
-    prompt wg_mtu "WG 隧道 MTU" "1420"
+    prompt wg_mtu "WG 隧道 MTU（mimic 伪 TCP 建议 1420；IPv6/dual 建议 1408）" "1420"
     validate_mtu "$wg_mtu"
     wan_iface="$(detect_default_iface)"
     prompt wan_iface "Mimic 绑定网卡" "${wan_iface:-eth0}"
@@ -2086,7 +2093,9 @@ import_code_interactive() {
 
     local code ingress_id wan_iface public_ip ing_priv ing_pub
     local updating=0 prev_host="" prev_iface=""
-    printf '请粘贴 WMGF1: IX 接入码：' >&2
+    printf '\n── 导入接入码（模式一 · 公网入口接入）──\n' >&2
+    printf '把 IX 侧「创建中转线路」时生成的 WMGF1 接入码粘贴到此处，公网入口将自动建立到 IX 的 mimic 隧道并按规则开放入口端口。\n\n' >&2
+    printf '请粘贴接入码（WMGF1: 开头）：' >&2
     read -r code </dev/tty
     code="$(trim "$code")"
     parse_code "$code"
@@ -3527,31 +3536,29 @@ show_menu() {
     require_tty() { [[ -t 0 ]] || die "需要交互终端"; }
     require_tty
     while true; do
+        printf '\n'
+        printf '════════════════════════════════════════════════\n'
+        printf '   wg-mimic-fabric · 管理控制台    v%s\n' "$SCRIPT_VERSION"
         cat <<'MENU'
+   WireGuard 组网 · Mimic 伪 TCP 伪装 · swgp 流量混淆
+════════════════════════════════════════════════
 
-╔══════════════════════════════════════╗
-║     wg-mimic-fabric 管理菜单         ║
-╠══════════════════════════════════════╣
-║  1) IX 创建组网线路（生成接入码）    ║
-║  2) 公网入口导入接入码               ║
-║  3) 启动线路                         ║
-║  4) 停止线路                         ║
-║  5) 健康检查                         ║
-║  6) 列出线路                         ║
-║  7) 显示接入码（IX）                 ║
-║  8) 刷新接入码（IX）                 ║
-║  9) 端口地图                         ║
-║ 10) 规则管理（列出/增/删）           ║
-╟─── 混淆组网 / 全局出口 ──────────────╢
-║ 11) 创建国外出口 B（create-exit）    ║
-║ 12) 导入出口接入码 A                 ║
-║ 13) 客户端管理（增/列/删）           ║
-╟──────────────────────────────────────╢
-║ 14) 删除线路（delete-line）          ║
-║ 15) 升级脚本                         ║
-║ 16) 卸载 / 完全清理                  ║
-║  0) 退出                             ║
-╚══════════════════════════════════════╝
+ ▸ 模式一：IX 中转组网（端口转发 / 中转加速）
+     1) 创建中转线路（IX 侧，生成接入码）
+     2) 导入接入码（公网入口接入）
+
+ ▸ 模式二：全局出口（混淆翻墙，国内 A → 国外 B）
+    11) 创建国外出口 B（生成出口接入码）
+    12) 导入出口接入码（国内网关 A 接入）
+    13) 客户端管理（新增 / 列出 / 删除，自动出二维码）
+
+ ▸ 线路运维（两种模式通用）
+     3) 启动线路     4) 停止线路     5) 健康检查     6) 列出线路
+     7) 显示接入码     8) 刷新接入码     9) 端口地图     10) 转发规则管理
+
+ ▸ 系统维护
+    14) 删除线路     15) 升级脚本     16) 卸载 / 完全清理     0) 退出
+────────────────────────────────────────────────
 MENU
         local choice id rid
         read -r -p "选择: " choice </dev/tty
