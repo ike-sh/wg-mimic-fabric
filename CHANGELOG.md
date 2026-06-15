@@ -1,5 +1,15 @@
 # Changelog
 
+## [1.1.0-beta.14] - 2026-06-16
+
+### Fixed（swgp-go 被装成损坏文件导致 `Exec format error`，A↔B 骨干 100% 丢包的真正根因）
+
+- **`download_swgp_release` 支持 `.tar.zst` 解压**：swgp-go 上游（database64128）自 v1.10.0 起**只发布 `.tar.zst` 资产**（无 `.tar.gz`/`.zip`）。旧代码的 `case "$url"` 只认 `.zip`/`.tar.gz`/`.tgz`，`.tar.zst` 落入 `*)` 兜底分支——**把压缩包原样 `cp` 成 `/usr/local/bin/swgp-go` 并 `chmod +x`**，于是「二进制」其实是个 zstd 压缩档，systemd 启动即 `Failed to execute ... Exec format error`（status=203/EXEC）疯狂重启，swgp 端口从不监听 → A 发包 B 不回 → `wm test` / `ping 10.90.0.2` 100% 丢包。现新增 `.tar.zst`/`.tar`/`.zst` 分支（GNU `tar --zstd`，回退 `zstd -d | tar`），并按需 `apt install zstd`。
+- **资产选型优先「静态构建 + x86-64-v2」**：上游同时提供 glibc/静态、v2/v3 多档；旧打分逻辑遇全 `.tar.zst` 时一律打平、取首个（glibc-v2），可能引入 glibc 版本依赖或 AVX2(v3) 指令兼容问题。现优先选**静态构建**（更可移植）与 **x86-64-v2**（兼容性最广），降低换机即崩风险。
+- **下载产物强制 ELF 魔数校验**：`install` 前用 `is_elf_bin` 确认产物确为 ELF（`7f 45 4c 46`），任何「未解压归档/坏档」一律拒装，从源头杜绝再装出 `Exec format error`。
+- **`install_swgp` 守卫自愈损坏二进制**：旧守卫 `[[ -x "$SWGP_BIN" ]]` 见到带 +x 的坏档即判「已安装」直接返回，导致反复 `bootstrap`/`upgrade` 永远绕过重装、坏档一直在（用户多次重装仍报「swgp-go 已安装」却始终不通的元凶）。现改为 `swgp_installed_ok`——仅当是真 ELF 才算已装，否则删除坏档并重新下载，**升级即自愈**。
+- 验证：`bash -n` 语法通过；`smoke nopy` 回归全 10 项通过；并以真实 v1.10.0 资产核对解包路径（`./swgp-go`）与选型（`linux-x86-64-v2.tar.zst`）。
+
 ## [1.1.0-beta.13] - 2026-06-15
 
 ### Fixed（`wm test` 对 relay 线路假通过：ping 的是自己而非对端 B）

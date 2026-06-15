@@ -2,7 +2,7 @@
 # wg-mimic-fabric — WireGuard + Mimic tunnel orchestrator (MVP)
 set -Eeuo pipefail
 
-SCRIPT_VERSION="1.1.0-beta.13"
+SCRIPT_VERSION="1.1.0-beta.14"
 MIMIC_UPSTREAM_TAG="${MIMIC_UPSTREAM_TAG:-v0.7.0}"
 APP_NAME="wg-mimic-fabric"
 WMF_PROJECT_REPO="${WMF_REPO:-ike-sh/wg-mimic-fabric}"
@@ -3102,6 +3102,30 @@ update_mimic() {
 # swgp-go 的 PSK 与 WireGuard PSK 同格式（base64 32B）。
 swgp_genpsk() { wg genpsk; }
 
+# 判断文件是否为 ELF 可执行（魔数 7f 45 4c 46）——用于识别「误把压缩包当二进制」的损坏安装。
+# 用 od 读前 4 字节（busybox 与 coreutils 通用），不依赖 head -c（busybox 可能不支持）。
+is_elf_bin() {
+    [[ -s "$1" ]] || return 1
+    local magic
+    magic="$(LC_ALL=C od -An -tx1 -N4 "$1" 2>/dev/null)"
+    magic="${magic//[[:space:]]/}"
+    [[ "$magic" == "7f454c46" ]]
+}
+
+# 确保 zstd 可用（解压 .tar.zst 需要；GNU tar --zstd 也依赖 zstd 程序）。
+ensure_zstd() {
+    command_exists zstd && return 0
+    command_exists apt-get && DEBIAN_FRONTEND=noninteractive apt-get install -y zstd >/dev/null 2>&1
+    command_exists zstd
+}
+
+# 解压 .tar.zst：优先 GNU tar 的 --zstd，回退 `zstd -d | tar`。
+extract_tar_zst() {
+    local pkg="$1" out="$2"
+    tar --zstd -xf "$pkg" -C "$out" 2>/dev/null && return 0
+    zstd -dqc "$pkg" 2>/dev/null | tar -xf - -C "$out" 2>/dev/null
+}
+
 # 从 GitHub release 动态匹配 linux+arch 资产并安装 swgp-go 二进制（在线运行时调用）。
 download_swgp_release() {
     local dest="$1" tmpd url
@@ -3122,35 +3146,64 @@ elif m in ("aarch64", "arm64"):
     arch = ["arm64", "aarch64"]
 else:
     arch = [m]
-best = None; best_score = -1
+def asset_score(n):
+    # 仅接受可解压的归档；校验和/签名/包等排除
+    if n.endswith((".sha256", ".asc", ".sig", ".sbom", ".pem", ".json", ".txt", ".deb", ".rpm")):
+        return -1
+    if not n.endswith((".tar.zst", ".tzst", ".tar.gz", ".tgz", ".tar", ".zip")):
+        return -1
+    s = 100
+    if "glibc" not in n:                       # 静态构建更可移植，优先
+        s += 20
+    if "x86-64-v2" in n or "x86_64-v2" in n:   # 微架构 v2 兼容性最广，优先于 v3（避免无 AVX2 机器跑 v3）
+        s += 10
+    elif "x86-64-v3" in n or "x86_64-v3" in n:
+        s += 5
+    return s
+best = None; best_score = 0
 for a in d.get("assets", []):
     n = a["name"].lower()
     if "linux" not in n or not any(t in n for t in arch):
         continue
-    if n.endswith((".sha256", ".asc", ".sig", ".sbom", ".json", ".txt")):
-        continue
-    score = 2 if n.endswith((".tar.gz", ".tgz", ".zip")) else 1
-    if score > best_score:
-        best, best_score = a["browser_download_url"], score
+    sc = asset_score(n)
+    if sc > best_score:
+        best, best_score = a["browser_download_url"], sc
 print(best or "")
 PY
 )"
     [[ -n "$url" ]] || { rm -rf "$tmpd"; return 1; }
     gh_curl "$url" "$tmpd/pkg" || { rm -rf "$tmpd"; return 1; }
     case "$url" in
-        *.zip)            command_exists unzip && unzip -o "$tmpd/pkg" -d "$tmpd" >/dev/null 2>&1 ;;
-        *.tar.gz|*.tgz)   tar -xzf "$tmpd/pkg" -C "$tmpd" 2>/dev/null ;;
-        *)                cp "$tmpd/pkg" "$tmpd/swgp-go" ;;
+        *.zip)              command_exists unzip && unzip -o "$tmpd/pkg" -d "$tmpd" >/dev/null 2>&1 ;;
+        *.tar.gz|*.tgz)     tar -xzf "$tmpd/pkg" -C "$tmpd" 2>/dev/null ;;
+        *.tar.zst|*.tzst)   ensure_zstd && extract_tar_zst "$tmpd/pkg" "$tmpd" ;;
+        *.tar)              tar -xf "$tmpd/pkg" -C "$tmpd" 2>/dev/null ;;
+        *.zst)              ensure_zstd && zstd -dqf "$tmpd/pkg" -o "$tmpd/swgp-go" 2>/dev/null ;;
+        *)                  cp "$tmpd/pkg" "$tmpd/swgp-go" ;;
     esac
     local bin; bin="$(find "$tmpd" -type f -name 'swgp-go' 2>/dev/null | head -1)"
-    [[ -n "$bin" ]] || { rm -rf "$tmpd"; return 1; }
+    [[ -n "$bin" ]] || { warn "swgp-go release 解压后未找到二进制（资产：$url）"; rm -rf "$tmpd"; return 1; }
+    # 关键：确认产物是真正的 ELF，杜绝把未解压的归档当二进制安装（Exec format error 的根因）。
+    is_elf_bin "$bin" || { warn "swgp-go 下载产物非有效 ELF（疑似未解压归档），放弃安装"; rm -rf "$tmpd"; return 1; }
     install -m 755 "$bin" "$dest"
     rm -rf "$tmpd"
 }
 
+# 仅当 swgp-go 是真正可执行的 ELF 才算「已装」——避免把误装的 .tar.zst 归档（带 +x）
+# 当成已安装而拒绝重装（beta.13 及之前 Exec format error 反复出现的根因之一）。
+swgp_installed_ok() {
+    if [[ -e "$SWGP_BIN" ]]; then
+        is_elf_bin "$SWGP_BIN" && return 0
+        warn "检测到损坏的 swgp-go（非 ELF 可执行文件），删除后将重新下载"
+        rm -f "$SWGP_BIN"
+        return 1
+    fi
+    command_exists swgp-go
+}
+
 install_swgp() {
     require_root
-    if [[ -x "$SWGP_BIN" ]] || command_exists swgp-go; then
+    if swgp_installed_ok; then
         ok "swgp-go 已安装"; return 0
     fi
     info "安装 swgp-go（WireGuard 混淆）..."
