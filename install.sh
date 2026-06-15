@@ -2,7 +2,7 @@
 # wg-mimic-fabric — WireGuard + Mimic tunnel orchestrator (MVP)
 set -Eeuo pipefail
 
-SCRIPT_VERSION="0.6.11"
+SCRIPT_VERSION="0.6.12"
 MIMIC_UPSTREAM_TAG="${MIMIC_UPSTREAM_TAG:-v0.7.0}"
 APP_NAME="wg-mimic-fabric"
 WMF_PROJECT_REPO="${WMF_REPO:-ike-sh/wg-mimic-fabric}"
@@ -2338,13 +2338,14 @@ MENU
             8) read -r -p "IX 线路 ID: " id </dev/tty; refresh_code "$(sanitize_id "$(trim "$id")")" ;;
             9) read -r -p "线路 ID（回车=唯一）: " id </dev/tty; show_port_map "$(trim "$id")" ;;
             10)
-                read -r -p "线路 ID（回车=唯一）: " id </dev/tty; id="$(trim "$id")"
+                read -r -p "线路 ID（回车=唯一）: " id </dev/tty; id="$(resolve_profile_id "$(trim "$id")")"
                 list_rules "$id"
-                read -r -p "操作 add/del/pool/skip: " rid </dev/tty
+                read -r -p "操作 add/edit/del/pool/skip: " rid </dev/tty
                 case "$(trim "$rid")" in
                     add) add_rule "$id" ;;
-                    del) read -r -p "规则 ID: " rid </dev/tty; delete_rule "$id" "$(trim "$rid")" ;;
-                    pool) read -r -p "端口池(如 40000-40010；留空=清除): " rid </dev/tty; set_transit_pool "$id" "$(trim "$rid")" ;;
+                    edit) read -r -p "要编辑的规则 ID: " rid </dev/tty; edit_rule "$id" "$(trim "$rid")" ;;
+                    del) read -r -p "要删除的规则 ID: " rid </dev/tty; delete_rule "$id" "$(trim "$rid")" ;;
+                    pool) read -r -p "端口池(如 18300-18399；留空=清除): " rid </dev/tty; set_transit_pool "$id" "$(trim "$rid")" ;;
                 esac
                 ;;
             11) upgrade_script ;;
