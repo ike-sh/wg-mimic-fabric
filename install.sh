@@ -2,7 +2,7 @@
 # wg-mimic-fabric — WireGuard + Mimic tunnel orchestrator (MVP)
 set -Eeuo pipefail
 
-SCRIPT_VERSION="1.1.0-beta.8"
+SCRIPT_VERSION="1.1.0-beta.9"
 MIMIC_UPSTREAM_TAG="${MIMIC_UPSTREAM_TAG:-v0.7.0}"
 APP_NAME="wg-mimic-fabric"
 WMF_PROJECT_REPO="${WMF_REPO:-ike-sh/wg-mimic-fabric}"
@@ -1134,8 +1134,8 @@ EOF
             extra="${extra}Table = off"$'\n'
             if [[ -n "${CLIENT_SUBNET:-}" ]]; then
                 local _t; _t=$(( 8000 + $(printf '%s' "$PROFILE_ID" | cksum | cut -d' ' -f1) % 1000 ))
-                extra="${extra}PostUp = ip route replace default dev %i table ${_t}; ip rule del from ${CLIENT_SUBNET} lookup ${_t} 2>/dev/null; ip rule add from ${CLIENT_SUBNET} lookup ${_t}"$'\n'
-                extra="${extra}PostDown = ip rule del from ${CLIENT_SUBNET} lookup ${_t} 2>/dev/null; ip route flush table ${_t} 2>/dev/null; true"$'\n'
+                extra="${extra}PostUp = ip route replace default dev %i table ${_t}; ip rule del from ${CLIENT_SUBNET} lookup ${_t} 2>/dev/null || true; ip rule add from ${CLIENT_SUBNET} lookup ${_t}"$'\n'
+                extra="${extra}PostDown = ip rule del from ${CLIENT_SUBNET} lookup ${_t} 2>/dev/null || true; ip route flush table ${_t} 2>/dev/null || true; true"$'\n'
             fi
         else
             peerb_allowed="${ix_allowed}"

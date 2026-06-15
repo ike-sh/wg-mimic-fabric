@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.1.0-beta.9] - 2026-06-15
+
+### Fixed（relay 全局出口隧道 wg-quick 启动失败 status=2,却无报错）
+
+- **relay 的 PostUp/PostDown 清理命令补 `|| true`**：全局出口 relay 的 WG conf 在加策略路由前用 `ip rule del ... 2>/dev/null` 清残留,但 **wg-quick 本身以 `set -e` 运行 PostUp**——首次启动规则不存在时 `ip rule del` 返回 2（`2>/dev/null` 只挡了报错信息、挡不住退出码），触发 set -e 中止 → `wg-quick up` 失败回滚(`Main process exited status=2/INVALIDARGUMENT`,且**不打印任何 Error 行**,极难排查)。给 PostUp/PostDown 的 `ip rule del` / `ip route flush` 都加 `|| true` 使其幂等,首次启动不再被 set -e 打断。属 Phase 2 全局出口(beta.2/4)从未真机验证暴露的问题。
+
 ## [1.1.0-beta.8] - 2026-06-15
 
 ### Fixed（多条线路撞同一网段/虚拟IP；虚拟IP 不在所选网段内）
