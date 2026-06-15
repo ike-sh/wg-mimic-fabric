@@ -2,7 +2,7 @@
 # wg-mimic-fabric — WireGuard + Mimic tunnel orchestrator (MVP)
 set -Eeuo pipefail
 
-SCRIPT_VERSION="0.6.10"
+SCRIPT_VERSION="0.6.11"
 MIMIC_UPSTREAM_TAG="${MIMIC_UPSTREAM_TAG:-v0.7.0}"
 APP_NAME="wg-mimic-fabric"
 WMF_PROJECT_REPO="${WMF_REPO:-ike-sh/wg-mimic-fabric}"
@@ -311,8 +311,8 @@ pool_used_ports() {
 
 # First pool port not yet used by a rule; non-zero exit when pool exhausted.
 pool_alloc_port() {
-    local pid="$1" spec="$2" used p
-    used="$(pool_used_ports "$pid" | sort -u)"
+    local pid="$1" spec="$2" reserve="${3:-}" used p
+    used="$( { pool_used_ports "$pid"; [[ -n "$reserve" ]] && printf '%s\n' "$reserve"; } | sort -u )"
     while IFS= read -r p; do
         [[ -n "$p" ]] || continue
         grep -qxF "$p" <<<"$used" && continue
@@ -1269,13 +1269,8 @@ create_transit_interactive() {
     profile_id="$(sanitize_id "$profile_id")"
     [[ ! -f "$(profile_env_path "$profile_id")" ]] || die "线路已存在：$profile_id"
 
-    local egress_ip local_ip
-    egress_ip="$(detect_public_ipv4)"
-    local_ip="$(detect_local_ipv4)"
-    [[ -n "$egress_ip" ]] && info "出网 IPv4（curl 探测）：${egress_ip}"
-    [[ -n "$local_ip" ]]  && info "本机网卡 IPv4：${local_ip}（NAT 机器此为内网IP）"
-    info "请填「公网入口能连到本机的公网地址」；NAT/多IP 机器若是另配的浮动公网IP，请手动填写"
-    prompt endpoint_host "公网入口可达的 IX 公网地址（域名或IP）" "${egress_ip:-$local_ip}"
+    info "填「公网入口能连到本机的公网地址」= 商家给的公网IP/域名（NAT 机通常不是本机网卡IP，需手填；不自动填默认值以免误填出网IP）"
+    prompt endpoint_host "公网入口可达的 IX 公网地址（域名或IP）" ""
     [[ -n "$endpoint_host" ]] || die "IX 可达地址不能为空"
     prompt_port wg_port "WireGuard 监听端口（Mimic 伪 TCP 绑定）" "51820"
     prompt wg_mtu "WG 隧道 MTU" "1420"
@@ -1298,16 +1293,23 @@ create_transit_interactive() {
         prompt ingress_ip6 "公网入口虚拟 IPv6" "fd88:6d6d::1"
     fi
 
-    prompt transit_pool "中转端口池（如 40000-40010,40050；留空=每条规则手动指定）" ""
+    prompt transit_pool "中转端口池（如 18300-18399；商家给的可用端口段；留空=手动指定）" ""
     if [[ -n "$transit_pool" ]]; then
         validate_port_pool "$transit_pool" || die "端口池格式非法：$transit_pool"
-        tp_default="$(pool_alloc_port "$profile_id" "$transit_pool")" || die "端口池为空"
+        # 防呆：WG 监听端口=公网入口要连的传输端口，必须落在商家放行的池范围内
+        if ! pool_contains "$transit_pool" "$wg_port"; then
+            warn "WG 监听端口 ${wg_port} 不在端口池 ${transit_pool} 内；商家若只放行池内端口，公网入口将连不上 IX"
+            prompt_port wg_port "改用池内的 WG 监听端口" "$(pool_alloc_port "$profile_id" "$transit_pool")"
+            pool_contains "$transit_pool" "$wg_port" || die "WG 端口仍不在端口池内：${wg_port}"
+        fi
+        tp_default="$(pool_alloc_port "$profile_id" "$transit_pool" "$wg_port")" || die "端口池已无空闲端口"
     fi
 
     info "首条转发规则（落地可填 IPv6）："
     prompt_port transit_port "中转端口（IX 虚拟IP 上的端口）" "$tp_default"
     if [[ -n "$transit_pool" ]]; then
         pool_contains "$transit_pool" "$transit_port" || die "端口 ${transit_port} 不在端口池 ${transit_pool} 内"
+        [[ "$transit_port" != "$wg_port" ]] || die "中转端口不能与 WG 监听端口 ${wg_port} 相同"
     fi
     prompt landing_host "落地 IP/域名"
     [[ -n "$landing_host" ]] || die "落地地址不能为空"
@@ -1529,7 +1531,7 @@ add_rule() {
     rid="$(generate_unique_rule_id "$PROFILE_ID" "rule")"
     prompt note "规则备注" "$rid"
     if [[ -n "${TRANSIT_PORT_POOL:-}" ]]; then
-        tp_default="$(pool_alloc_port "$PROFILE_ID" "$TRANSIT_PORT_POOL")" \
+        tp_default="$(pool_alloc_port "$PROFILE_ID" "$TRANSIT_PORT_POOL" "${WG_PORT:-}")" \
             || die "端口池 ${TRANSIT_PORT_POOL} 已用尽，请 wm set-pool 扩充或清空后手动指定"
     fi
     prompt_port transit_port "中转端口（IX 虚拟IP）" "$tp_default"

@@ -126,6 +126,8 @@ test_pool() {
     # 40000 & 40001 used by seed → next free in pool = 40002
     local got; got="$(pool_alloc_port ix-nat "40000-40002,40005")"
     [[ "$got" == "40002" ]] || fail "pool_alloc next free: $got"
+    # reserve 40002 (e.g. WG port) → next free skips it = 40005
+    [[ "$(pool_alloc_port ix-nat "40000-40002,40005" 40002)" == "40005" ]] || fail "pool_alloc reserve"
     pool_contains "40000-40002,40005" 40005 || fail "pool_contains 40005"
     ! pool_contains "40000-40002,40005" 40009 || fail "pool_contains 40009 should be false"
     pool_contains "18301-18399" 18301 || fail "pool_contains first port of pure range"
