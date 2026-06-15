@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.1.0-beta.7] - 2026-06-15
+
+### Fixed（restart/set-mtu/upgrade 后遗留旧 mimic 进程 → 隧道不通）
+
+- **`ensure_mimic_service_up` 改为总是按最新 unit/conf/env 干净重启 mimic**：此前“见 mimic 已 active 就提前 return”，导致 `wm set-mtu` / `restart` / `upgrade-script` 后 mimic 仍跑着旧进程（旧 XDP 模式、或解析旧 conf 丢了 filter），在 virtio 网卡上尤其致命——重启后隧道直接不通、必须手动 `systemctl restart wg-mimic-mimic@<iface>` 才能救。现在每次都 `detach_xdp` +（virtio 直接 skb）+ `restart` mimic，确保按当前 `-x` 模式与 filter 重新挂载。代价：同一网卡多线路时会顺带重启共享 mimic（秒级抖动），换取重启后状态必定一致。
+- **`start_profile` 用 `systemctl restart` 显式拉起隧道**：隧道单元 `Requires=wg-mimic-mimic@<iface>`，重启 mimic 可能被 systemd 级联停掉隧道；改用 `restart`（而非 `enable --now`）保证隧道最终一定起来并套用最新 WG conf（修“重启 mimic 后 WG 接口消失、隧道不通”）。
+
 ## [1.1.0-beta.6] - 2026-06-15
 
 ### Fixed（严重：virtio 网卡上 mimic 丢 filter 导致隧道在 XDP 层不通）

@@ -2,7 +2,7 @@
 # wg-mimic-fabric — WireGuard + Mimic tunnel orchestrator (MVP)
 set -Eeuo pipefail
 
-SCRIPT_VERSION="1.1.0-beta.6"
+SCRIPT_VERSION="1.1.0-beta.7"
 MIMIC_UPSTREAM_TAG="${MIMIC_UPSTREAM_TAG:-v0.7.0}"
 APP_NAME="wg-mimic-fabric"
 WMF_PROJECT_REPO="${WMF_REPO:-ike-sh/wg-mimic-fabric}"
@@ -1523,14 +1523,15 @@ force_iface_skb() {
 # rejected on virtio_net + GRO), force skb mode for that nic's profiles and retry.
 ensure_mimic_service_up() {
     local iface="$1"
-    # Already up (shared by another profile on this nic) → leave it running.
-    systemctl is-active --quiet "wg-mimic-mimic@${iface}.service" 2>/dev/null && return 0
-    # Clear any stale XDP program before attaching, so a previously failed native
-    # attach can't block this (re)attach.
+    # 总是按最新 unit/conf/env(含命令行 -x XDP 模式)干净重启 mimic。
+    # 旧逻辑“见 active 就 return 0”会在 set-mtu/restart/upgrade 后遗留旧 mimic 进程
+    # (旧 XDP 模式 / 解析失败丢 filter)→ virtio 网卡上重启后隧道直接不通,必须手动救。
+    # 代价:同一网卡多线路时这会顺带重启共享 mimic(秒级抖动),换取重启后状态必定一致。
+    # 先清残留 XDP,virtio 直接 skb,再 restart(不在则等同 start)。
     detach_xdp "$iface"
-    # On virtio NICs native is unreliable → start straight in skb (no native churn).
     nic_prefers_skb "$iface" && force_iface_skb "$iface"
-    systemctl enable --now "wg-mimic-mimic@${iface}.service" 2>/dev/null || true
+    systemctl enable "wg-mimic-mimic@${iface}.service" 2>/dev/null || true
+    systemctl restart "wg-mimic-mimic@${iface}.service" 2>/dev/null || true
     wait_mimic_active "$iface" 8 && return 0
     warn "mimic@${iface} 未起来，改用 XDP skb 模式重试..."
     # Fully stop the failed unit and clear the leftover program before retrying —
@@ -1565,7 +1566,10 @@ start_profile() {
     # swgp 必须先于 WG 隧道起来（relay 的 WG 拨本机 swgp client）
     if obfs_has_swgp; then systemctl enable --now "wg-mimic-swgp@${PROFILE_ID}.service" 2>/dev/null || true; fi
     if obfs_has_mimic; then ensure_mimic_service_up "$WAN_IFACE"; fi
-    systemctl enable --now "wg-mimic-tunnel@${PROFILE_ID}.service"
+    # 用 restart 显式拉起隧道:隧道单元 Requires=mimic,上面重启 mimic 可能级联停掉
+    # 隧道,这里 restart 保证最终一定起来(且套用最新 WG conf),enable 仅保证开机自启。
+    systemctl enable "wg-mimic-tunnel@${PROFILE_ID}.service" 2>/dev/null || true
+    systemctl restart "wg-mimic-tunnel@${PROFILE_ID}.service"
     ok "已启动线路：${PROFILE_ID} (${ROLE:-})"
     if [[ "${ROLE:-}" == "nat-ingress" ]]; then
         ok "客户端连接：${INGRESS_PUBLIC_HOST:-本机公网IP}:<client_port>（wm show-port-map ${PROFILE_ID}）"
