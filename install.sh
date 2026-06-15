@@ -2,7 +2,7 @@
 # wg-mimic-fabric — WireGuard + Mimic tunnel orchestrator (MVP)
 set -Eeuo pipefail
 
-SCRIPT_VERSION="1.1.0-beta.10"
+SCRIPT_VERSION="1.1.0-beta.11"
 MIMIC_UPSTREAM_TAG="${MIMIC_UPSTREAM_TAG:-v0.7.0}"
 APP_NAME="wg-mimic-fabric"
 WMF_PROJECT_REPO="${WMF_REPO:-ike-sh/wg-mimic-fabric}"
@@ -3421,8 +3421,9 @@ show_menu() {
 ║ 12) 导入出口接入码 A                 ║
 ║ 13) 客户端管理（增/列/删）           ║
 ╟──────────────────────────────────────╢
-║ 14) 升级脚本                         ║
-║ 15) 卸载 / 完全清理                  ║
+║ 14) 删除线路（delete-line）          ║
+║ 15) 升级脚本                         ║
+║ 16) 卸载 / 完全清理                  ║
 ║  0) 退出                             ║
 ╚══════════════════════════════════════╝
 MENU
@@ -3488,8 +3489,9 @@ MENU
                     esac
                 fi
                 ;;
-            14) upgrade_script; ok "重新加载菜单以应用新版本..."; exec "$WM_BIN" ;;
-            15) uninstall_from_menu ;;
+            14) if id="$(menu_pick_profile)"; then delete_profile "$id"; fi ;;
+            15) upgrade_script; ok "重新加载菜单以应用新版本..."; exec "$WM_BIN" ;;
+            16) uninstall_from_menu ;;
             0|q|Q) exit 0 ;;
             *) warn "无效选择" ;;
         esac
