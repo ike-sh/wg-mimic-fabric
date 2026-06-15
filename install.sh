@@ -2,7 +2,7 @@
 # wg-mimic-fabric — WireGuard + Mimic tunnel orchestrator (MVP)
 set -Eeuo pipefail
 
-SCRIPT_VERSION="1.1.0-beta.7"
+SCRIPT_VERSION="1.1.0-beta.8"
 MIMIC_UPSTREAM_TAG="${MIMIC_UPSTREAM_TAG:-v0.7.0}"
 APP_NAME="wg-mimic-fabric"
 WMF_PROJECT_REPO="${WMF_REPO:-ike-sh/wg-mimic-fabric}"
@@ -288,6 +288,24 @@ wg_pubkey_of() { printf '%s' "$1" | wg pubkey; }
 default_mesh_subnet() { printf '10.88.0.0/24'; }
 default_ix_ip()       { printf '10.88.0.2'; }
 default_ingress_ip()  { printf '10.88.0.1'; }
+
+# 从 /24 网段取主机 IP：10.90.0.0/24 + 2 → 10.90.0.2
+mesh_host_ip() { local s="${1%%/*}"; printf '%s.%s' "${s%.*}" "$2"; }
+
+# 扫描已有线路占用的 mesh 网段(10.N.0.0/24 的 N),返回第一个空闲的,避免多条线路
+# 撞同一网段/虚拟IP;预留 10.89(relay 客户端默认子网)。无线路时仍回 10.88(单线路旧默认)。
+next_free_mesh_subnet() {
+    local p sub used=" 89 " n
+    for p in "$PROFILES_DIR"/*.env; do
+        [[ -f "$p" ]] || continue
+        sub="$(grep -m1 '^WG_MESH_SUBNET=' "$p" 2>/dev/null | cut -d= -f2- | tr -d '"' || true)"
+        [[ "$sub" =~ ^10\.([0-9]+)\. ]] && used="${used}${BASH_REMATCH[1]} "
+    done
+    for n in 88 90 91 92 93 94 95 96 97 98 99; do
+        [[ "$used" == *" $n "* ]] || { printf '10.%s.0.0/24' "$n"; return 0; }
+    done
+    printf '10.88.0.0/24'
+}
 
 # ── rule env I/O (multi-rule) ──────────────────────────────────────────────
 
@@ -1646,9 +1664,9 @@ create_exit_interactive() {
     validate_mtu "$wg_mtu"
     wan_iface="$(detect_default_iface)"
     prompt wan_iface "Mimic/出网绑定网卡" "${wan_iface:-eth0}"
-    prompt subnet "组网网段" "$(default_mesh_subnet)"
-    prompt ix_ip "B 虚拟 IP" "$(default_ix_ip)"
-    prompt ingress_ip "A 虚拟 IP" "$(default_ingress_ip)"
+    prompt subnet "组网网段" "$(next_free_mesh_subnet)"
+    prompt ix_ip "B 虚拟 IP" "$(mesh_host_ip "$subnet" 2)"
+    prompt ingress_ip "A 虚拟 IP" "$(mesh_host_ip "$subnet" 1)"
     validate_ipv4 "$ix_ip" || die "B 虚拟 IP 非法"
     validate_ipv4 "$ingress_ip" || die "A 虚拟 IP 非法"
 
@@ -1858,9 +1876,9 @@ create_transit_interactive() {
     wan_iface="$(detect_default_iface)"
     prompt wan_iface "Mimic 绑定网卡" "${wan_iface:-eth0}"
 
-    prompt subnet "组网网段" "$(default_mesh_subnet)"
-    prompt ix_ip "IX 虚拟 IP" "$(default_ix_ip)"
-    prompt ingress_ip "公网入口虚拟 IP" "$(default_ingress_ip)"
+    prompt subnet "组网网段" "$(next_free_mesh_subnet)"
+    prompt ix_ip "IX 虚拟 IP" "$(mesh_host_ip "$subnet" 2)"
+    prompt ingress_ip "公网入口虚拟 IP" "$(mesh_host_ip "$subnet" 1)"
     validate_ipv4 "$ix_ip" || die "IX 虚拟 IP 非法"
     validate_ipv4 "$ingress_ip" || die "入口虚拟 IP 非法"
 
