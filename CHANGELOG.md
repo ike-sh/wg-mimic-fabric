@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.0.2] - 2026-06-15
+
+### Fixed
+
+- **TCP MSS 钳制（修"能连但大流量卡死/网页转圈"）**：nft `forward` 链新增 `tcp flags syn tcp option maxseg size set rt mtu`——把进/出隧道的 TCP SYN 的 MSS 钳到隧道路由 MTU（如 1420→MSS 1380）。此前**未做 MSS 钳制**，>隧道MTU 的大包只能靠 PMTUD，而中转/NAT 常过滤 ICMP "需要分片"导致 **PMTUD 黑洞**：小请求正常、大文件/大 TLS 静默丢包卡死。钳制后两端自动协商出能过隧道的段大小，不再依赖 PMTUD。两端 `wm start`/`apply-rules` 后即生效，随 `WG_MTU` 自动适配（IPv4/IPv6 通用）。
+
 ## [1.0.1] - 2026-06-15
 
 ### Added

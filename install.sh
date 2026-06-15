@@ -2,7 +2,7 @@
 # wg-mimic-fabric — WireGuard + Mimic tunnel orchestrator (MVP)
 set -Eeuo pipefail
 
-SCRIPT_VERSION="1.0.1"
+SCRIPT_VERSION="1.0.2"
 MIMIC_UPSTREAM_TAG="${MIMIC_UPSTREAM_TAG:-v0.7.0}"
 APP_NAME="wg-mimic-fabric"
 WMF_PROJECT_REPO="${WMF_REPO:-ike-sh/wg-mimic-fabric}"
@@ -1097,6 +1097,9 @@ render_nft_all() {
         printf '    }\n'
         printf '    chain forward {\n'
         printf '        type filter hook forward priority filter; policy accept;\n'
+        # MSS 钳制：把进/出隧道的 TCP SYN 的 MSS 钳到该路由的 MTU（隧道侧=WG_MTU-头部），
+        # 这样两端 TCP 协商出能过隧道的段大小，不再依赖易被掐断的 PMTUD（修大包黑洞/卡顿）。
+        printf '        tcp flags syn tcp option maxseg size set rt mtu counter comment "wm-mss-clamp"\n'
         printf '    }\n'
         printf '    chain input {\n'
         printf '        type filter hook input priority filter; policy accept;\n'

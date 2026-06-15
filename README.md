@@ -291,7 +291,7 @@ wm health-all
 | `mimic@<网卡> 仍未启动` | virtio 等网卡 native 起不来；脚本会自动回退 skb。若卡住：`ip link set dev <网卡> xdp off` 后 `wm restart <ID>` |
 | 客户端连不上 | `wm show-port-map`，确认 `client_port` 已放行、IX 到落地可达（IX 上 `wm test` / `nc`） |
 | mimic 模块缺失 | `wm install-mimic`；Secure Boot 需入册 MOK；内核与头文件不匹配需 `reboot` |
-| MTU 异常/大包不通 | `wm set-mtu <ID> 1380`（两端） |
+| MTU 异常/大包不通 | nft `forward` 链已自动 **MSS 钳制**到隧道 MTU（不依赖 PMTUD）；仍异常可 `wm set-mtu <ID> 1380`（两端） |
 
 诊断命令：`wm diagnose <ID>`（OS/内核/BTF/mimic/ip_forward 预检 + health）、`wm test <ID>`（隧道丢包）、`wg show`、`mimic show <网卡>`。
 
