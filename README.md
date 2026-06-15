@@ -4,7 +4,11 @@
 **仓库**：https://github.com/ike-sh/wg-mimic-fabric  
 **定位**：公网入口 + IX 组网 + 落地转发，运维体验对标 [ix-transit-fabric](https://github.com/ike-sh/ix-transit-fabric)。
 
-**纯 nft 端口转发**：落地无需 WG、无需 Mimic。IX 机生成接入码，公网入口粘贴接入码即可。
+**纯 nft 端口转发** + **公网入口 Mimic（UDP→伪 TCP）**。IX 机生成接入码，公网入口粘贴接入码。落地无需 WG / wm。
+
+```text
+客户端 ──Mimic(伪TCP)──► 公网入口 ──明文 UDP/TCP──► IX ──► 落地:端口
+```
 
 ---
 
@@ -19,8 +23,11 @@
 ## 安装
 
 ```bash
-# 纯转发节点推荐跳过 mimic
-WMF_SKIP_MIMIC=1 curl -fsSL https://raw.githubusercontent.com/ike-sh/wg-mimic-fabric/main/scripts/bootstrap.sh | sudo bash
+# IX 中转机可跳过 mimic
+WMF_SKIP_MIMIC=1 curl -fsSL .../bootstrap.sh | sudo bash
+
+# 公网入口需要 mimic（不要 SKIP）
+curl -fsSL https://raw.githubusercontent.com/ike-sh/wg-mimic-fabric/main/scripts/bootstrap.sh | sudo bash
 ```
 
 ---

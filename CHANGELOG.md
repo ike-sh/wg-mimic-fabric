@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.1] - 2026-06-15
+
+### Added
+
+- 公网入口 `import-transit-code` 自动安装并启用 **Mimic**（`filter=local=公网IP:端口`，UDP 伪装 TCP）
+- IX 中转仍为纯 nft 转发（无需 mimic）
+
 ## [0.5.0] - 2026-06-15
 
 ### Changed（Breaking）
