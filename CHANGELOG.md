@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.6.19] - 2026-06-15
+
+### Fixed
+
+- **native XDP attach 失败后残留程序把线路弄成"仍未启动"死循环**：在不支持 native XDP 的网卡（如 virtio_net `ens5`）上 `set-xdp-mode native` / 启动时，native attach 失败会**残留一个 XDP 程序挂在网卡上**，导致随后连 skb 模式都 attach 不上 → `mimic@<iface> 仍未启动`、`wm health` 全 inactive，必须手动 `ip link set dev <iface> xdp off` 才能救活。
+  - 新增 `detach_xdp`：清理网卡上残留的 XDP 程序（generic/native-drv/offload 三种模式都清）。
+  - `ensure_mimic_service_up`：**首次 attach 前**与 **skb 回退前**都先 `detach_xdp`（回退前还会先 `systemctl stop` 彻底停掉失败单元），让 native→skb 回退能干净恢复、不再把线路弄挂；并新增"mimic 已在该网卡运行则直接返回"避免打扰共享网卡上的其它线路。
+  - `stop_profile`：停止后若该网卡已无 mimic 运行，则 `detach_xdp` 让网卡保持干净，下次启动干净 attach。
+
 ## [0.6.18] - 2026-06-15
 
 ### Fixed

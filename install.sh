@@ -2,7 +2,7 @@
 # wg-mimic-fabric — WireGuard + Mimic tunnel orchestrator (MVP)
 set -Eeuo pipefail
 
-SCRIPT_VERSION="0.6.18"
+SCRIPT_VERSION="0.6.19"
 MIMIC_UPSTREAM_TAG="${MIMIC_UPSTREAM_TAG:-v0.7.0}"
 APP_NAME="wg-mimic-fabric"
 WMF_PROJECT_REPO="${WMF_REPO:-ike-sh/wg-mimic-fabric}"
@@ -1213,14 +1213,37 @@ remove_tunnel_mimic_dropin() {
     rm -rf "/etc/systemd/system/wg-mimic-tunnel@${profile_id}.service.d" 2>/dev/null || true
 }
 
+# Force-detach any XDP program left on the NIC. A failed native attach (e.g. on
+# virtio_net) can leave a stale program that blocks the NEXT attach — even skb —
+# trapping mimic in a "仍未启动" loop until cleared manually. Clearing before each
+# (re)attach makes the native→skb fallback recover cleanly instead of bricking the
+# line. Detach all modes (generic / native-drv / offload) to be thorough.
+detach_xdp() {
+    local iface="$1"
+    [[ -n "$iface" ]] || return 0
+    command_exists ip || return 0
+    ip link set dev "$iface" xdpgeneric off 2>/dev/null || true
+    ip link set dev "$iface" xdpdrv off 2>/dev/null || true
+    ip link set dev "$iface" xdp off 2>/dev/null || true
+}
+
 # Start mimic@<iface> and verify it actually came up. On failure (e.g. XDP native
 # rejected on virtio_net + GRO), force skb mode for that nic's profiles and retry.
 ensure_mimic_service_up() {
     local iface="$1" p
+    # Already up (shared by another profile on this nic) → leave it running.
+    systemctl is-active --quiet "wg-mimic-mimic@${iface}.service" 2>/dev/null && return 0
+    # Clear any stale XDP program before attaching, so a previously failed native
+    # attach can't block this (re)attach.
+    detach_xdp "$iface"
     systemctl enable --now "wg-mimic-mimic@${iface}.service" 2>/dev/null || true
     sleep 1
     systemctl is-active --quiet "wg-mimic-mimic@${iface}.service" && return 0
     warn "mimic@${iface} 未起来，改用 XDP skb 模式重试..."
+    # Fully stop the failed unit and clear the leftover program before retrying —
+    # otherwise the stale native attach blocks the skb attach too.
+    systemctl stop "wg-mimic-mimic@${iface}.service" 2>/dev/null || true
+    detach_xdp "$iface"
     for p in "$PROFILES_DIR"/*.env; do
         [[ -f "$p" ]] || continue
         grep -q "^WAN_IFACE=${iface}\$" "$p" 2>/dev/null && set_or_append_kv "$p" MIMIC_XDP_MODE skb
@@ -1273,6 +1296,10 @@ stop_profile() {
         apply_mimic_conf_iface "$WAN_IFACE"
         systemctl try-restart "wg-mimic-mimic@${WAN_IFACE}.service" 2>/dev/null \
             || systemctl stop "wg-mimic-mimic@${WAN_IFACE}.service" 2>/dev/null || true
+        # If mimic no longer runs on this nic (no other profile uses it), clear its
+        # XDP program so the NIC is left clean and the next start attaches cleanly.
+        systemctl is-active --quiet "wg-mimic-mimic@${WAN_IFACE}.service" 2>/dev/null \
+            || detach_xdp "$WAN_IFACE"
     fi
     ok "已停止线路：${PROFILE_ID}"
 }
