@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.6.18] - 2026-06-15
+
+### Fixed
+
+- **「刷新接入码」轮换密钥却不重启 IX → 公网入口重导后整体不通的真因**：菜单 8 / `refresh_code` 每次都会**轮换入口 WG 密钥对**（把新私钥写进接入码、新公钥写进 IX 的 `WG_PEER_PUBLIC_KEY`），但随后只调 `apply_profile_configs`（**仅重写 conf 文件**），从不重启正在运行的 IX 隧道。于是 IX 内核里仍是**旧** ingress 公钥，公网入口用接入码里的**新**私钥重导+重启后，两端公钥对不上 → WG 永远不握手 → 这条隧道上的**所有规则（含原来好用的）一起中断**。
+  - **解耦**：`refresh-code`（菜单 8）改为**按当前规则刷新接入码、不换密钥、不重启**（改规则后用它即可，两端不断流）；密钥轮换拆到新命令 **`wm rotate-keys [ID]`**。
+  - **修复轮换路径**：`rotate-keys` 在 `apply_profile_configs` 后，**若 IX 隧道在运行则 `restart_profile`**，让内核真正加载新的对端公钥；随后提示公网入口必须重新 `import-code`。
+  - 修正 `README.md` / `examples/operations.md` 误导：改规则不需要（也不应）轮换密钥；`add-rule/edit-rule/delete-rule` 已自动重生成接入码。
+  - 受影响用户**立即恢复**：在 IX 机执行 `wm restart ix-nat`（加载已写好的新对端公钥，握手即恢复）。
+
 ## [0.6.17] - 2026-06-15
 
 ### Fixed

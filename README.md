@@ -98,9 +98,12 @@ wm edit-rule <ID> <规则ID>
 wm delete-rule <ID> <规则ID>
 wm enable-rule|disable-rule <ID> <规则ID>
 wm set-pool <ID> [端口池]  # 设置/清除 IX 中转端口池(如 40000-40010,40050)
-wm refresh-code <ID>     # IX 改规则后刷新接入码（公网入口需重新 import-code）
+wm refresh-code <ID>     # 按当前规则刷新接入码（不换密钥、不断流；改规则后公网入口重新 import-code）
 wm apply-rules <ID>      # 重建 nft
 ```
+
+> 改/增/删规则会**自动重生成接入码且不换密钥**，公网入口重新 `import-code` 即可，隧道不会断。
+> 仅在**密钥泄露**时才用 `wm rotate-keys <ID>` 轮换密钥（会重启 IX，两端短暂中断）。
 
 ### 商家中转端口池（可选）
 
@@ -112,7 +115,7 @@ wm set-pool ix-nat                     # 留空=清除，恢复手动指定
 wm list-rules ix-nat                    # 顶部显示「端口池: …（共/已用/剩）」
 ```
 
-接入码（`code_schema=5`）含组网密钥与落地信息，**请勿公开**；泄露后 `wm refresh-code` 会轮换入口密钥并刷新接入码，再重新导入即可。
+接入码（`code_schema=5`）含组网密钥与落地信息，**请勿公开**；泄露后用 `wm rotate-keys` 轮换入口密钥并刷新接入码（会重启 IX），再到公网入口重新导入即可。
 
 ---
 
@@ -166,7 +169,8 @@ wm health-all
 | `wm import-code` | 公网入口：导入接入码 |
 | `wm start\|stop\|restart [ID]` | 启停线路（两端均需 WG+Mimic） |
 | `wm show-port-map [ID]` | 端口地图 |
-| `wm show-code [ID]` / `refresh-code [ID]` | 显示 / 刷新接入码（IX） |
+| `wm show-code [ID]` / `refresh-code [ID]` | 显示 / 按当前规则刷新接入码（不换密钥，IX） |
+| `wm rotate-keys [ID]` | 轮换入口密钥并刷新接入码（密钥泄露时用，会重启 IX） |
 | `wm list-rules\|add-rule\|edit-rule\|delete-rule\|enable-rule\|disable-rule\|apply-rules` | 规则管理 |
 | `wm set-pool <ID> [端口池]` | IX 中转端口池(如 40000-40010；留空=清除，规则自动分配) |
 | `wm ddns-enable\|ddns-disable\|ddns-status\|ddns-refresh` | DDNS |
@@ -186,7 +190,7 @@ wm health-all
 
 ## 安全
 
-- 接入码含 WG 组网私钥与落地信息，按密钥对待，勿公开；泄露后 `refresh-code` 轮换。
+- 接入码含 WG 组网私钥与落地信息，按密钥对待，勿公开；泄露后 `rotate-keys` 轮换密钥。
 - 主备为手动切换，脚本不自动切线、不接管全局防火墙。
 - `wm purge` 会删除全部配置/密钥/接入码/服务（含 mimic 系统包，可用 `WMF_PURGE_NO_MIMIC=1` 保留）。
 

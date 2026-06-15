@@ -41,11 +41,14 @@ wm health ix-nat-ingress
 ## 多规则
 
 ```bash
-wm add-rule ix-nat            # IX 新增落地规则
-wm refresh-code ix-nat        # 刷新接入码（公网入口需重新 import-code）
+wm add-rule ix-nat            # IX 新增落地规则（已自动刷新接入码，密钥不变）
+wm show-code ix-nat           # 复制最新接入码
+# 公网入口：wm import-code 粘贴新码 → 重启（密钥不变，不会断流）
 wm list-rules ix-nat
-wm apply-rules ix-nat-ingress # 重建 nft
 ```
+
+> 改规则**不要**用 `rotate-keys`（那会轮换密钥并重启 IX，仅密钥泄露时才用）。
+> `add-rule/edit-rule/delete-rule` 已自动重生成接入码；需要手动再生用 `wm refresh-code`。
 
 ## 验证
 
@@ -54,7 +57,7 @@ wm diagnose ix-nat
 wg show wm-ix-nat             # WG 握手与流量
 mimic show -c eth0           # Mimic 连接状态
 ping -c3 10.88.0.2           # 入口 ping IX 虚拟 IP
-wm refresh-code ix-nat       # 密钥泄露后轮换并重新导入
+wm rotate-keys ix-nat        # 密钥泄露后轮换密钥（会重启IX，公网入口需重新 import-code）
 WMF_PURGE_YES=1 wm purge     # 完全清理
 ```
 

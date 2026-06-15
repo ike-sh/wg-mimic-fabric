@@ -2,7 +2,7 @@
 # wg-mimic-fabric — WireGuard + Mimic tunnel orchestrator (MVP)
 set -Eeuo pipefail
 
-SCRIPT_VERSION="0.6.17"
+SCRIPT_VERSION="0.6.18"
 MIMIC_UPSTREAM_TAG="${MIMIC_UPSTREAM_TAG:-v0.7.0}"
 APP_NAME="wg-mimic-fabric"
 WMF_PROJECT_REPO="${WMF_REPO:-ike-sh/wg-mimic-fabric}"
@@ -1833,11 +1833,26 @@ show_code() {
     fi
 }
 
+# 按当前规则重新生成接入码 —— 不轮换密钥、不重启隧道（密钥不变两端不会断流）。
+# 改/增/删规则后用它把新规则集打进接入码即可（add-rule/edit-rule/delete-rule 已自动
+# 调过一次，这里供手动按需再生）。要轮换密钥见 rotate_keys（那才会重启 IX）。
 refresh_code() {
     local id; id="$(resolve_profile_id "${1:-}")"
     require_root
     load_profile "$id"
     [[ "${ROLE:-}" == "nat-transit" ]] || die "仅 IX(nat-transit) 线路可 refresh-code"
+    apply_nft_all
+    generate_code | tee "${CODES_DIR}/${PROFILE_ID}.code"
+    chmod 600 "${CODES_DIR}/${PROFILE_ID}.code"
+    ok "已按当前规则刷新接入码（密钥不变，公网入口重新 import-code 即可，不会断流）"
+}
+
+# 轮换入口 WG 密钥对 + 刷新接入码（仅用于密钥泄露等场景，会短暂中断两端）。
+rotate_keys() {
+    local id; id="$(resolve_profile_id "${1:-}")"
+    require_root
+    load_profile "$id"
+    [[ "${ROLE:-}" == "nat-transit" ]] || die "仅 IX(nat-transit) 线路可 rotate-keys"
     local ing_priv ing_pub ing_priv_b64 path
     ing_priv="$(wg_genkey)"; ing_pub="$(wg_pubkey_of "$ing_priv")"
     ing_priv_b64="$(printf '%s' "$ing_priv" | base64url_encode)"
@@ -1850,9 +1865,16 @@ refresh_code() {
     fi
     load_profile "$id"
     apply_profile_configs
+    # 关键：apply_profile_configs 只重写 conf 文件，不会动正在运行的接口。轮换换掉了
+    # 对端公钥，若不重启，IX 内核里仍是旧 ingress 公钥 —— 公网入口用新私钥重导后两端
+    # 公钥对不上、WG 永远不握手 → 该隧道上的全部规则一起中断。隧道在跑就重启使其生效。
+    if systemctl is-active --quiet "wg-mimic-tunnel@${PROFILE_ID}.service" 2>/dev/null; then
+        info "重启 IX 隧道以加载新的对端公钥..."
+        restart_profile "$PROFILE_ID"
+    fi
     generate_code | tee "${CODES_DIR}/${PROFILE_ID}.code"
     chmod 600 "${CODES_DIR}/${PROFILE_ID}.code"
-    ok "已刷新接入码与入口密钥（公网入口需重新 import-code）"
+    warn "已轮换入口密钥：公网入口必须用新接入码重新 import-code（两端会短暂中断）"
 }
 
 set_profile_mtu() {
@@ -2350,7 +2372,8 @@ wg-mimic-fabric ${SCRIPT_VERSION} — 公网入口 ⇄ IX WireGuard 组网 + Mim
   wm list-profiles
   wm show-config [ID]
   wm show-code [ID]               显示 IX 接入码
-  wm refresh-code [ID]            轮换入口密钥并刷新接入码
+  wm refresh-code [ID]            按当前规则刷新接入码（不换密钥、不断流）
+  wm rotate-keys [ID]             轮换入口密钥并刷新接入码（会重启IX，公网入口需重导）
   wm show-port-map [ID]           端口地图
   wm list-rules [ID]
   wm add-rule [ID]
@@ -2473,6 +2496,7 @@ main() {
         show-config) load_profile "$(resolve_profile_id "${2:-}")"; cat "$(profile_env_path "$PROFILE_ID")" ;;
         show-code) show_code "${2:-}" ;;
         refresh-code) refresh_code "${2:-}" ;;
+        rotate-keys) rotate_keys "${2:-}" ;;
         show-port-map) show_port_map "${2:-}" ;;
         list-rules) list_rules "${2:-}" ;;
         add-rule) add_rule "${2:-}" ;;
