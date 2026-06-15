@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.1.0-beta.3] - 2026-06-15
+
+### Fixed（国内服务器拉取 GitHub release）
+
+- **swgp-go / mimic 的 release 下载改走镜像**：新增通用 `gh_curl`（镜像优先轮询 + 直连兜底 + 连接/总超时 + 重试），替换原先裸连 `api.github.com` / `browser_download_url` 的 `curl`。国内（中国大陆）网关机 `import-exit-code` / `install-swgp` / `install-mimic` 不再因直连 GitHub 失败而卡死。
+- 镜像源沿用 `WMF_GITHUB_MIRRORS`（默认 `gh.ddlc.top / gh-proxy.com / ghproxy.net`），API 与资产下载统一走同一套；mimic 源码 tarball 同样改为镜像下载后解压。
+- `test`：非数字 ping 包数自动回退默认值（避免误报 100% 丢包）。
+
 ## [1.1.0-beta.2] - 2026-06-15
 
 ### Added（混淆组网 Phase 2：客户端入口 + 全局出口）

@@ -2,7 +2,7 @@
 # wg-mimic-fabric — WireGuard + Mimic tunnel orchestrator (MVP)
 set -Eeuo pipefail
 
-SCRIPT_VERSION="1.1.0-beta.2"
+SCRIPT_VERSION="1.1.0-beta.3"
 MIMIC_UPSTREAM_TAG="${MIMIC_UPSTREAM_TAG:-v0.7.0}"
 APP_NAME="wg-mimic-fabric"
 WMF_PROJECT_REPO="${WMF_REPO:-ike-sh/wg-mimic-fabric}"
@@ -686,6 +686,21 @@ download_with_mirrors() {
             url="https://raw.githubusercontent.com/${repo}/${ref}/${relpath}?ts=$(date +%s)"
         fi
         if curl -fsSL -o "$dest" "$url" 2>/dev/null; then return 0; fi
+    done
+    return 1
+}
+
+# 下载任意 GitHub/api/raw 资源：优先走镜像（国内可达），逐个轮询，最后直连兜底。
+# $1=完整 URL（github.com / api.github.com / *.githubusercontent.com）  $2=落地文件
+gh_curl() {
+    local url="$1" dest="$2" m u mirrors=()
+    IFS=',' read -ra mirrors <<< "${WMF_GITHUB_MIRRORS:-$DEFAULT_GITHUB_MIRRORS}"
+    for m in "${mirrors[@]}" "" ; do
+        if [[ -n "$m" ]]; then u="$(mirror_url "$m" "$url")"; else u="$url"; fi
+        if curl -fsSL --connect-timeout 10 --max-time 300 --retry 1 -o "$dest" "$u" 2>/dev/null \
+            && [[ -s "$dest" ]]; then
+            return 0
+        fi
     done
     return 1
 }
@@ -2676,12 +2691,12 @@ install_mimic_github_deb() {
     arch="$(dpkg --print-architecture 2>/dev/null || echo amd64)"
     tmpd="$(mktemp -d)"
     info "尝试从 GitHub Releases 下载 ${codename} .deb (${MIMIC_UPSTREAM_TAG})..."
-    mapfile -t urls < <(python3 - "$MIMIC_UPSTREAM_TAG" "$codename" <<'PY'
-import json, sys, urllib.request
-tag, codename = sys.argv[1], sys.argv[2]
-api = f"https://api.github.com/repos/hack3ric/mimic/releases/tags/{tag}"
-with urllib.request.urlopen(api, timeout=60) as r:
-    data = json.load(r)
+    gh_curl "https://api.github.com/repos/hack3ric/mimic/releases/tags/${MIMIC_UPSTREAM_TAG}" "$tmpd/rel.json" \
+        || { rm -rf "$tmpd"; return 1; }
+    mapfile -t urls < <(python3 - "$tmpd/rel.json" "$codename" <<'PY'
+import json, sys
+data = json.load(open(sys.argv[1]))
+codename = sys.argv[2]
 for a in data.get("assets", []):
     n = a["name"]
     if codename not in n or not n.endswith(".deb"):
@@ -2702,8 +2717,8 @@ PY
         [[ "$kind" == "DKMS" ]] && dkms_deb="$u"
     done
     [[ -n "$mimic_deb" && -n "$dkms_deb" ]] || { rm -rf "$tmpd"; return 1; }
-    curl -fsSL -o "$tmpd/mimic.deb" "$mimic_deb" || { rm -rf "$tmpd"; return 1; }
-    curl -fsSL -o "$tmpd/mimic-dkms.deb" "$dkms_deb" || { rm -rf "$tmpd"; return 1; }
+    gh_curl "$mimic_deb" "$tmpd/mimic.deb" || { rm -rf "$tmpd"; return 1; }
+    gh_curl "$dkms_deb" "$tmpd/mimic-dkms.deb" || { rm -rf "$tmpd"; return 1; }
     DEBIAN_FRONTEND=noninteractive apt-get install -y "$tmpd/mimic.deb" "$tmpd/mimic-dkms.deb" \
         || { rm -rf "$tmpd"; return 1; }
     rm -rf "$tmpd"
@@ -2719,13 +2734,11 @@ install_mimic_from_source() {
     install_base_packages || true
     dir="$(mktemp -d /tmp/mimic-src.XXXXXX)"
     info "源码编译 mimic (${tag}, CHECKSUM_HACK=${hack})..."
-    if command_exists git; then
-        git clone --depth 1 --branch "$tag" https://github.com/hack3ric/mimic.git "$dir" 2>/dev/null \
-            || curl -fsSL "https://github.com/hack3ric/mimic/archive/refs/tags/${tag}.tar.gz" \
-                | tar xz -C "$dir" --strip-components=1
-    else
-        curl -fsSL "https://github.com/hack3ric/mimic/archive/refs/tags/${tag}.tar.gz" \
-            | tar xz -C "$dir" --strip-components=1
+    if command_exists git \
+        && git clone --depth 1 --branch "$tag" https://github.com/hack3ric/mimic.git "$dir" 2>/dev/null; then
+        :
+    elif gh_curl "https://github.com/hack3ric/mimic/archive/refs/tags/${tag}.tar.gz" "$dir/src.tgz"; then
+        tar xzf "$dir/src.tgz" -C "$dir" --strip-components=1 2>/dev/null
     fi
     [[ -f "$dir/Makefile" ]] || { rm -rf "$dir"; return 1; }
     make -C "$dir" CHECKSUM_HACK="$hack" build-cli build-kmod 2>/dev/null \
@@ -2871,12 +2884,12 @@ download_swgp_release() {
     local dest="$1" tmpd url
     command_exists python3 || return 1
     tmpd="$(mktemp -d)"
-    url="$(python3 - "$SWGP_REPO" <<'PY' 2>/dev/null
-import json, sys, platform, urllib.request
-repo = sys.argv[1]
+    gh_curl "https://api.github.com/repos/${SWGP_REPO}/releases/latest" "$tmpd/rel.json" \
+        || { rm -rf "$tmpd"; return 1; }
+    url="$(python3 - "$tmpd/rel.json" <<'PY' 2>/dev/null
+import json, sys, platform
 try:
-    d = json.load(urllib.request.urlopen(
-        f"https://api.github.com/repos/{repo}/releases/latest", timeout=30))
+    d = json.load(open(sys.argv[1]))
 except Exception:
     sys.exit(0)
 m = platform.machine().lower()
@@ -2900,7 +2913,7 @@ print(best or "")
 PY
 )"
     [[ -n "$url" ]] || { rm -rf "$tmpd"; return 1; }
-    curl -fsSL -o "$tmpd/pkg" "$url" || { rm -rf "$tmpd"; return 1; }
+    gh_curl "$url" "$tmpd/pkg" || { rm -rf "$tmpd"; return 1; }
     case "$url" in
         *.zip)            command_exists unzip && unzip -o "$tmpd/pkg" -d "$tmpd" >/dev/null 2>&1 ;;
         *.tar.gz|*.tgz)   tar -xzf "$tmpd/pkg" -C "$tmpd" 2>/dev/null ;;
