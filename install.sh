@@ -29,6 +29,10 @@ SYSTEMD_DDNS_SERVICE="/etc/systemd/system/wg-mimic-ddns.service"
 SYSTEMD_DDNS_TIMER="/etc/systemd/system/wg-mimic-ddns.timer"
 SYSTEMD_AUTOSWITCH_SERVICE="/etc/systemd/system/wg-mimic-autoswitch@.service"
 SYSTEMD_AUTOSWITCH_TIMER="/etc/systemd/system/wg-mimic-autoswitch@.timer"
+SWGP_BIN="/usr/local/bin/swgp-go"
+SWGP_CONF_DIR="${CONFIG_DIR}/swgp"
+SWGP_REPO="${SWGP_REPO:-database64128/swgp-go}"
+SYSTEMD_SWGP_TEMPLATE="/etc/systemd/system/wg-mimic-swgp@.service"
 SYSTEMD_RESUME_SERVICE="/etc/systemd/system/wg-mimic-resume.service"
 RESUME_MARKER="${STATE_DIR}/resume.cmd"
 
@@ -2465,6 +2469,131 @@ update_mimic() {
     ok "mimic 升级完成：${before} → ${after}"
 }
 
+# ── swgp-go（WireGuard 流量混淆，抗 DPI/过墙；可与 mimic 叠加）────────────────
+# 链路: WG → swgp-go → mimic。swgp-go 是用户态 Go 代理，把 WG 的 UDP 混淆/加密成
+# 另一种 UDP；mimic 再在外层把它伪装成 TCP。本节负责装它、渲染配置、跑 systemd。
+
+# swgp-go 的 PSK 与 WireGuard PSK 同格式（base64 32B）。
+swgp_genpsk() { wg genpsk; }
+
+# 从 GitHub release 动态匹配 linux+arch 资产并安装 swgp-go 二进制（在线运行时调用）。
+download_swgp_release() {
+    local dest="$1" tmpd url
+    command_exists python3 || return 1
+    tmpd="$(mktemp -d)"
+    url="$(python3 - "$SWGP_REPO" <<'PY' 2>/dev/null
+import json, sys, platform, urllib.request
+repo = sys.argv[1]
+try:
+    d = json.load(urllib.request.urlopen(
+        f"https://api.github.com/repos/{repo}/releases/latest", timeout=30))
+except Exception:
+    sys.exit(0)
+m = platform.machine().lower()
+if m in ("x86_64", "amd64"):
+    arch = ["x86-64-v3", "x86-64-v2", "x86-64", "amd64", "x86_64"]
+elif m in ("aarch64", "arm64"):
+    arch = ["arm64", "aarch64"]
+else:
+    arch = [m]
+best = None; best_score = -1
+for a in d.get("assets", []):
+    n = a["name"].lower()
+    if "linux" not in n or not any(t in n for t in arch):
+        continue
+    if n.endswith((".sha256", ".asc", ".sig", ".sbom", ".json", ".txt")):
+        continue
+    score = 2 if n.endswith((".tar.gz", ".tgz", ".zip")) else 1
+    if score > best_score:
+        best, best_score = a["browser_download_url"], score
+print(best or "")
+PY
+)"
+    [[ -n "$url" ]] || { rm -rf "$tmpd"; return 1; }
+    curl -fsSL -o "$tmpd/pkg" "$url" || { rm -rf "$tmpd"; return 1; }
+    case "$url" in
+        *.zip)            command_exists unzip && unzip -o "$tmpd/pkg" -d "$tmpd" >/dev/null 2>&1 ;;
+        *.tar.gz|*.tgz)   tar -xzf "$tmpd/pkg" -C "$tmpd" 2>/dev/null ;;
+        *)                cp "$tmpd/pkg" "$tmpd/swgp-go" ;;
+    esac
+    local bin; bin="$(find "$tmpd" -type f -name 'swgp-go' 2>/dev/null | head -1)"
+    [[ -n "$bin" ]] || { rm -rf "$tmpd"; return 1; }
+    install -m 755 "$bin" "$dest"
+    rm -rf "$tmpd"
+}
+
+install_swgp() {
+    require_root
+    if [[ -x "$SWGP_BIN" ]] || command_exists swgp-go; then
+        ok "swgp-go 已安装"; return 0
+    fi
+    info "安装 swgp-go（WireGuard 混淆）..."
+    if download_swgp_release "$SWGP_BIN"; then
+        ok "已通过 GitHub release 安装 swgp-go"
+    elif command_exists go; then
+        info "release 不可用，改用 go install..."
+        GOBIN=/usr/local/bin go install "github.com/${SWGP_REPO}/cmd/swgp-go@latest" \
+            || die "swgp-go 安装失败（go install）"
+        ok "已通过 go install 安装 swgp-go"
+    else
+        die "swgp-go 安装失败：无可用 release 资产且未装 go（可 apt install golang 后重试）"
+    fi
+}
+
+# 渲染 swgp-go 配置 JSON：
+#   render_swgp_conf server <proxy_listen_port> <wg_endpoint> <mode> <psk> [mtu] [fwmark]
+#   render_swgp_conf client <wg_listen_port>   <proxy_endpoint> <mode> <psk> [mtu] [fwmark]
+render_swgp_conf() {
+    local kind="$1" p2="$2" p3="$3" mode="$4" psk="$5" mtu="${6:-1500}" fwmark="${7:-0}"
+    python3 - "$kind" "$p2" "$p3" "$mode" "$psk" "$mtu" "$fwmark" <<'PY'
+import json, sys
+kind, p2, p3, mode, psk, mtu, fwmark = sys.argv[1:8]
+mtu = int(mtu); fwmark = int(fwmark)
+if kind == "server":
+    obj = {"servers": [{
+        "name": "wm", "proxyListen": f":{p2}", "proxyMode": mode, "proxyPSK": psk,
+        "proxyFwmark": fwmark, "wgEndpoint": p3, "wgFwmark": 0, "mtu": mtu}]}
+else:
+    obj = {"clients": [{
+        "name": "wm", "wgListen": f":{p2}", "wgFwmark": 0, "proxyEndpoint": p3,
+        "proxyMode": mode, "proxyPSK": psk, "proxyFwmark": fwmark, "mtu": mtu}]}
+print(json.dumps(obj, indent=2))
+PY
+}
+
+# 写 swgp-go 配置到 /etc/wg-mimic-fabric/swgp/<id>.json（由 profile 字段渲染）。
+apply_swgp_conf() {
+    local id="$1"; shift
+    install -d -m 700 "$SWGP_CONF_DIR"
+    local tmp; tmp="$(mktemp)"
+    render_swgp_conf "$@" >"$tmp"
+    install -m 600 "$tmp" "${SWGP_CONF_DIR}/${id}.json"
+    rm -f "$tmp"
+}
+
+install_swgp_units() {
+    local swgp_bin; swgp_bin="$(resolve_bin swgp-go "$SWGP_BIN")"
+    local tmp; tmp="$(mktemp)"
+    cat >"$tmp" <<EOF
+[Unit]
+Description=wg-mimic-fabric swgp-go %i
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=${swgp_bin} -confPath ${SWGP_CONF_DIR}/%i.json
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    install -m 644 "$tmp" "$SYSTEMD_SWGP_TEMPLATE"
+    rm -f "$tmp"
+    systemctl daemon-reload 2>/dev/null || true
+}
+
 install_all() {
     require_root
     install_wm_cli
@@ -2679,6 +2808,7 @@ wg-mimic-fabric ${SCRIPT_VERSION} — 公网入口 ⇄ IX WireGuard 组网 + Mim
   wm set-mtu <ID> <MTU> / wm set-xdp-mode <ID> [skb|native]
   wm install-all|install-mimic|install-deps|compat
   wm update-mimic [版本]           升级 mimic 到 apt 最新或指定版本（重载模块+重启线路）
+  wm install-swgp                  安装 swgp-go（WireGuard 混淆，过墙用）
   wm upgrade-script / wm uninstall / wm purge
 
 架构: 客户端 → 公网入口:client_port → WG(Mimic 伪TCP) → IX 虚拟IP:transit_port → 落地
@@ -2780,6 +2910,7 @@ main() {
         install-wm-cli) install_wm_cli ;;
         install-mimic) install_mimic_packages ;;
         update-mimic) update_mimic "${2:-}" ;;
+        install-swgp) install_swgp ;;
         install-all) install_all ;;
         install-deps) install_deps ;;
         compat) compat_os_report ;;

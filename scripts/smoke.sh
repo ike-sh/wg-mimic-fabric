@@ -164,6 +164,19 @@ test_iface() {
     echo "IFACE OK"
 }
 
+test_swgp() {
+    local s c
+    s="$(render_swgp_conf server 18443 127.0.0.1:51820 zero-overhead-2026 PSKBASE64)"
+    grep -q '"proxyListen": ":18443"' <<<"$s" || fail "swgp server proxyListen"
+    grep -q '"proxyMode": "zero-overhead-2026"' <<<"$s" || fail "swgp server mode"
+    grep -q '"wgEndpoint": "127.0.0.1:51820"' <<<"$s" || fail "swgp server wgEndpoint"
+    grep -q '"proxyPSK": "PSKBASE64"' <<<"$s" || fail "swgp server psk"
+    c="$(render_swgp_conf client 18444 1.2.3.4:18443 zero-overhead-2026 PSKBASE64)"
+    grep -q '"wgListen": ":18444"' <<<"$c" || fail "swgp client wgListen"
+    grep -q '"proxyEndpoint": "1.2.3.4:18443"' <<<"$c" || fail "swgp client proxyEndpoint"
+    echo "SWGP OK"
+}
+
 case "${1:-all}" in
     rule) test_rule ;;
     code) test_code ;;
@@ -174,7 +187,8 @@ case "${1:-all}" in
     pool) test_pool ;;
     mimic) test_mimic ;;
     iface) test_iface ;;
+    swgp) test_swgp ;;
     nopy) test_rule; test_wgconf; test_nft; test_ipv6; test_group; test_pool; test_mimic; test_iface; echo "NOPY OK" ;;
-    all) test_rule; test_code; test_wgconf; test_nft; test_ipv6; test_group; test_pool; test_mimic; test_iface; echo "ALL OK" ;;
-    *) echo "usage: smoke.sh [rule|code|wgconf|nft|ipv6|group|pool|mimic|iface|nopy|all]"; exit 1 ;;
+    all) test_rule; test_code; test_swgp; test_wgconf; test_nft; test_ipv6; test_group; test_pool; test_mimic; test_iface; echo "ALL OK" ;;
+    *) echo "usage: smoke.sh [rule|code|swgp|wgconf|nft|ipv6|group|pool|mimic|iface|nopy|all]"; exit 1 ;;
 esac
