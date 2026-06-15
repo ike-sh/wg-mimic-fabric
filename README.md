@@ -1,10 +1,10 @@
 # wg-mimic-fabric
 
-**当前版本**：[`v0.3.4`](https://github.com/ike-sh/wg-mimic-fabric/releases/tag/v0.3.4)  
+**当前版本**：[`v0.4.0`](https://github.com/ike-sh/wg-mimic-fabric/releases/tag/v0.4.0)  
 **仓库**：https://github.com/ike-sh/wg-mimic-fabric  
 **定位**：WireGuard + [Mimic](https://github.com/hack3ric/mimic) 伪 TCP 隧道编排器，对标 [ix-transit-fabric](https://github.com/ike-sh/ix-transit-fabric) 的运维体验。
 
-管理 **WireGuard 隧道 + Mimic UDP→TCP 混淆**：服务端生成配对码，客户端导入即可组网，自动处理 MTU、Mimic filter、systemd 生命周期。
+管理 **WireGuard 隧道 + Mimic UDP→TCP 混淆**，以及 **纯端口中继（relay）** 对标 ix-transit 三段转发。
 
 **不负责**：安装 Mimic 本体（仅检测并指引）、代理内核、全局防火墙接管。
 
@@ -103,6 +103,7 @@ ping 10.66.66.1   # 从客户端 ping 服务端隧道 IP
 |------|------|
 | `wm` | 交互菜单 |
 | `wm create-forwarder` | Forwarder 旁路（RouterOS 等） |
+| `wm create-relay` | 纯转发中继（公网入口/IX→落地，无需 WG） |
 | `wm install-deps` | 按发行版打印 mimic 依赖指引 |
 | `wm compat` | 操作系统兼容性报告 |
 | `wm create-server` | 创建服务端线路 |

@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.4.0] - 2026-06-15
+
+### Added
+
+- **`wm create-relay`**：纯 nft 端口转发（`ROLE=relay`），对标 ix-transit 公网入口→IX→落地
+  - `RELAY_KIND=ingress|transit`，支持 `tcp` / `udp` / `both`
+  - 落地无需 WG / Mimic
+- 文档 `docs/transit-topology.md`
+
 ## [0.3.4] - 2026-06-15
 
 ### Fixed

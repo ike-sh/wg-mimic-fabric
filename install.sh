@@ -2,7 +2,7 @@
 # wg-mimic-fabric — WireGuard + Mimic tunnel orchestrator (MVP)
 set -Eeuo pipefail
 
-SCRIPT_VERSION="0.3.4"
+SCRIPT_VERSION="0.4.0"
 MIMIC_UPSTREAM_TAG="${MIMIC_UPSTREAM_TAG:-v0.7.0}"
 APP_NAME="wg-mimic-fabric"
 WMF_PROJECT_REPO="${WMF_REPO:-ike-sh/wg-mimic-fabric}"
@@ -453,6 +453,8 @@ collect_nft_input_ports() {
                 printf '%s %s-server\n' "$WG_PORT" "$PROFILE_ID"
             elif [[ "${ROLE:-}" == "forwarder" ]]; then
                 printf '%s %s-fwd\n' "$FORWARDER_LISTEN_PORT" "$PROFILE_ID"
+            elif [[ "${ROLE:-}" == "relay" ]]; then
+                printf '%s %s-relay\n' "$RELAY_LISTEN_PORT" "$PROFILE_ID"
             fi
         )
     done | sort -u -k1,1
@@ -466,39 +468,120 @@ collect_forwarder_nat_rules() {
             # shellcheck disable=SC1090
             source "$p"
             [[ "${ROLE:-}" == "forwarder" ]] || exit 0
-            printf '%s %s %s %s\n' "$FORWARDER_LISTEN_PORT" "$SERVER_PUBLIC_IP" "$SERVER_WG_PORT" "$PROFILE_ID"
+            printf '%s %s %s udp %s\n' "$FORWARDER_LISTEN_PORT" "$SERVER_PUBLIC_IP" "$SERVER_WG_PORT" "$PROFILE_ID"
         )
     done
 }
 
+collect_relay_nat_rules() {
+    local p
+    for p in "$PROFILES_DIR"/*.env; do
+        [[ -f "$p" ]] || continue
+        (
+            # shellcheck disable=SC1090
+            source "$p"
+            [[ "${ROLE:-}" == "relay" ]] || exit 0
+            printf '%s %s %s %s %s\n' \
+                "${RELAY_LISTEN_PORT:-}" "${RELAY_TARGET_HOST:-}" "${RELAY_TARGET_PORT:-}" \
+                "${FORWARD_PROTO:-both}" "$PROFILE_ID"
+        )
+    done
+}
+
+render_nft_dnat_rules() {
+    local rules="$1" tag_prefix="${2:-wm}"
+    local listen tip tport proto pid
+    while read -r listen tip tport proto pid; do
+        [[ -n "$listen" && -n "$tip" && -n "$tport" ]] || continue
+        case "$proto" in
+            tcp)
+                printf '        tcp dport %s counter dnat to %s:%s comment "%s-%s"\n' \
+                    "$listen" "$tip" "$tport" "$tag_prefix" "$pid"
+                ;;
+            udp)
+                printf '        udp dport %s counter dnat to %s:%s comment "%s-%s"\n' \
+                    "$listen" "$tip" "$tport" "$tag_prefix" "$pid"
+                ;;
+            both|*)
+                printf '        tcp dport %s counter dnat to %s:%s comment "%s-%s-tcp"\n' \
+                    "$listen" "$tip" "$tport" "$tag_prefix" "$pid"
+                printf '        udp dport %s counter dnat to %s:%s comment "%s-%s-udp"\n' \
+                    "$listen" "$tip" "$tport" "$tag_prefix" "$pid"
+                ;;
+        esac
+    done <<<"$rules"
+}
+
+render_nft_postrouting_rules() {
+    local rules="$1" tag_prefix="${2:-wm}"
+    local listen tip tport proto pid
+    while read -r listen tip tport proto pid; do
+        [[ -n "$tip" && -n "$tport" ]] || continue
+        case "$proto" in
+            tcp)
+                printf '        ip daddr %s tcp dport %s counter masquerade comment "%s-%s"\n' \
+                    "$tip" "$tport" "$tag_prefix" "$pid"
+                ;;
+            udp)
+                printf '        ip daddr %s udp dport %s counter masquerade comment "%s-%s"\n' \
+                    "$tip" "$tport" "$tag_prefix" "$pid"
+                ;;
+            both|*)
+                printf '        ip daddr %s tcp dport %s counter masquerade comment "%s-%s-tcp"\n' \
+                    "$tip" "$tport" "$tag_prefix" "$pid"
+                printf '        ip daddr %s udp dport %s counter masquerade comment "%s-%s-udp"\n' \
+                    "$tip" "$tport" "$tag_prefix" "$pid"
+                ;;
+        esac
+    done <<<"$rules"
+}
+
+render_nft_forward_rules() {
+    local rules="$1" tag_prefix="${2:-wm}"
+    local listen tip tport proto pid
+    while read -r listen tip tport proto pid; do
+        [[ -n "$tip" && -n "$tport" ]] || continue
+        case "$proto" in
+            tcp)
+                printf '        ip daddr %s tcp dport %s accept comment "%s-%s"\n' "$tip" "$tport" "$tag_prefix" "$pid"
+                printf '        ip saddr %s tcp sport %s accept comment "%s-%s-r"\n' "$tip" "$tport" "$tag_prefix" "$pid"
+                ;;
+            udp)
+                printf '        ip daddr %s udp dport %s accept comment "%s-%s"\n' "$tip" "$tport" "$tag_prefix" "$pid"
+                printf '        ip saddr %s udp sport %s accept comment "%s-%s-r"\n' "$tip" "$tport" "$tag_prefix" "$pid"
+                ;;
+            both|*)
+                printf '        ip daddr %s tcp dport %s accept comment "%s-%s-tcp"\n' "$tip" "$tport" "$tag_prefix" "$pid"
+                printf '        ip saddr %s tcp sport %s accept comment "%s-%s-tcp-r"\n' "$tip" "$tport" "$tag_prefix" "$pid"
+                printf '        ip daddr %s udp dport %s accept comment "%s-%s-udp"\n' "$tip" "$tport" "$tag_prefix" "$pid"
+                printf '        ip saddr %s udp sport %s accept comment "%s-%s-udp-r"\n' "$tip" "$tport" "$tag_prefix" "$pid"
+                ;;
+        esac
+    done <<<"$rules"
+}
+
 render_nft_all() {
-    local ports rules line listen sip sport pid
+    local ports fwd_rules relay_rules all_rules
     ports="$(collect_nft_input_ports)"
-    rules="$(collect_forwarder_nat_rules)"
+    fwd_rules="$(collect_forwarder_nat_rules)"
+    relay_rules="$(collect_relay_nat_rules)"
+    all_rules="$(printf '%s\n%s' "$fwd_rules" "$relay_rules" | sed '/^$/d')"
     {
         printf 'table inet %s {\n' "$NFT_TABLE"
-        if [[ -n "$rules" ]]; then
+        if [[ -n "$all_rules" ]]; then
             printf '    chain prerouting {\n'
             printf '        type nat hook prerouting priority dstnat; policy accept;\n'
-            while read -r listen sip sport pid; do
-                [[ -n "$listen" ]] || continue
-                printf '        udp dport %s counter dnat to %s:%s comment "wm-fwd-%s"\n' "$listen" "$sip" "$sport" "$pid"
-            done <<<"$rules"
+            render_nft_dnat_rules "$all_rules"
             printf '    }\n'
             printf '    chain postrouting {\n'
             printf '        type nat hook postrouting priority srcnat; policy accept;\n'
-            while read -r listen sip sport pid; do
-                [[ -n "$sip" ]] || continue
-                printf '        ip daddr %s udp dport %s counter masquerade comment "wm-fwd-%s"\n' "$sip" "$sport" "$pid"
-            done <<<"$rules"
+            printf '        ip protocol tcp oifname "lo" return\n'
+            printf '        ip protocol udp oifname "lo" return\n'
+            render_nft_postrouting_rules "$all_rules"
             printf '    }\n'
             printf '    chain forward {\n'
             printf '        type filter hook forward priority filter; policy accept;\n'
-            while read -r listen sip sport pid; do
-                [[ -n "$sip" ]] || continue
-                printf '        ip daddr %s udp dport %s accept comment "wm-fwd-%s"\n' "$sip" "$sport" "$pid"
-                printf '        ip saddr %s udp sport %s accept comment "wm-fwd-%s-r"\n' "$sip" "$sport" "$pid"
-            done <<<"$rules"
+            render_nft_forward_rules "$all_rules"
             printf '    }\n'
         fi
         printf '    chain input {\n'
@@ -580,6 +663,16 @@ EOF
 
 start_profile() {
     load_profile "$1"
+    if [[ "${ROLE:-}" == "relay" ]]; then
+        local path; path="$(profile_env_path "$PROFILE_ID")"
+        if grep -q '^ENABLED=' "$path" 2>/dev/null; then
+            sed -i 's/^ENABLED=.*/ENABLED=true/' "$path"
+        fi
+        apply_nft_all
+        ensure_ip_forward
+        ok "已启动 relay：${PROFILE_ID}（${RELAY_LISTEN_PORT:-?} → ${RELAY_TARGET_HOST:-?}:${RELAY_TARGET_PORT:-?}）"
+        return
+    fi
     apply_profile_configs
     apply_nft_all
     [[ "${ROLE:-}" == "forwarder" ]] && ensure_ip_forward
@@ -592,6 +685,17 @@ start_profile() {
 
 stop_profile() {
     load_profile "$1"
+    if [[ "${ROLE:-}" == "relay" ]]; then
+        local path; path="$(profile_env_path "$PROFILE_ID")"
+        if grep -q '^ENABLED=' "$path" 2>/dev/null; then
+            sed -i 's/^ENABLED=.*/ENABLED=false/' "$path"
+        else
+            printf 'ENABLED=false\n' >>"$path"
+        fi
+        apply_nft_all
+        ok "已停止 relay：${PROFILE_ID}"
+        return
+    fi
     if [[ "${ROLE:-}" != "forwarder" ]]; then
         systemctl stop "wg-mimic-tunnel@${PROFILE_ID}.service" 2>/dev/null || true
     fi
@@ -732,6 +836,67 @@ create_forwarder_interactive() {
     printf '详见 docs/forwarder.md\n'
 }
 
+create_relay_interactive() {
+    require_root
+    ensure_dirs
+    command_exists nft || die "需要 nftables，请 apt install nftables"
+
+    local profile_id relay_kind listen_port target_host target_port forward_proto
+    prompt profile_id "线路 ID（字母数字）" "ix-transit"
+    profile_id="$(sanitize_id "$profile_id")"
+    [[ ! -f "$(profile_env_path "$profile_id")" ]] || die "线路已存在：$profile_id"
+
+    prompt relay_kind "用途 ingress=公网入口 / transit=IX中转" "transit"
+    case "$relay_kind" in
+        ingress|transit) ;;
+        *) die "用途必须是 ingress 或 transit" ;;
+    esac
+
+    prompt listen_port "本机监听端口（客户端或上一跳连此口）"
+    [[ "$listen_port" =~ ^[0-9]+$ ]] || die "端口必须是数字"
+    (( listen_port >= 1 && listen_port <= 65535 )) || die "端口范围 1-65535"
+
+    prompt target_host "转发目标 IP 或域名"
+    [[ -n "$target_host" ]] || die "目标地址不能为空"
+
+    prompt target_port "转发目标端口"
+    [[ "$target_port" =~ ^[0-9]+$ ]] || die "端口必须是数字"
+
+    prompt forward_proto "协议 tcp / udp / both" "both"
+    case "$forward_proto" in
+        tcp|udp|both) ;;
+        *) die "协议必须是 tcp、udp 或 both" ;;
+    esac
+
+    write_profile_kv "$(profile_env_path "$profile_id")" \
+        "PROFILE_ID=${profile_id}" \
+        "PROFILE_NAME=${profile_id}" \
+        "ROLE=relay" \
+        "RELAY_KIND=${relay_kind}" \
+        "ENABLED=true" \
+        "RELAY_LISTEN_PORT=${listen_port}" \
+        "RELAY_TARGET_HOST=${target_host}" \
+        "RELAY_TARGET_PORT=${target_port}" \
+        "FORWARD_PROTO=${forward_proto}" \
+        "FW_OPEN_PORT=true"
+
+    load_profile "$profile_id"
+    apply_nft_all
+    ensure_ip_forward
+
+    printf '\n═══ Relay 部署说明 ═══\n'
+    printf '类型: %s\n' "$relay_kind"
+    printf '转发: 本机:%s (%s) → %s:%s\n' "$listen_port" "$forward_proto" "$target_host" "$target_port"
+    if [[ "$relay_kind" == "ingress" ]]; then
+        printf '客户端连接: 公网入口IP:%s\n' "$listen_port"
+        printf '目标一般为 IX 中转机的 IX 网段 IP:中转端口\n'
+    else
+        printf '上一跳一般为公网入口；目标为落地 IP:端口（落地无需 WG/Mimic）\n'
+    fi
+    printf '无需 mimic / wireguard。执行：wm start %s\n' "$profile_id"
+    printf '详见 docs/transit-topology.md\n'
+}
+
 import_code_interactive() {
     require_root
     ensure_wg_tools
@@ -853,7 +1018,17 @@ health_profile() {
     local status="healthy" wg_iface; wg_iface="$(wg_iface_for "$PROFILE_ID")"
 
     printf '线路: %s (%s)\n' "$PROFILE_ID" "${ROLE:-unknown}"
-    if [[ "${ROLE:-}" == "forwarder" ]]; then
+    if [[ "${ROLE:-}" == "relay" ]]; then
+        printf 'Relay [%s]: listen %s (%s) → %s:%s\n' \
+            "${RELAY_KIND:-relay}" "${RELAY_LISTEN_PORT:-?}" "${FORWARD_PROTO:-both}" \
+            "${RELAY_TARGET_HOST:-?}" "${RELAY_TARGET_PORT:-?}"
+        [[ "$(sysctl -n net.ipv4.ip_forward 2>/dev/null)" == "1" ]] && printf 'IP forward: on\n' || { printf 'IP forward: off\n'; status="degraded"; }
+        [[ "${ENABLED:-true}" == "true" ]] && printf 'Relay: active\n' || { printf 'Relay: disabled\n'; status="degraded"; }
+        printf 'Mimic: N/A (relay 纯转发)\n'
+        printf 'WireGuard: N/A (relay 纯转发)\n'
+        printf 'HEALTH_STATUS=%s\n' "$status"
+        return
+    elif [[ "${ROLE:-}" == "forwarder" ]]; then
         printf '监听: UDP %s → %s:%s\n' "${FORWARDER_LISTEN_PORT:-?}" "${SERVER_PUBLIC_IP:-?}" "${SERVER_WG_PORT:-?}"
     else
         printf 'IP=%s  网卡: %s  端口: %s  MTU: %s\n' "${IP_VERSION:-4}" "$WAN_IFACE" "${WG_PORT:-?}" "${WG_MTU:-?}"
@@ -889,18 +1064,23 @@ diagnose_profile() {
     printf '=== OS compatibility ===\n'
     compat_os_report | while IFS= read -r line; do printf '  %s\n' "$line"; done
     printf '=== preflight ===\n'
-    if [[ "${ROLE:-}" != "forwarder" ]]; then
-        command_exists wg && ok "wireguard-tools" || warn "缺少 wireguard-tools"
-    fi
-    command_exists mimic && ok "mimic CLI" || warn "缺少 mimic"
-    lsmod 2>/dev/null | grep -q '^mimic ' && ok "mimic kernel module" || warn "mimic 内核模块未加载"
-    if kernel_ge_61; then
-        ok "kernel >= 6.1 ($(uname -r))"
+    if [[ "${ROLE:-}" == "relay" ]]; then
+        command_exists nft && ok "nftables" || warn "缺少 nftables"
+        [[ "$(sysctl -n net.ipv4.ip_forward 2>/dev/null)" == "1" ]] && ok "ip_forward" || warn "ip_forward 未开启"
     else
-        warn "kernel < 6.1 ($(uname -r))"
+        if [[ "${ROLE:-}" != "forwarder" ]]; then
+            command_exists wg && ok "wireguard-tools" || warn "缺少 wireguard-tools"
+        fi
+        command_exists mimic && ok "mimic CLI" || warn "缺少 mimic"
+        lsmod 2>/dev/null | grep -q '^mimic ' && ok "mimic kernel module" || warn "mimic 内核模块未加载"
+        if kernel_ge_61; then
+            ok "kernel >= 6.1 ($(uname -r))"
+        else
+            warn "kernel < 6.1 ($(uname -r))"
+        fi
+        [[ -f /sys/kernel/btf/vmlinux ]] && ok "BTF vmlinux" || warn "无 BTF（OpenWrt/精简内核可能需 kprobe 模式编 mimic）"
+        mimic run --check -F "${MIMIC_CONF_DIR}/${WAN_IFACE}.conf" "$WAN_IFACE" 2>&1 | sed 's/^/  /' || warn "mimic --check 失败"
     fi
-    [[ -f /sys/kernel/btf/vmlinux ]] && ok "BTF vmlinux" || warn "无 BTF（OpenWrt/精简内核可能需 kprobe 模式编 mimic）"
-    mimic run --check -F "${MIMIC_CONF_DIR}/${WAN_IFACE}.conf" "$WAN_IFACE" 2>&1 | sed 's/^/  /' || warn "mimic --check 失败"
     health_profile "$id"
 }
 
@@ -1463,6 +1643,7 @@ wg-mimic-fabric ${SCRIPT_VERSION} — WireGuard + Mimic 隧道编排
   wm compat                       操作系统兼容性报告
   wm create-server                创建服务端线路
   wm create-forwarder             创建 Forwarder 旁路（RouterOS 等）
+  wm create-relay                 创建纯转发中继（IX/公网入口→落地）
   wm import-code                  客户端导入配对码
   wm start|stop|restart <ID>      启停线路
   wm list-profiles
@@ -1504,17 +1685,18 @@ show_menu() {
 ║  1) 创建服务端隧道                   ║
 ║  2) 客户端导入配对码                 ║
 ║  3) 创建 Forwarder 旁路              ║
-║  4) 启动线路                         ║
-║  5) 停止线路                         ║
-║  6) 健康检查                         ║
-║  7) 列出线路                         ║
-║  8) 显示配对码                       ║
-║  9) 刷新配对码                       ║
-║ 10) 依赖安装指引 (install-deps)      ║
-║ 11) 系统兼容性 (compat)              ║
-║ 12) 升级脚本                         ║
-║ 13) 卸载 / 完全清理                  ║
-║ 14) 安装 wm CLI                      ║
+║  4) 创建 Relay 中继（IX/入口→落地）  ║
+║  5) 启动线路                         ║
+║  6) 停止线路                         ║
+║  7) 健康检查                         ║
+║  8) 列出线路                         ║
+║  9) 显示配对码                       ║
+║ 10) 刷新配对码                       ║
+║ 11) 依赖安装指引 (install-deps)      ║
+║ 12) 系统兼容性 (compat)              ║
+║ 13) 升级脚本                         ║
+║ 14) 卸载 / 完全清理                  ║
+║ 15) 安装 wm CLI                      ║
 ║  0) 退出                             ║
 ╚══════════════════════════════════════╝
 MENU
@@ -1524,9 +1706,10 @@ MENU
             1) create_server_interactive ;;
             2) import_code_interactive ;;
             3) create_forwarder_interactive ;;
-            4) read -r -p "线路 ID: " id </dev/tty; start_profile "$(sanitize_id "$(trim "$id")")" ;;
-            5) read -r -p "线路 ID: " id </dev/tty; stop_profile "$(sanitize_id "$(trim "$id")")" ;;
-            6)
+            4) create_relay_interactive ;;
+            5) read -r -p "线路 ID: " id </dev/tty; start_profile "$(sanitize_id "$(trim "$id")")" ;;
+            6) read -r -p "线路 ID: " id </dev/tty; stop_profile "$(sanitize_id "$(trim "$id")")" ;;
+            7)
                 if readarray -t _ids < <(list_profile_ids) && [[ "${#_ids[@]}" -eq 1 ]]; then
                     health_profile "${_ids[0]}"
                 else
@@ -1535,14 +1718,14 @@ MENU
                     health_profile "${id:-$(resolve_profile_id "")}"
                 fi
                 ;;
-            7) list_profile_ids | sed 's/^/  /' || printf '  (无线路)\n' ;;
-            8) read -r -p "服务端线路 ID: " id </dev/tty; show_code "$(sanitize_id "$(trim "$id")")" ;;
-            9) read -r -p "服务端线路 ID: " id </dev/tty; refresh_code "$(sanitize_id "$(trim "$id")")" ;;
-            10) install_deps ;;
-            11) compat_os_report ;;
-            12) upgrade_script ;;
-            13) uninstall_from_menu ;;
-            14) install_wm_cli ;;
+            8) list_profile_ids | sed 's/^/  /' || printf '  (无线路)\n' ;;
+            9) read -r -p "服务端线路 ID: " id </dev/tty; show_code "$(sanitize_id "$(trim "$id")")" ;;
+            10) read -r -p "服务端线路 ID: " id </dev/tty; refresh_code "$(sanitize_id "$(trim "$id")")" ;;
+            11) install_deps ;;
+            12) compat_os_report ;;
+            13) upgrade_script ;;
+            14) uninstall_from_menu ;;
+            15) install_wm_cli ;;
             0|q|Q) exit 0 ;;
             *) warn "无效选择" ;;
         esac
@@ -1561,6 +1744,7 @@ main() {
         compat) compat_os_report ;;
         create-server) create_server_interactive ;;
         create-forwarder) create_forwarder_interactive ;;
+        create-relay) create_relay_interactive ;;
         import-code) import_code_interactive ;;
         start) start_profile "$(resolve_profile_id "${2:-}")" ;;
         stop) stop_profile "$(resolve_profile_id "${2:-}")" ;;
