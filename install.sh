@@ -2,7 +2,7 @@
 # wg-mimic-fabric — WireGuard + Mimic tunnel orchestrator (MVP)
 set -Eeuo pipefail
 
-SCRIPT_VERSION="0.6.14"
+SCRIPT_VERSION="0.6.15"
 MIMIC_UPSTREAM_TAG="${MIMIC_UPSTREAM_TAG:-v0.7.0}"
 APP_NAME="wg-mimic-fabric"
 WMF_PROJECT_REPO="${WMF_REPO:-ike-sh/wg-mimic-fabric}"
@@ -1474,7 +1474,13 @@ regenerate_code_if_transit() {
     local code; code="$(generate_code)"
     printf '%s\n' "$code" >"${CODES_DIR}/${PROFILE_ID}.code"
     chmod 600 "${CODES_DIR}/${PROFILE_ID}.code"
-    info "接入码已更新（公网入口需重新 import-code）"
+    warn "规则已变更：公网入口需用新接入码重新 import-code"
+    local _ans=""
+    [[ -e /dev/tty ]] && prompt _ans "现在显示更新后的接入码吗？[Y/n]" "Y"
+    case "$_ans" in
+        [Nn]*) info "稍后可用 wm show-code ${PROFILE_ID} 查看" ;;
+        *) printf '\n═══ 新接入码（复制到公网入口：wm import-code）═══\n%s\n════════════════════════════════════════════\n' "$code" ;;
+    esac
 }
 
 show_port_map() {
@@ -1509,15 +1515,17 @@ list_rules() {
     for rid in $(list_rule_ids "$PROFILE_ID"); do
         (
             load_rule "$PROFILE_ID" "$rid" || exit 0
+            printf '  ── %s ──\n' "$RULE_ID"
+            printf '     备注:     %s\n' "${RULE_NOTE:-}"
+            printf '     启用:     %s\n' "${RULE_ENABLED:-true}"
+            printf '     协议:     %s\n' "${FORWARD_PROTO:-both}"
             if [[ "${ROLE:-}" == "nat-ingress" ]]; then
-                printf '  %s [%s] %s  入口:%s → IX:%s → %s:%s (%s)\n' \
-                    "$RULE_ID" "${RULE_ENABLED:-true}" "${RULE_NOTE:-}" \
-                    "${CLIENT_PORT:-?}" "$TRANSIT_PORT" "$LANDING_HOST" "$LANDING_PORT" "${FORWARD_PROTO:-both}"
+                printf '     客户入口: %s:%s\n' "${INGRESS_PUBLIC_HOST:-公网IP}" "${CLIENT_PORT:-?}"
+                printf '     中转:     IX %s:%s\n' "$WG_IX_IP" "$TRANSIT_PORT"
             else
-                printf '  %s [%s] %s  IX:%s → %s:%s (%s)\n' \
-                    "$RULE_ID" "${RULE_ENABLED:-true}" "${RULE_NOTE:-}" \
-                    "$TRANSIT_PORT" "$LANDING_HOST" "$LANDING_PORT" "${FORWARD_PROTO:-both}"
+                printf '     中转端口: IX %s:%s\n' "$WG_IX_IP" "$TRANSIT_PORT"
             fi
+            printf '     落地:     %s:%s\n' "$LANDING_HOST" "$LANDING_PORT"
         )
     done
 }
