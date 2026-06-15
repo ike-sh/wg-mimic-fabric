@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.6.10] - 2026-06-15
+
+### Fixed
+
+- **配端口池时 `create-transit`/`add-rule` 误报「端口 X 不在端口池内」**（X 明明在池内）：`pool_contains` 用 `expand_port_pool | grep -qxF`，`grep -q` 命中首个端口即退出并关闭管道，左侧 `expand_port_pool` 在 `set -o pipefail` 下收到 SIGPIPE → 整条管道返回非 0 → 误判。属时序竞争（缓冲快的机器不必现，真机慢必现，区间首端口最易触发）。改为**纯 bash 匹配，无管道/无 grep**
+
 ## [0.6.9] - 2026-06-15
 
 ### Fixed

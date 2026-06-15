@@ -2,7 +2,7 @@
 # wg-mimic-fabric — WireGuard + Mimic tunnel orchestrator (MVP)
 set -Eeuo pipefail
 
-SCRIPT_VERSION="0.6.9"
+SCRIPT_VERSION="0.6.10"
 MIMIC_UPSTREAM_TAG="${MIMIC_UPSTREAM_TAG:-v0.7.0}"
 APP_NAME="wg-mimic-fabric"
 WMF_PROJECT_REPO="${WMF_REPO:-ike-sh/wg-mimic-fabric}"
@@ -321,10 +321,16 @@ pool_alloc_port() {
     return 1
 }
 
-# True when PORT belongs to the expanded pool SPEC.
+# True when PORT belongs to the expanded pool SPEC. Pure-bash match (no `grep -q`):
+# under `set -o pipefail`, grep -q exits on the first match and the still-writing
+# expand_port_pool gets SIGPIPE, making the pipeline return non-zero and falsely
+# report "not in pool" (timing-dependent; hits the first port the hardest).
 pool_contains() {
-    local spec="$1" port="$2"
-    expand_port_pool "$spec" | grep -qxF "$port"
+    local spec="$1" port="$2" p
+    for p in $(expand_port_pool "$spec"); do
+        [[ "$p" == "$port" ]] && return 0
+    done
+    return 1
 }
 
 # How many pool ports are left for this profile (echoes total/used/free counts).
