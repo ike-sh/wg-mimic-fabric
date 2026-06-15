@@ -2,7 +2,7 @@
 # wg-mimic-fabric — WireGuard + Mimic tunnel orchestrator (MVP)
 set -Eeuo pipefail
 
-SCRIPT_VERSION="0.6.12"
+SCRIPT_VERSION="0.6.13"
 MIMIC_UPSTREAM_TAG="${MIMIC_UPSTREAM_TAG:-v0.7.0}"
 APP_NAME="wg-mimic-fabric"
 WMF_PROJECT_REPO="${WMF_REPO:-ike-sh/wg-mimic-fabric}"
@@ -2338,15 +2338,29 @@ MENU
             8) read -r -p "IX 线路 ID: " id </dev/tty; refresh_code "$(sanitize_id "$(trim "$id")")" ;;
             9) read -r -p "线路 ID（回车=唯一）: " id </dev/tty; show_port_map "$(trim "$id")" ;;
             10)
-                read -r -p "线路 ID（回车=唯一）: " id </dev/tty; id="$(resolve_profile_id "$(trim "$id")")"
-                list_rules "$id"
-                read -r -p "操作 add/edit/del/pool/skip: " rid </dev/tty
-                case "$(trim "$rid")" in
-                    add) add_rule "$id" ;;
-                    edit) read -r -p "要编辑的规则 ID: " rid </dev/tty; edit_rule "$id" "$(trim "$rid")" ;;
-                    del) read -r -p "要删除的规则 ID: " rid </dev/tty; delete_rule "$id" "$(trim "$rid")" ;;
-                    pool) read -r -p "端口池(如 18300-18399；留空=清除): " rid </dev/tty; set_transit_pool "$id" "$(trim "$rid")" ;;
-                esac
+                local _lines _n _l
+                _lines="$(list_profile_ids)"
+                if [[ -z "$_lines" ]]; then
+                    warn "暂无线路，请先用 1)IX 创建 或 2)入口导入"
+                else
+                    printf '\n现有线路与规则：\n'
+                    while IFS= read -r _l; do [[ -n "$_l" ]] && list_rules "$_l"; done <<<"$_lines"
+                    _n="$(grep -c . <<<"$_lines")"
+                    if [[ "$_n" -eq 1 ]]; then
+                        id="$(trim "$_lines")"; printf '（仅一条线路，已自动选中 %s）\n' "$id"
+                    else
+                        read -r -p "选择线路 ID: " id </dev/tty; id="$(sanitize_id "$(trim "$id")")"
+                    fi
+                    if [[ -n "$id" ]]; then
+                        read -r -p "操作 add/edit/del/pool/skip: " rid </dev/tty
+                        case "$(trim "$rid")" in
+                            add) add_rule "$id" ;;
+                            edit) read -r -p "要编辑的规则 ID: " rid </dev/tty; edit_rule "$id" "$(trim "$rid")" ;;
+                            del) read -r -p "要删除的规则 ID: " rid </dev/tty; delete_rule "$id" "$(trim "$rid")" ;;
+                            pool) read -r -p "端口池(如 18300-18399；留空=清除): " rid </dev/tty; set_transit_pool "$id" "$(trim "$rid")" ;;
+                        esac
+                    fi
+                fi
                 ;;
             11) upgrade_script ;;
             12) uninstall_from_menu ;;
