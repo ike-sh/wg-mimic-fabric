@@ -2,7 +2,7 @@
 # wg-mimic-fabric — WireGuard + Mimic tunnel orchestrator (MVP)
 set -Eeuo pipefail
 
-SCRIPT_VERSION="1.1.0-beta.11"
+SCRIPT_VERSION="1.1.0-beta.12"
 MIMIC_UPSTREAM_TAG="${MIMIC_UPSTREAM_TAG:-v0.7.0}"
 APP_NAME="wg-mimic-fabric"
 WMF_PROJECT_REPO="${WMF_REPO:-ike-sh/wg-mimic-fabric}"
@@ -203,25 +203,85 @@ menu_pick_profile() {
         return 1
     fi
     printf '现有线路：\n' >&2
+    local _i=1
     for id in "${ids[@]}"; do
         path="$(profile_env_path "$id")"
         role="$(grep -m1 '^ROLE=' "$path" 2>/dev/null | cut -d= -f2- | tr -d '"' || true)"
-        printf '  - %s%s\n' "$id" "${role:+  [$role]}" >&2
+        printf '  %d) %s%s\n' "$_i" "$id" "${role:+  [$role]}" >&2
+        _i=$((_i + 1))
     done
     if [[ "${#ids[@]}" -eq 1 ]]; then
         printf '（仅一条线路，已自动选中 %s）\n' "${ids[0]}" >&2
         printf '%s' "${ids[0]}"
         return 0
     fi
-    read -r -p "选择线路 ID（回车取消）: " sel </dev/tty
+    read -r -p "选择编号或线路 ID（回车取消）: " sel </dev/tty
     sel="$(trim "$sel")"
     [[ -n "$sel" ]] || { warn "已取消"; return 1; }
+    if [[ "$sel" =~ ^[0-9]+$ ]] && (( 10#$sel >= 1 && 10#$sel <= ${#ids[@]} )); then
+        printf '%s' "${ids[$((10#$sel - 1))]}"
+        return 0
+    fi
     sel="$(sanitize_id "$sel" 2>/dev/null)" || { warn "无效的线路 ID"; return 1; }
     for id in "${ids[@]}"; do
         [[ "$id" == "$sel" ]] && { printf '%s' "$sel"; return 0; }
     done
     warn "线路不存在：$sel"
     return 1
+}
+
+# 按编号/ID 选择某线路下的一条规则（列表打到 stderr，选中 id 打到 stdout）。
+menu_pick_rule() {
+    local pid="$1" rids=() rid sel note path _i=1
+    while IFS= read -r rid; do [[ -n "$rid" ]] && rids+=("$rid"); done \
+        < <(list_rule_ids "$pid" 2>/dev/null || true)
+    if [[ "${#rids[@]}" -eq 0 ]]; then warn "该线路暂无规则（先用 新增规则）"; return 1; fi
+    printf '现有规则：\n' >&2
+    for rid in "${rids[@]}"; do
+        note=""; path="$(rule_env_path "$pid" "$rid")"
+        [[ -f "$path" ]] && note="$(grep -m1 '^RULE_NOTE=' "$path" 2>/dev/null | cut -d= -f2- | tr -d '"' || true)"
+        printf '  %d) %s%s\n' "$_i" "$rid" "${note:+  （$note）}" >&2
+        _i=$((_i + 1))
+    done
+    if [[ "${#rids[@]}" -eq 1 ]]; then
+        printf '（仅一条规则，已自动选中 %s）\n' "${rids[0]}" >&2
+        printf '%s' "${rids[0]}"; return 0
+    fi
+    read -r -p "选择编号或规则 ID（回车取消）: " sel </dev/tty
+    sel="$(trim "$sel")"
+    [[ -n "$sel" ]] || { warn "已取消"; return 1; }
+    if [[ "$sel" =~ ^[0-9]+$ ]] && (( 10#$sel >= 1 && 10#$sel <= ${#rids[@]} )); then
+        printf '%s' "${rids[$((10#$sel - 1))]}"; return 0
+    fi
+    for rid in "${rids[@]}"; do [[ "$rid" == "$sel" ]] && { printf '%s' "$sel"; return 0; }; done
+    warn "规则不存在：$sel"; return 1
+}
+
+# 按编号/名称选择某网关下的一个客户端。
+menu_pick_client() {
+    local pid="$1" cids=() cid sel ip path _i=1
+    while IFS= read -r cid; do [[ -n "$cid" ]] && cids+=("$cid"); done \
+        < <(list_client_ids "$pid" 2>/dev/null || true)
+    if [[ "${#cids[@]}" -eq 0 ]]; then warn "该网关暂无客户端（先用 新增客户端）"; return 1; fi
+    printf '现有客户端：\n' >&2
+    for cid in "${cids[@]}"; do
+        ip=""; path="$(client_env_path "$pid" "$cid")"
+        [[ -f "$path" ]] && ip="$(grep -m1 '^CLIENT_IP=' "$path" 2>/dev/null | cut -d= -f2- | tr -d '"' || true)"
+        printf '  %d) %s%s\n' "$_i" "$cid" "${ip:+  $ip}" >&2
+        _i=$((_i + 1))
+    done
+    if [[ "${#cids[@]}" -eq 1 ]]; then
+        printf '（仅一个客户端，已自动选中 %s）\n' "${cids[0]}" >&2
+        printf '%s' "${cids[0]}"; return 0
+    fi
+    read -r -p "选择编号或客户端名（回车取消）: " sel </dev/tty
+    sel="$(trim "$sel")"
+    [[ -n "$sel" ]] || { warn "已取消"; return 1; }
+    if [[ "$sel" =~ ^[0-9]+$ ]] && (( 10#$sel >= 1 && 10#$sel <= ${#cids[@]} )); then
+        printf '%s' "${cids[$((10#$sel - 1))]}"; return 0
+    fi
+    for cid in "${cids[@]}"; do [[ "$cid" == "$sel" ]] && { printf '%s' "$sel"; return 0; }; done
+    warn "客户端不存在：$sel"; return 1
 }
 
 # ── JSON / pairing code (python3) ──────────────────────────────────────────
@@ -3440,20 +3500,14 @@ MENU
             8) if id="$(menu_pick_profile)"; then refresh_code "$id"; fi ;;
             9) if id="$(menu_pick_profile)"; then show_port_map "$id"; fi ;;
             10)
-                local _lines _n _l
+                local _lines _l
                 _lines="$(list_profile_ids)"
                 if [[ -z "$_lines" ]]; then
                     warn "暂无线路，请先用 1)IX 创建 或 2)入口导入"
                 else
                     printf '\n现有线路与规则：\n'
                     while IFS= read -r _l; do [[ -n "$_l" ]] && list_rules "$_l"; done <<<"$_lines"
-                    _n="$(grep -c . <<<"$_lines")"
-                    if [[ "$_n" -eq 1 ]]; then
-                        id="$(trim "$_lines")"; printf '（仅一条线路，已自动选中 %s）\n' "$id"
-                    else
-                        read -r -p "选择线路 ID: " id </dev/tty; id="$(sanitize_id "$(trim "$id")")"
-                    fi
-                    if [[ -n "$id" ]]; then
+                    if id="$(menu_pick_profile)"; then
                         printf '  操作:\n'
                         printf '    1) 新增规则\n'
                         printf '    2) 编辑规则\n'
@@ -3463,8 +3517,8 @@ MENU
                         read -r -p "选择操作: " rid </dev/tty
                         case "$(trim "$rid")" in
                             1|add) add_rule "$id" ;;
-                            2|edit) read -r -p "要编辑的规则 ID: " rid </dev/tty; edit_rule "$id" "$(trim "$rid")" ;;
-                            3|del) read -r -p "要删除的规则 ID: " rid </dev/tty; delete_rule "$id" "$(trim "$rid")" ;;
+                            2|edit) if rid="$(menu_pick_rule "$id")"; then edit_rule "$id" "$rid"; fi ;;
+                            3|del) if rid="$(menu_pick_rule "$id")"; then delete_rule "$id" "$rid"; fi ;;
                             4|pool) read -r -p "端口池(如 18300-18399；留空=清除): " rid </dev/tty; set_transit_pool "$id" "$(trim "$rid")" ;;
                             *) : ;;
                         esac
@@ -3484,7 +3538,7 @@ MENU
                     case "$(trim "$rid")" in
                         1) read -r -p "客户端名: " rid </dev/tty; add_client "$id" "$(trim "$rid")" ;;
                         2) list_clients "$id" ;;
-                        3) read -r -p "要删除的客户端名: " rid </dev/tty; del_client "$id" "$(trim "$rid")" ;;
+                        3) if rid="$(menu_pick_client "$id")"; then del_client "$id" "$rid"; fi ;;
                         *) : ;;
                     esac
                 fi
