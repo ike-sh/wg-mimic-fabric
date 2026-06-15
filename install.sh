@@ -2,7 +2,7 @@
 # wg-mimic-fabric — WireGuard + Mimic tunnel orchestrator (MVP)
 set -Eeuo pipefail
 
-SCRIPT_VERSION="0.6.0"
+SCRIPT_VERSION="0.6.1"
 MIMIC_UPSTREAM_TAG="${MIMIC_UPSTREAM_TAG:-v0.7.0}"
 APP_NAME="wg-mimic-fabric"
 WMF_PROJECT_REPO="${WMF_REPO:-ike-sh/wg-mimic-fabric}"
@@ -181,11 +181,11 @@ validate_port() {
 
 prompt_port() {
     local var="$1" text="$2" default="${3:-}"
-    local val
+    local _pval=""
     while true; do
-        prompt val "$text" "$default"
-        if validate_port "$val"; then
-            printf -v "$var" '%s' "$val"
+        prompt _pval "$text" "$default"
+        if validate_port "$_pval"; then
+            printf -v "$var" '%s' "$_pval"
             return 0
         fi
         warn "端口必须是 1–65535 的数字"
@@ -1005,14 +1005,14 @@ stop_profile() {
 
 prompt() {
     local var="$1" prompt_text="$2" default="${3:-}"
-    local val
+    local __prompt_val=""
     if [[ -n "$default" ]]; then
-        read -r -p "${prompt_text} [${default}]: " val </dev/tty
-        val="${val:-$default}"
+        read -r -p "${prompt_text} [${default}]: " __prompt_val </dev/tty || true
+        __prompt_val="${__prompt_val:-$default}"
     else
-        read -r -p "${prompt_text}: " val </dev/tty
+        read -r -p "${prompt_text}: " __prompt_val </dev/tty || true
     fi
-    printf -v "$var" '%s' "$(trim "$val")"
+    printf -v "$var" '%s' "$(trim "$__prompt_val")"
 }
 
 create_transit_interactive() {

@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.6.1] - 2026-06-15
+
+### Fixed
+
+- `create-transit` / `import-code` 交互按回车取默认值时报 `val: unbound variable`：`prompt` 与 `prompt_port` 因内部 `local val` 同名，`printf -v` 跨函数回写错位，`set -u` 下调用方变量未绑定。重命名内部变量（`__prompt_val` / `_pval`）修复；并对 `read </dev/tty` 失败兜底默认值。
+
 ## [0.6.0] - 2026-06-15
 
 ### Changed（Breaking — 重构）
