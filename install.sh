@@ -2378,6 +2378,7 @@ measure_tunnel_loss() {
 # wm test [ID] [count] — measure real tunnel packet loss + rtt, with a verdict.
 test_profile() {
     local id count; id="$(resolve_profile_id "${1:-}")"; count="${2:-100}"
+    [[ "$count" =~ ^[1-9][0-9]*$ ]] || count=100
     load_profile "$id"
     local target; target="$(peer_mesh_ip)"
     [[ -n "$target" ]] || die "线路 ${PROFILE_ID} 无对端虚拟IP，无法测试"
