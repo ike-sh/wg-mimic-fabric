@@ -2,7 +2,7 @@
 # wg-mimic-fabric — WireGuard + Mimic tunnel orchestrator (MVP)
 set -Eeuo pipefail
 
-SCRIPT_VERSION="0.6.4"
+SCRIPT_VERSION="0.6.5"
 MIMIC_UPSTREAM_TAG="${MIMIC_UPSTREAM_TAG:-v0.7.0}"
 APP_NAME="wg-mimic-fabric"
 WMF_PROJECT_REPO="${WMF_REPO:-ike-sh/wg-mimic-fabric}"
@@ -509,6 +509,15 @@ offer_reboot() {
 
 detect_default_iface() {
     ip -4 route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}'
+}
+
+# First global IPv4 bound to the default interface — the inbound/bindable IP,
+# which (unlike curl's egress IP) is what Mimic must bind and clients reach.
+detect_local_ipv4() {
+    local iface; iface="$(detect_default_iface)"
+    [[ -n "$iface" ]] || return 0
+    ip -4 addr show dev "$iface" scope global 2>/dev/null \
+        | awk '/inet /{print $2}' | cut -d/ -f1 | head -1
 }
 
 # Resolve a host to an IP. Literal IPv4/IPv6 pass through unchanged; hostnames
@@ -1181,11 +1190,14 @@ create_transit_interactive() {
     profile_id="$(sanitize_id "$profile_id")"
     [[ ! -f "$(profile_env_path "$profile_id")" ]] || die "线路已存在：$profile_id"
 
-    ix_public_ip="$(detect_public_ipv4)"
-    [[ -n "$ix_public_ip" ]] && info "检测到本机公网 IPv4：${ix_public_ip}"
-    prompt endpoint_host "公网入口可达的 IX 地址（域名或IP）" "${ix_public_ip:-}"
+    local egress_ip local_ip
+    local_ip="$(detect_local_ipv4)"
+    egress_ip="$(detect_public_ipv4)"
+    [[ -n "$local_ip" ]]  && info "本机网卡 IPv4：${local_ip}（入口可达地址/Mimic 绑定一般用这个）"
+    [[ -n "$egress_ip" ]] && info "出口 IPv4：${egress_ip}（curl 探测的出网IP，通常≠入口IP，仅参考）"
+    prompt endpoint_host "公网入口可达的 IX 地址（域名或IP）" "${local_ip:-$egress_ip}"
     [[ -n "$endpoint_host" ]] || die "IX 可达地址不能为空"
-    prompt ix_public_ip "IX 本机公网 IP（Mimic local 绑定）" "${ix_public_ip:-$endpoint_host}"
+    prompt ix_public_ip "IX 本机公网 IP（Mimic local 绑定）" "${local_ip:-$endpoint_host}"
     prompt_port wg_port "WireGuard 监听端口（Mimic 伪 TCP 绑定）" "51820"
     prompt wg_mtu "WG 隧道 MTU" "1420"
     validate_mtu "$wg_mtu"
@@ -1304,8 +1316,12 @@ import_code_interactive() {
     ing_priv="$(printf '%s' "$CODE_INGRESS_PRIVKEY_B64" | base64url_decode)"
     ing_pub="$(wg_pubkey_of "$ing_priv")"
 
-    public_ip="$(detect_public_ipv4)"
-    [[ -n "$public_ip" ]] || prompt public_ip "公网 IPv4（客户端连接地址）"
+    local egress_ip local_ip
+    local_ip="$(detect_local_ipv4)"
+    egress_ip="$(detect_public_ipv4)"
+    [[ -n "$local_ip" ]]  && info "本机网卡 IPv4：${local_ip}（客户端连接地址一般用这个）"
+    [[ -n "$egress_ip" ]] && info "出口 IPv4：${egress_ip}（curl 探测的出网IP，通常≠入口IP，仅参考）"
+    prompt public_ip "公网 IPv4（客户端连接地址）" "${local_ip:-$egress_ip}"
     wan_iface="$(detect_default_iface)"
     prompt wan_iface "Mimic 绑定网卡" "${wan_iface:-eth0}"
 

@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.6.5] - 2026-06-15
+
+### Fixed
+
+- `create-transit` / `import-code` 的公网 IP 默认值改用**本机网卡全局 IPv4**（新增 `detect_local_ipv4`，即 Mimic 可绑定、客户端可达的入口 IP），不再默认 `curl` 探测的**出网 IP**——多 IP / NAT 机器上出口 IP ≠ 入口 IP，旧默认常需手动改正；curl 出口 IP 降级为参考提示
+
 ## [0.6.4] - 2026-06-15
 
 ### Fixed
