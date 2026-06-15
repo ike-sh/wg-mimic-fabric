@@ -11,8 +11,11 @@ modprobe mimic
 ## 安装
 
 ```bash
-# 本地开发
-sudo bash install.sh install-wm-cli
+# 本地开发（自动装 mimic，Debian/Ubuntu）
+sudo bash install.sh install-all
+
+# 仅装 wm，不装 mimic
+WMF_SKIP_MIMIC=1 sudo bash install.sh install-wm-cli
 
 # 一行安装（需推送到 GitHub 后）
 curl -fsSL https://raw.githubusercontent.com/ike-sh/wg-mimic-fabric/main/scripts/bootstrap.sh | sudo bash

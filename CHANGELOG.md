@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.3.1] - 2026-06-15
+
+### Added
+
+- **默认自动安装 mimic**：`bootstrap` / `install-all` / `install-wm-cli` 在 Debian/Ubuntu 上 `apt install mimic mimic-dkms`
+- `wm install-mimic`、`wm install-all` 命令
+- `WMF_SKIP_MIMIC=1` 跳过 mimic 自动安装
+
 ## [0.3.0] - 2026-06-15
 
 ### Added

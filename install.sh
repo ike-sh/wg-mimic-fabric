@@ -2,7 +2,7 @@
 # wg-mimic-fabric — WireGuard + Mimic tunnel orchestrator (MVP)
 set -Eeuo pipefail
 
-SCRIPT_VERSION="0.3.0"
+SCRIPT_VERSION="0.3.1"
 APP_NAME="wg-mimic-fabric"
 WMF_PROJECT_REPO="${WMF_REPO:-ike-sh/wg-mimic-fabric}"
 
@@ -1037,6 +1037,58 @@ stop_mimic_services() {
     done
 }
 
+install_mimic_packages() {
+    require_root
+    local id; id="$(detect_os_id)"
+    if command_exists mimic; then
+        ok "mimic 已安装：$(mimic --version 2>/dev/null || command -v mimic)"
+        modprobe mimic 2>/dev/null || warn "mimic 内核模块未加载，请确认 mimic-dkms"
+        return 0
+    fi
+    info "安装 mimic 及依赖（OS: ${id}）..."
+    case "$id" in
+        debian|ubuntu)
+            command_exists apt-get || die "需要 apt-get"
+            apt-get update -qq || warn "apt update 失败，继续尝试安装..."
+            if apt-cache show mimic &>/dev/null; then
+                DEBIAN_FRONTEND=noninteractive apt-get install -y \
+                    wireguard-tools python3 nftables mimic mimic-dkms \
+                    || die "apt 安装 mimic 失败"
+            else
+                warn "当前 apt 源无 mimic 包"
+                cat <<'EOF' >&2
+  Debian 13 / Ubuntu 24.04+：确认已启用官方源后重试
+  Debian 12：从 GitHub 安装 .deb
+    https://github.com/hack3ric/mimic/releases
+    apt install ./bookworm_mimic_*_amd64.deb ./bookworm_mimic-dkms_*_amd64.deb
+EOF
+                die "无法通过 apt 自动安装 mimic"
+            fi
+            ;;
+        arch)
+            die "Arch 请手动安装：yay -S mimic-bpf mimic-bpf-dkms wireguard-tools"
+            ;;
+        *)
+            install_deps
+            die "当前 OS 无自动安装 mimic，请按上方指引手动安装"
+            ;;
+    esac
+    modprobe mimic 2>/dev/null || warn "modprobe mimic 失败，请检查 mimic-dkms"
+    command_exists wg || warn "wireguard-tools 未就绪"
+    ok "mimic 及依赖安装完成"
+}
+
+install_all() {
+    require_root
+    install_wm_cli
+    if [[ "${WMF_SKIP_MIMIC:-}" != "1" ]]; then
+        install_mimic_packages || warn "mimic 自动安装未成功，可稍后 wm install-mimic"
+    else
+        info "已跳过 mimic 安装（WMF_SKIP_MIMIC=1）"
+    fi
+    ok "install-all 完成"
+}
+
 uninstall_mimic_packages() {
     local id; id="$(detect_os_id)"
     info "卸载 mimic 相关组件..."
@@ -1193,6 +1245,9 @@ WRAP
     chmod 755 "$WM_BIN"
     install_systemd_units
     ok "已安装 wm 命令：$WM_BIN"
+    if [[ "${WMF_AUTO_MIMIC:-1}" == "1" && "${WMF_SKIP_MIMIC:-}" != "1" ]]; then
+        install_mimic_packages 2>/dev/null || warn "mimic 未自动装上，请运行：wm install-mimic"
+    fi
 }
 
 usage() {
@@ -1202,8 +1257,10 @@ wg-mimic-fabric ${SCRIPT_VERSION} — WireGuard + Mimic 隧道编排
 用法:
   wm                              交互菜单
   wm --version
-  wm install-wm-cli               安装 wm 到 /usr/local/bin
-  wm install-deps                 按发行版打印依赖安装指引
+  wm install-wm-cli               安装 wm（默认同时 apt 装 mimic）
+  wm install-mimic                安装 mimic + wireguard-tools 等依赖
+  wm install-all                  安装 wm + mimic（等同 bootstrap）
+  wm install-deps                 仅打印依赖指引（不安装）
   wm compat                       操作系统兼容性报告
   wm create-server                创建服务端线路
   wm create-forwarder             创建 Forwarder 旁路（RouterOS 等）
@@ -1229,6 +1286,8 @@ wg-mimic-fabric ${SCRIPT_VERSION} — WireGuard + Mimic 隧道编排
   WMF_UPGRADE_YES=1               升级跳过确认
   WMF_PURGE_YES=1                 purge 跳过确认
   WMF_UNINSTALL_YES=1             uninstall 跳过确认
+  WMF_SKIP_MIMIC=1                跳过 mimic 自动安装
+  WMF_AUTO_MIMIC=0                install-wm-cli 时不自动装 mimic
   WMF_PURGE_NO_MIMIC=1            purge 时保留 mimic 系统包
   WMF_GITHUB_MIRRORS=url,...      GitHub 下载镜像
 EOF
@@ -1297,6 +1356,8 @@ main() {
         --version|-V) printf 'wg-mimic-fabric %s\n' "$SCRIPT_VERSION"; exit 0 ;;
         --help|-h|help) usage; exit 0 ;;
         install-wm-cli) install_wm_cli ;;
+        install-mimic) install_mimic_packages ;;
+        install-all) install_all ;;
         install-deps) install_deps ;;
         compat) compat_os_report ;;
         create-server) create_server_interactive ;;

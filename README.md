@@ -1,6 +1,6 @@
 # wg-mimic-fabric
 
-**当前版本**：[`v0.3.0`](https://github.com/ike-sh/wg-mimic-fabric/releases/tag/v0.3.0)  
+**当前版本**：[`v0.3.1`](https://github.com/ike-sh/wg-mimic-fabric/releases/tag/v0.3.1)  
 **仓库**：https://github.com/ike-sh/wg-mimic-fabric  
 **定位**：WireGuard + [Mimic](https://github.com/hack3ric/mimic) 伪 TCP 隧道编排器，对标 [ix-transit-fabric](https://github.com/ike-sh/ix-transit-fabric) 的运维体验。
 
@@ -27,8 +27,11 @@
 - `systemd`
 
 ```bash
-apt install wireguard-tools mimic mimic-dkms python3
-modprobe mimic
+# Debian / Ubuntu — bootstrap 会自动 apt 安装 mimic + mimic-dkms + wireguard-tools
+curl -fsSL https://raw.githubusercontent.com/ike-sh/wg-mimic-fabric/main/scripts/bootstrap.sh | sudo bash
+
+# 跳过 mimic 自动安装
+WMF_SKIP_MIMIC=1 curl -fsSL .../bootstrap.sh | sudo bash
 ```
 
 ---
@@ -40,7 +43,7 @@ modprobe mimic
 ```bash
 git clone https://github.com/ike-sh/wg-mimic-fabric.git
 cd wg-mimic-fabric
-sudo bash install.sh install-wm-cli
+sudo bash install.sh install-all
 wm
 ```
 
