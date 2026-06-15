@@ -2,7 +2,7 @@
 # wg-mimic-fabric — WireGuard + Mimic tunnel orchestrator (MVP)
 set -Eeuo pipefail
 
-SCRIPT_VERSION="1.1.0-beta.15"
+SCRIPT_VERSION="1.1.0-beta.16"
 MIMIC_UPSTREAM_TAG="${MIMIC_UPSTREAM_TAG:-v0.7.0}"
 APP_NAME="wg-mimic-fabric"
 WMF_PROJECT_REPO="${WMF_REPO:-ike-sh/wg-mimic-fabric}"
@@ -1892,6 +1892,13 @@ PersistentKeepalive = 25
 EOF
 }
 
+# 确保 qrencode 可用（客户端配置出二维码用），按需 apt 安装；装不上则回退到文本配置。
+ensure_qrencode() {
+    command_exists qrencode && return 0
+    command_exists apt-get && DEBIAN_FRONTEND=noninteractive apt-get install -y qrencode >/dev/null 2>&1
+    command_exists qrencode
+}
+
 add_client() {
     local id name; id="$(resolve_profile_id "${1:-}")"; name="$(sanitize_id "${2:-}")"
     require_root
@@ -1915,10 +1922,11 @@ add_client() {
     local conf; conf="$(render_client_conf "$priv" "$ip" "$WG_PUBLIC_KEY" \
         "$(format_mimic_ip "$A_PUBLIC_HOST"):${CLIENT_WG_PORT}" "${CLIENT_DNS:-1.1.1.1}" "${CLIENT_MTU:-1280}")"
     printf '\n═══ 客户端 %s 配置（导入 官方WG/小火箭/mihomo/sing-box）═══\n%s\n' "$name" "$conf"
+    ensure_qrencode
     if command_exists qrencode; then
         printf '\n── 二维码（WG App 扫码导入）──\n'; printf '%s' "$conf" | qrencode -t ANSIUTF8
     else
-        info "装 qrencode 可出二维码：apt install qrencode"
+        warn "无法自动安装 qrencode（非 apt 环境？）→ 直接复制上面的配置文本导入，或手动 apt install qrencode 后重新添加"
     fi
     ok "已新增客户端 ${name}（${ip}）"
 }

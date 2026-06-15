@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.1.0-beta.16] - 2026-06-16
+
+### Changed（新增客户端默认出二维码：自动安装 qrencode）
+
+- **`add-client` 自动安装 qrencode**：此前新增客户端只在「已装 qrencode」时出终端二维码，否则仅提示 `apt install qrencode`，用户得手动装好再重新添加。现新增 `ensure_qrencode`，按需 `apt-get install -y qrencode`，**默认即出扫码二维码**；非 apt 环境装不上时回退提示「直接复制配置文本导入」。
+- 验证：`bash -n` 通过；`smoke nopy` 全 10 项通过。
+
 ## [1.1.0-beta.15] - 2026-06-16
 
 ### Fixed（relay 全局出口漏配对端 mesh 路由 → `wm test` / A↔B mesh ping 100% 丢包；真机定位）
