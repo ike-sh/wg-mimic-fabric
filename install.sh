@@ -2,7 +2,7 @@
 # wg-mimic-fabric — WireGuard + Mimic tunnel orchestrator (MVP)
 set -Eeuo pipefail
 
-SCRIPT_VERSION="0.6.16"
+SCRIPT_VERSION="0.6.17"
 MIMIC_UPSTREAM_TAG="${MIMIC_UPSTREAM_TAG:-v0.7.0}"
 APP_NAME="wg-mimic-fabric"
 WMF_PROJECT_REPO="${WMF_REPO:-ike-sh/wg-mimic-fabric}"
@@ -165,6 +165,41 @@ resolve_profile_id() {
     fi
     [[ "${#ids[@]}" -eq 1 ]] && printf '%s' "${ids[0]}" && return
     die "请指定线路 ID（wm list-profiles 查看）"
+}
+
+# Interactive picker: print existing lines, resolve to ONE id on stdout.
+# Listing/prompts go to stderr so callers can capture the id via $(...).
+# Returns non-zero (empty stdout) when there are no lines or the user cancels,
+# so menu actions skip gracefully instead of aborting the whole script with
+# "无效的 PROFILE_ID".
+menu_pick_profile() {
+    local ids=() id role path sel
+    while IFS= read -r id; do [[ -n "$id" ]] && ids+=("$id"); done \
+        < <(list_profile_ids 2>/dev/null || true)
+    if [[ "${#ids[@]}" -eq 0 ]]; then
+        warn "暂无线路，请先用 1)IX 创建组网线路 或 2)公网入口导入接入码"
+        return 1
+    fi
+    printf '现有线路：\n' >&2
+    for id in "${ids[@]}"; do
+        path="$(profile_env_path "$id")"
+        role="$(grep -m1 '^ROLE=' "$path" 2>/dev/null | cut -d= -f2- | tr -d '"' || true)"
+        printf '  - %s%s\n' "$id" "${role:+  [$role]}" >&2
+    done
+    if [[ "${#ids[@]}" -eq 1 ]]; then
+        printf '（仅一条线路，已自动选中 %s）\n' "${ids[0]}" >&2
+        printf '%s' "${ids[0]}"
+        return 0
+    fi
+    read -r -p "选择线路 ID（回车取消）: " sel </dev/tty
+    sel="$(trim "$sel")"
+    [[ -n "$sel" ]] || { warn "已取消"; return 1; }
+    sel="$(sanitize_id "$sel" 2>/dev/null)" || { warn "无效的线路 ID"; return 1; }
+    for id in "${ids[@]}"; do
+        [[ "$id" == "$sel" ]] && { printf '%s' "$sel"; return 0; }
+    done
+    warn "线路不存在：$sel"
+    return 1
 }
 
 # ── JSON / pairing code (python3) ──────────────────────────────────────────
@@ -2376,13 +2411,13 @@ MENU
         case "$(trim "$choice")" in
             1) create_transit_interactive ;;
             2) import_code_interactive ;;
-            3) read -r -p "线路 ID（回车=唯一）: " id </dev/tty; start_profile "$(resolve_profile_id "$(trim "$id")")" ;;
-            4) read -r -p "线路 ID（回车=唯一）: " id </dev/tty; stop_profile "$(resolve_profile_id "$(trim "$id")")" ;;
-            5) read -r -p "线路 ID（回车=唯一）: " id </dev/tty; health_profile "$(trim "$id")" ;;
+            3) if id="$(menu_pick_profile)"; then start_profile "$id"; fi ;;
+            4) if id="$(menu_pick_profile)"; then stop_profile "$id"; fi ;;
+            5) if id="$(menu_pick_profile)"; then health_profile "$id"; fi ;;
             6) list_profile_ids | sed 's/^/  /' || printf '  (无线路)\n' ;;
-            7) read -r -p "IX 线路 ID: " id </dev/tty; show_code "$(sanitize_id "$(trim "$id")")" ;;
-            8) read -r -p "IX 线路 ID: " id </dev/tty; refresh_code "$(sanitize_id "$(trim "$id")")" ;;
-            9) read -r -p "线路 ID（回车=唯一）: " id </dev/tty; show_port_map "$(trim "$id")" ;;
+            7) if id="$(menu_pick_profile)"; then show_code "$id"; fi ;;
+            8) if id="$(menu_pick_profile)"; then refresh_code "$id"; fi ;;
+            9) if id="$(menu_pick_profile)"; then show_port_map "$id"; fi ;;
             10)
                 local _lines _n _l
                 _lines="$(list_profile_ids)"
