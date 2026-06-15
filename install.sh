@@ -2,7 +2,7 @@
 # wg-mimic-fabric — WireGuard + Mimic tunnel orchestrator (MVP)
 set -Eeuo pipefail
 
-SCRIPT_VERSION="0.6.15"
+SCRIPT_VERSION="0.6.16"
 MIMIC_UPSTREAM_TAG="${MIMIC_UPSTREAM_TAG:-v0.7.0}"
 APP_NAME="wg-mimic-fabric"
 WMF_PROJECT_REPO="${WMF_REPO:-ike-sh/wg-mimic-fabric}"
@@ -1388,13 +1388,29 @@ import_code_interactive() {
     ensure_mimic_kmod_loaded || warn "mimic 内核模块未加载，请 reboot 或安装 linux-headers-\$(uname -r)"
 
     local code ingress_id wan_iface public_ip ing_priv ing_pub
+    local updating=0 prev_host="" prev_iface=""
     printf '请粘贴 WMGF1: IX 接入码：' >&2
     read -r code </dev/tty
     code="$(trim "$code")"
     parse_code "$code"
 
     ingress_id="${CODE_PROFILE_ID}-ingress"
-    [[ ! -f "$(profile_env_path "$ingress_id")" ]] || die "入口线路已存在：$ingress_id（可先 wm stop 后删除）"
+    if [[ -f "$(profile_env_path "$ingress_id")" ]]; then
+        # 入口线路已存在（IX 改/增规则后重导接入码）→ 更新而非报错
+        local _upd="Y"
+        prompt _upd "入口线路 ${ingress_id} 已存在，用此接入码更新它吗？[Y/n]" "Y"
+        case "$_upd" in
+            [Nn]*) die "已取消（如需彻底重建：wm stop ${ingress_id} 后删除其 profile 再重导）" ;;
+        esac
+        updating=1
+        # 保留本机已配置的公网IP/网卡作默认值
+        local _pv
+        _pv="$(load_profile "$ingress_id" 2>/dev/null; printf '%s\t%s' "${INGRESS_PUBLIC_HOST:-}" "${WAN_IFACE:-}")" || _pv=""
+        prev_host="${_pv%%$'\t'*}"
+        prev_iface="${_pv#*$'\t'}"
+        info "更新模式：停止旧线路 → 同步新接入码的规则集（保留各规则已选客户端入口端口）"
+        stop_profile "$ingress_id" >/dev/null 2>&1 || true
+    fi
 
     ing_priv="$(printf '%s' "$CODE_INGRESS_PRIVKEY_B64" | base64url_decode)"
     ing_pub="$(wg_pubkey_of "$ing_priv")"
@@ -1404,9 +1420,9 @@ import_code_interactive() {
     local_ip="$(detect_local_ipv4)"
     [[ -n "$egress_ip" ]] && info "出网 IPv4（curl 探测）：${egress_ip}"
     [[ -n "$local_ip" ]]  && info "本机网卡 IPv4：${local_ip}（NAT 机器此为内网IP）"
-    prompt public_ip "公网 IPv4（客户端连接本入口的地址）" "${egress_ip:-$local_ip}"
+    prompt public_ip "公网 IPv4（客户端连接本入口的地址）" "${prev_host:-${egress_ip:-$local_ip}}"
     wan_iface="$(detect_default_iface)"
-    prompt wan_iface "Mimic 绑定网卡" "${wan_iface:-eth0}"
+    prompt wan_iface "Mimic 绑定网卡" "${prev_iface:-${wan_iface:-eth0}}"
 
     printf '\n── 接入码摘要 ──\n'
     printf '  IX 端点: %s:%s\n' "$CODE_IX_ENDPOINT_HOST" "$CODE_WG_PORT"
@@ -1437,11 +1453,33 @@ import_code_interactive() {
         "MIMIC_XDP_MODE=native" \
         "FW_OPEN_PORT=true"
 
-    local client_port=30000 rid note tport lhost lport rproto
+    # 更新模式：删除新接入码里已不存在的旧规则（IX 端已删的）
+    if [[ "$updating" == 1 ]]; then
+        local _new_ids _old_rid
+        _new_ids="$(printf '%s' "$CODE_RULES_TSV" | cut -f1 | tr '\n' ' ')"
+        for _old_rid in $(list_rule_ids "$ingress_id"); do
+            case " $_new_ids " in
+                *" $_old_rid "*) : ;;
+                *) rm -f "$(rule_env_path "$ingress_id" "$_old_rid")"; info "移除 IX 已删规则：${_old_rid}" ;;
+            esac
+        done
+    fi
+
+    local client_port=30000 rid note tport lhost lport rproto keep_cp
     while IFS=$'\t' read -r rid note tport lhost lport rproto; do
         [[ -n "$rid" ]] || continue
-        # 默认与落地端口一致（客户端用同一端口号），回车即可；可手动改
-        prompt_port client_port "规则 ${rid}（${note:-}）客户端入口端口" "${lport:-$client_port}"
+        keep_cp=""
+        if [[ "$updating" == 1 ]]; then
+            # 沿用该规则已选的客户端入口端口（IX 改的是中转/落地，客户端口不应变）
+            keep_cp="$(load_rule "$ingress_id" "$rid" >/dev/null 2>&1 && printf '%s' "${CLIENT_PORT:-}")" || keep_cp=""
+        fi
+        if [[ -n "$keep_cp" ]]; then
+            client_port="$keep_cp"
+            info "规则 ${rid}（${note:-}）沿用已有客户端入口端口 ${client_port}"
+        else
+            # 默认与落地端口一致（客户端用同一端口号），回车即可；可手动改
+            prompt_port client_port "规则 ${rid}（${note:-}）客户端入口端口" "${lport:-$client_port}"
+        fi
         write_rule "$ingress_id" "$rid" \
             "RULE_ID=${rid}" \
             "RULE_NOTE=${note}" \
