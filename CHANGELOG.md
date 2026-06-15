@@ -1,5 +1,34 @@
 # Changelog
 
+## [1.1.0] - 2026-06-16
+
+首个稳定版：在 `1.0.0`（IX 中转组网）基础上新增「**混淆全局出口**」整条能力线，并在真机（国内网关 A ⇄ 国外出口 B）完整验证（`swgp+mimic` 全局出口 `wm test` 0% 丢包 / ~28–32ms、手机扫码全局出网正常）。聚合 `beta.8`–`beta.16` 全部变更。
+
+### Added（混淆组网 / 全局出口）
+
+- **国外出口 B（`create-exit`）+ 国内网关 A（`import-exit-code`）**：搭建 A↔B 全局出口隧道，A 侧客户端流量经隧道从 B 出网。新增角色 `exit`（B 落地出口）/ `relay`（A 全局网关）。
+- **swgp-go 流量混淆**：混淆方式可选 `direct / mimic / swgp / swgp+mimic`；swgp-go 在 WG 之外再加一层 UDP 混淆并叠加 mimic 伪 TCP，强化抗 DPI/封锁。swgp-go 按需自动安装（GitHub release，优先静态 `x86-64-v2`，ELF 魔数校验，损坏自愈重装）。
+- **客户端管理（菜单 `13` / `add-client`）**：A 网关上一键新增/列出/删除客户端，自动生成 `.conf` + 终端二维码（按需自动装 `qrencode`），手机 WireGuard 扫码即走全局出口。
+- **删除整条线路（菜单 `14` / `delete-line`）**：安全删除线路的配置/密钥/接入码/客户端/服务，并重渲染同机其它线路的 nft + mimic。
+- **交互菜单 ID 列表编号选择**：线路/规则/客户端选择改为输入阿拉伯数字（仍兼容输 ID/名称）。
+
+### Fixed（本轮真机定位）
+
+- **relay 全局出口漏配对端 mesh 路由（真凶）**：`Table = off` 下仅建客户端子网策略路由，漏了到对端 mesh IP 的隧道路由，mesh 流量漏到物理网卡 → A↔B 100% 丢包。现 relay 全局出口 PostUp 自动 `ip route replace <对端 mesh IP>/32 dev %i`（IPv6 同理），PostDown 清理。真机实测从 100% 丢包变 0% / ~32ms。
+- **swgp-go 被装成损坏文件（`Exec format error`）**：上游 v1.10.0 起只发 `.tar.zst`，旧解压逻辑把压缩包当二进制安装 → 崩溃重启、端口从不监听。现支持 `.tar.zst`/`.tar`/`.zst` 解压 + ELF 校验 + 损坏自愈重装。
+- **`wm test` 对 relay 假通过**：`peer_mesh_ip` 此前让 relay ping 自身 IP；现改为真正 ping 对端 B。
+- relay `PostUp/PostDown` 的 `ip rule del` 幂等化（`|| true`），避免 wg-quick `set -e` 首启被中止。
+- 自动选取空闲 mesh 网段并派生虚拟 IP，避免多条线路撞 `10.88` 网段。
+
+### Changed
+
+- 移除无引用的遗留函数 `default_mesh_subnet` / `default_ix_ip` / `default_ingress_ip`（已被 `next_free_mesh_subnet` 动态选段取代）。
+- 重写 `README.md`：覆盖「IX 中转组网」+「混淆全局出口」两条能力线、全部交互菜单与 `wm` CLI、角色表与接入码 schema。
+
+### Verified
+
+- `bash -n` 语法通过；`smoke nopy` 回归全 10 项通过；混淆全局出口在真机实测 `wm test` 0% 丢包 / ~28–32ms、客户端扫码全局出网正常。
+
 ## [1.1.0-beta.16] - 2026-06-16
 
 ### Changed（新增客户端默认出二维码：自动安装 qrencode）

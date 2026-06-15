@@ -2,7 +2,7 @@
 # wg-mimic-fabric — WireGuard + Mimic tunnel orchestrator (MVP)
 set -Eeuo pipefail
 
-SCRIPT_VERSION="1.1.0-beta.16"
+SCRIPT_VERSION="1.1.0"
 MIMIC_UPSTREAM_TAG="${MIMIC_UPSTREAM_TAG:-v0.7.0}"
 APP_NAME="wg-mimic-fabric"
 WMF_PROJECT_REPO="${WMF_REPO:-ike-sh/wg-mimic-fabric}"
@@ -344,10 +344,6 @@ validate_proto() {
 
 wg_genkey() { wg genkey; }
 wg_pubkey_of() { printf '%s' "$1" | wg pubkey; }
-
-default_mesh_subnet() { printf '10.88.0.0/24'; }
-default_ix_ip()       { printf '10.88.0.2'; }
-default_ingress_ip()  { printf '10.88.0.1'; }
 
 # 从 /24 网段取主机 IP：10.90.0.0/24 + 2 → 10.90.0.2
 mesh_host_ip() { local s="${1%%/*}"; printf '%s.%s' "${s%.*}" "$2"; }
