@@ -2,7 +2,7 @@
 # wg-mimic-fabric — WireGuard + Mimic tunnel orchestrator (MVP)
 set -Eeuo pipefail
 
-SCRIPT_VERSION="1.4.2"
+SCRIPT_VERSION="1.4.3"
 MIMIC_UPSTREAM_TAG="${MIMIC_UPSTREAM_TAG:-v0.7.0}"
 
 CONFIG_DIR="/etc/wg-mimic-fabric"
@@ -2104,11 +2104,11 @@ ensure_qrencode() {
 
 # 统一输出客户端配置 + 二维码：说明走 stderr、纯配置走 stdout（便于 wm show-client > x.conf 取干净配置）
 emit_client_conf() {
-    local name="$1" conf="$2"
+    local conf="$2"   # $1=客户端名（脱敏：不打印到提示里，避免分享/截图泄露）
     {
-        printf '\n═══ 客户端【%s】配置（给手机 / 电脑「设备」用，别在服务器上运行）═══\n' "$name"
+        printf '\n═══ 客户端配置（手机 / 电脑「设备」用，勿在服务器上运行）═══\n'
         printf '  · 手机：装 WireGuard App → 扫最下方二维码 → 打开开关\n'
-        printf '  · 电脑：把下面整段存成 %s.conf，导入 WireGuard / 小火箭 / mihomo / sing-box\n' "$name"
+        printf '  · 电脑：把下面整段存成 .conf 文件（自定义名，如 wg0.conf），导入 WireGuard / 小火箭 / mihomo / sing-box\n'
         printf '  ----------------------------------------\n'
     } >&2
     printf '%s\n' "$conf"
