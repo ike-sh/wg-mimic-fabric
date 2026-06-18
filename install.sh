@@ -2,7 +2,7 @@
 # wg-mimic-fabric — WireGuard + Mimic tunnel orchestrator (MVP)
 set -Eeuo pipefail
 
-SCRIPT_VERSION="1.3.5"
+SCRIPT_VERSION="1.4.0"
 MIMIC_UPSTREAM_TAG="${MIMIC_UPSTREAM_TAG:-v0.7.0}"
 
 CONFIG_DIR="/etc/wg-mimic-fabric"
@@ -1929,8 +1929,16 @@ create_exit_interactive() {
     prompt endpoint_host "B 的公网地址（IP 或域名，A 用它连接 B）" ""
     [[ -n "$endpoint_host" ]] || die "B 可达地址不能为空"
     prompt_port wg_port "WireGuard 监听端口（B 本机内部端口，swgp 模式下保持默认即可）" "51820"
-    prompt obfs_mode "混淆方式（direct=不混淆 / mimic=伪TCP / swgp=加密 / swgp+mimic=双层最强，推荐）" "swgp+mimic"
-    case "$obfs_mode" in direct|mimic|swgp|swgp+mimic) ;; *) die "混淆方式只能 direct/mimic/swgp/swgp+mimic" ;; esac
+    local _obfs_sel=""
+    printf '  混淆方式：\n    1) swgp+mimic  双层最强（推荐）\n    2) mimic       仅伪 TCP\n    3) swgp        仅加密\n    4) direct      不混淆\n' >&2
+    prompt _obfs_sel "选择 1-4（也可直接输入名称）" "1"
+    case "$_obfs_sel" in
+        1|swgp+mimic) obfs_mode="swgp+mimic" ;;
+        2|mimic)      obfs_mode="mimic" ;;
+        3|swgp)       obfs_mode="swgp" ;;
+        4|direct)     obfs_mode="direct" ;;
+        *) die "无效选择：${_obfs_sel}（应为 1-4）" ;;
+    esac
     swgp_port=0; swgp_mode=""; swgp_psk=""
     if [[ "$obfs_mode" == *swgp* ]]; then
         info "swgp 对外端口 = A 经公网真正连接的端口；NAT/中转机请填「服务商转发给你的端口段内的空闲端口」，否则 A 连不上 B"
@@ -1971,6 +1979,7 @@ create_exit_interactive() {
     local code; code="$(generate_exit_code)"
     printf '%s\n' "$code" >"${CODES_DIR}/${profile_id}.code"; chmod 600 "${CODES_DIR}/${profile_id}.code"
     printf '\n═══ 出口接入码（复制到 A 国内网关：wm import-exit-code）═══\n%s\n════════════════════════════════════════════\n' "$code"
+    warn "接入码=机密：内含 A 端(relay)私钥。请安全传输（勿截图群发/贴公开渠道）；泄漏后用 wm rotate-keys ${profile_id} 轮换密钥"
     local _autostart=""; prompt _autostart "现在就启动该线路吗？[Y/n]" "Y"
     case "$_autostart" in [Nn]*) info "稍后：wm start ${profile_id}" ;; *) start_profile "$profile_id" ;; esac
 }
@@ -2014,6 +2023,12 @@ import_exit_code() {
     [[ -n "$local_ip" ]] && info "本机网卡 IPv4：${local_ip}（NAT 机此为内网IP）"
     prompt a_public "A 的公网地址（手机/设备连接本网关用的 IP/域名）" "${prev_ahost:-${egress_ip:-$local_ip}}"
     prompt_port client_port "客户端 WireGuard 接入端口（设备连 A 用）" "${prev_cport:-51820}"
+    # NAT 机提示：客户端走 WireGuard=UDP，NAT/中转商家常只转 TCP，需显式提醒转发 UDP（否则永远握手不上）
+    if [[ -n "$egress_ip" && -n "$local_ip" && "$egress_ip" != "$local_ip" ]]; then
+        warn "本机疑似 NAT 机：客户端走 WireGuard=UDP，需商家把 ${a_public}:${client_port} 的【UDP】转发到内网 ${local_ip}；只转 TCP 客户端永远握手不上"
+    fi
+    # 客户端 MTU 从隧道 MTU 派生（再减客户端↔A 那层 WG 的 ~80B 头部），避免「隧道1400/客户端却1280」的不一致
+    local client_mtu=$(( ${CODE_WG_MTU:-1400} - 80 )); (( client_mtu < 1280 )) && client_mtu=1280
 
     write_profile_kv "$(profile_env_path "$relay_id")" \
         "PROFILE_ID=${relay_id}" "PROFILE_NAME=${relay_id}" "ROLE=relay" "ENABLED=true" \
@@ -2025,7 +2040,7 @@ import_exit_code() {
         "OBFS_MODE=${CODE_OBFS_MODE}" "SWGP_MODE=${CODE_SWGP_MODE}" "SWGP_PSK=${CODE_SWGP_PSK}" \
         "SWGP_PORT=${CODE_SWGP_PORT}" "EXIT_MODE=${CODE_EXIT_MODE:-global}" \
         "A_PUBLIC_HOST=${a_public}" "CLIENT_WG_PORT=${client_port}" \
-        "CLIENT_SUBNET=${CLIENT_SUBNET_DEFAULT}" "CLIENT_DNS=1.1.1.1" "CLIENT_MTU=1280" \
+        "CLIENT_SUBNET=${CLIENT_SUBNET_DEFAULT}" "CLIENT_DNS=1.1.1.1" "CLIENT_MTU=${client_mtu}" \
         "FW_OPEN_PORT=true"
 
     load_profile "$relay_id"
@@ -2064,7 +2079,7 @@ alloc_client_ip() {
 
 # 标准 WG 客户端配置（官方App/小火箭/mihomo/sing-box 通吃）。
 render_client_conf() {
-    local priv="$1" ip="$2" peer_pub="$3" endpoint="$4" dns="${5:-1.1.1.1}" mtu="${6:-1280}" allowed="${7:-0.0.0.0/0}"
+    local priv="$1" ip="$2" peer_pub="$3" endpoint="$4" dns="${5:-1.1.1.1}" mtu="${6:-1280}" allowed="${7:-0.0.0.0/0, ::/0}"
     cat <<EOF
 [Interface]
 PrivateKey = ${priv}
@@ -2087,6 +2102,28 @@ ensure_qrencode() {
     command_exists qrencode
 }
 
+# 统一输出客户端配置 + 二维码：说明走 stderr、纯配置走 stdout（便于 wm show-client > x.conf 取干净配置）
+emit_client_conf() {
+    local name="$1" conf="$2"
+    {
+        printf '\n═══ 客户端【%s】配置（给手机 / 电脑「设备」用，别在服务器上运行）═══\n' "$name"
+        printf '  · 手机：装 WireGuard App → 扫最下方二维码 → 打开开关\n'
+        printf '  · 电脑：把下面整段存成 %s.conf，导入 WireGuard / 小火箭 / mihomo / sing-box\n' "$name"
+        printf '  ----------------------------------------\n'
+    } >&2
+    printf '%s\n' "$conf"
+    {
+        printf '  ----------------------------------------\n'
+        ensure_qrencode
+        if command_exists qrencode; then
+            printf '  ── 二维码（手机 WireGuard 扫码导入）──\n'
+            printf '%s' "$conf" | qrencode -t ANSIUTF8
+        else
+            warn "无 qrencode（非 apt 环境）→ 复制上面文本导入，或 apt install qrencode 后重试"
+        fi
+    } >&2
+}
+
 add_client() {
     local id name; id="$(resolve_profile_id "${1:-}")"; name="$(sanitize_id "${2:-}")"
     require_root
@@ -2096,27 +2133,25 @@ add_client() {
     [[ -n "${A_PUBLIC_HOST:-}" && -n "${CLIENT_WG_PORT:-}" ]] \
         || die "该网关未配置客户端入口（重新 wm import-exit-code 设置 A 公网IP/客户端端口）"
     [[ ! -f "$(client_env_path "$id" "$name")" ]] || die "客户端已存在：$name"
-    local ip priv pub tmp
+    local ip priv pub tmp cdns cmtu
     ip="$(alloc_client_ip "$id" "${CLIENT_SUBNET:-$CLIENT_SUBNET_DEFAULT}")" || die "客户端子网已满"
+    prompt cdns "客户端 DNS（回车用默认；国内直连可填 223.5.5.5）" "${CLIENT_DNS:-1.1.1.1}"
+    [[ -n "$cdns" ]] || cdns="1.1.1.1"
+    prompt cmtu "客户端 MTU（回车用默认；卡顿可调低，地板 1280）" "${CLIENT_MTU:-1280}"
+    [[ "$cmtu" =~ ^[0-9]+$ ]] && (( cmtu >= 1280 && cmtu <= 1500 )) || cmtu="${CLIENT_MTU:-1280}"
     priv="$(wg_genkey)"; pub="$(wg_pubkey_of "$priv")"
     install -d -m 700 "$(clients_dir_for "$id")"
     tmp="$(mktemp)"
     printf '%s\n' "CLIENT_ID=${name}" "CLIENT_NAME=${name}" "CLIENT_PRIVKEY=${priv}" \
-        "CLIENT_PUBKEY=${pub}" "CLIENT_IP=${ip}" >"$tmp"
+        "CLIENT_PUBKEY=${pub}" "CLIENT_IP=${ip}" "CLIENT_DNS=${cdns}" "CLIENT_MTU=${cmtu}" >"$tmp"
     install -m 600 "$tmp" "$(client_env_path "$id" "$name")"; rm -f "$tmp"
     apply_profile_configs
     systemctl is-active --quiet "wg-mimic-tunnel@${PROFILE_ID}.service" 2>/dev/null \
         && restart_profile "$PROFILE_ID" >/dev/null 2>&1 || true
     local conf; conf="$(render_client_conf "$priv" "$ip" "$WG_PUBLIC_KEY" \
-        "$(format_mimic_ip "$A_PUBLIC_HOST"):${CLIENT_WG_PORT}" "${CLIENT_DNS:-1.1.1.1}" "${CLIENT_MTU:-1280}")"
-    printf '\n═══ 客户端 %s 配置（导入 官方WG/小火箭/mihomo/sing-box）═══\n%s\n' "$name" "$conf"
-    ensure_qrencode
-    if command_exists qrencode; then
-        printf '\n── 二维码（WG App 扫码导入）──\n'; printf '%s' "$conf" | qrencode -t ANSIUTF8
-    else
-        warn "无法自动安装 qrencode（非 apt 环境？）→ 直接复制上面的配置文本导入，或手动 apt install qrencode 后重新添加"
-    fi
-    ok "已新增客户端 ${name}（${ip}）"
+        "$(format_mimic_ip "$A_PUBLIC_HOST"):${CLIENT_WG_PORT}" "$cdns" "$cmtu")"
+    emit_client_conf "$name" "$conf"
+    ok "已新增客户端 ${name}（${ip}，DNS ${cdns}，MTU ${cmtu}）"
 }
 
 list_clients() {
@@ -2143,6 +2178,23 @@ del_client() {
     systemctl is-active --quiet "wg-mimic-tunnel@${PROFILE_ID}.service" 2>/dev/null \
         && restart_profile "$PROFILE_ID" >/dev/null 2>&1 || true
     ok "已删除客户端 ${name}"
+}
+
+# 重新显示已存在客户端的配置 + 二维码（无需删了重建即可再次扫码导入）
+show_client() {
+    local id name; id="$(resolve_profile_id "${1:-}")"; name="$(sanitize_id "${2:-}")"
+    [[ -n "${2:-}" ]] || die "用法: wm show-client <网关线路> <客户端名>"
+    load_profile "$id"
+    [[ "${ROLE:-}" == "relay" ]] || die "show-client 仅用于 relay(国内网关)线路"
+    [[ -n "${A_PUBLIC_HOST:-}" && -n "${CLIENT_WG_PORT:-}" ]] || die "该网关未配置客户端入口"
+    local p; p="$(client_env_path "$PROFILE_ID" "$name")"
+    [[ -f "$p" ]] || die "客户端不存在：$name（wm list-clients $PROFILE_ID 查看）"
+    # shellcheck disable=SC1090
+    safe_load_env "$p"
+    [[ -n "${CLIENT_PRIVKEY:-}" && -n "${CLIENT_IP:-}" ]] || die "客户端配置缺失：$name"
+    local conf; conf="$(render_client_conf "$CLIENT_PRIVKEY" "$CLIENT_IP" "$WG_PUBLIC_KEY" \
+        "$(format_mimic_ip "$A_PUBLIC_HOST"):${CLIENT_WG_PORT}" "${CLIENT_DNS:-1.1.1.1}" "${CLIENT_MTU:-1280}")"
+    emit_client_conf "$name" "$conf"
 }
 
 create_transit_interactive() {
@@ -2956,18 +3008,26 @@ auto_mtu() {
     if (( best == 0 )); then
         die "探测失败：内层 1280 字节都过不去，隧道路径 MTU < 1280(WG下限)。保持 MTU ${orig_mtu}，请排查中转线路"
     fi
-    local new_mtu=$(( best + 28 ))
-    info "探测结果：最大可过内层包 ${new_mtu} 字节"
+    local margin=10 new_mtu probe_max=$(( best + 28 ))
+    new_mtu=$(( probe_max - margin ))
+    (( new_mtu < 1280 )) && new_mtu=1280
+    info "探测结果：最大可过内层包 ${probe_max} 字节，留 ${margin}B 抖动余量 → MTU ${new_mtu}"
     if (( new_mtu == orig_mtu )); then
         ok "当前 MTU ${orig_mtu} 已是最优，无需调整"
         return 0
     fi
     set_profile_mtu "$id" "$new_mtu"
     sleep 2
+    # 满包复测；线路抖动导致仍丢包则逐档下调（每次 -16），到 WG 地板 1280 为止
+    while ! ping -c4 -W2 -M "do" -s "$(( new_mtu - 28 ))" "$peer" >/dev/null 2>&1 && (( new_mtu > 1280 )); do
+        new_mtu=$(( new_mtu - 16 )); (( new_mtu < 1280 )) && new_mtu=1280
+        warn "满包复测丢包，下调 MTU 至 ${new_mtu} 重试..."
+        set_profile_mtu "$id" "$new_mtu"; sleep 2
+    done
     if ping -c4 -W2 -M "do" -s "$(( new_mtu - 28 ))" "$peer" >/dev/null 2>&1; then
         ok "已自适应 WG_MTU=${new_mtu}（满包复测通过）"
     else
-        warn "设为 ${new_mtu} 后满包复测仍丢包，可手动再降：wm set-mtu ${id} $(( new_mtu - 20 ))"
+        warn "已降至地板 ${new_mtu} 仍丢包，请排查中转线路质量（非 MTU 问题）"
     fi
     info "⚠️ 对端需设同值：在对端机执行 wm set-mtu <对端线路ID> ${new_mtu}（或对端也跑 wm automtu）"
 }
@@ -3773,6 +3833,7 @@ show_menu() {
  ▸ 线路运维（两种模式通用）
      6) 启动线路      7) 停止线路      8) 健康检查      9) 列出线路
     10) 显示接入码    11) 刷新接入码    12) 端口地图    13) 转发规则管理
+    19) MTU 调整（自动探测 automtu / 手动设置）
 
  ▸ 组件维护（内核模块 / 混淆代理）
     14) 更新 Mimic 模块    15) 安装 / 修复 swgp-go
@@ -3794,12 +3855,14 @@ MENU
                     printf '    1) 新增客户端\n'
                     printf '    2) 列出客户端\n'
                     printf '    3) 删除客户端\n'
+                    printf '    4) 显示配置 / 二维码\n'
                     printf '    回车) 返回\n'
                     read -r -p "选择操作: " rid </dev/tty
                     case "$(trim "$rid")" in
                         1) read -r -p "客户端名: " rid </dev/tty; add_client "$id" "$(trim "$rid")" ;;
                         2) list_clients "$id" ;;
                         3) if rid="$(menu_pick_client "$id")"; then del_client "$id" "$rid"; fi ;;
+                        4) if rid="$(menu_pick_client "$id")"; then show_client "$id" "$rid"; fi ;;
                         *) : ;;
                     esac
                 fi
@@ -3864,6 +3927,17 @@ MENU
                     exit 0
                 fi
                 ;;
+            19)
+                if id="$(menu_pick_profile)"; then
+                    printf '  MTU 操作:\n    1) 自动探测并设置（automtu，推荐；两端各跑一次）\n    2) 手动设置\n    回车) 返回\n'
+                    read -r -p "选择操作: " rid </dev/tty
+                    case "$(trim "$rid")" in
+                        1) auto_mtu "$id" ;;
+                        2) read -r -p "MTU 值(1280-1500): " rid </dev/tty; set_profile_mtu "$id" "$(trim "$rid")" ;;
+                        *) : ;;
+                    esac
+                fi
+                ;;
             0|q|Q) exit 0 ;;
             *) warn "无效选择" ;;
         esac
@@ -3889,6 +3963,7 @@ main() {
         import-exit-code) import_exit_code ;;
         add-client) add_client "${2:-}" "${3:-}" ;;
         list-clients) list_clients "${2:-}" ;;
+        show-client) show_client "${2:-}" "${3:-}" ;;
         del-client) del_client "${2:-}" "${3:-}" ;;
         start) start_profile "$(resolve_profile_id "${2:-}")" ;;
         stop) stop_profile "$(resolve_profile_id "${2:-}")" ;;
