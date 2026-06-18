@@ -2,7 +2,7 @@
 # wg-mimic-fabric — WireGuard + Mimic tunnel orchestrator (MVP)
 set -Eeuo pipefail
 
-SCRIPT_VERSION="1.4.0"
+SCRIPT_VERSION="1.4.1"
 MIMIC_UPSTREAM_TAG="${MIMIC_UPSTREAM_TAG:-v0.7.0}"
 
 CONFIG_DIR="/etc/wg-mimic-fabric"
@@ -2985,8 +2985,15 @@ auto_mtu() {
     [[ -n "$peer" ]] || die "线路缺少对端虚拟IP"
     wgi="$(wg_iface_for "$id")"
     [[ -d "/sys/class/net/${wgi}" ]] || die "隧道接口 ${wgi} 未就绪，先 wm start ${id}"
-    ping -c1 -W2 "$peer" >/dev/null 2>&1 \
-        || die "隧道不通（ping ${peer} 失败）——先确保 wm test ${id} 能通再 automtu"
+    if ! ping -c1 -W2 "$peer" >/dev/null 2>&1; then
+        case "${ROLE:-}" in
+            exit|nat-transit)
+                # 被动监听端：对端(网关/入口)常在 NAT 后，无法从这里主动探测；引导手动同步 MTU
+                die "本端是被动监听端（${ROLE}），对端(网关/入口)多在 NAT 后、无法从这里主动探测。请在【对端机】跑 'wm automtu <对端线路>' 得到 MTU，再回本端 'wm set-mtu ${id} <该值>' 设为同值（菜单 19 → 2 手动设置）" ;;
+            *)
+                die "隧道不通（ping ${peer} 失败）——先确保 wm test ${id} 能通再 automtu" ;;
+        esac
+    fi
 
     local orig_mtu probe_ceiling=1440
     orig_mtu="$(cat "/sys/class/net/${wgi}/mtu" 2>/dev/null || echo 1420)"
