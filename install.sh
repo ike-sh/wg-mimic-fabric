@@ -2,7 +2,7 @@
 # wg-mimic-fabric — WireGuard + Mimic tunnel orchestrator (MVP)
 set -Eeuo pipefail
 
-SCRIPT_VERSION="1.3.4"
+SCRIPT_VERSION="1.3.5"
 MIMIC_UPSTREAM_TAG="${MIMIC_UPSTREAM_TAG:-v0.7.0}"
 
 CONFIG_DIR="/etc/wg-mimic-fabric"
@@ -3610,6 +3610,8 @@ uninstall_wm_core() {
             nft delete table inet "$NFT_TABLE" 2>/dev/null || true
         fi
         rm -f "$NFT_FILE" "$SYSCTL_FILE" "$SWGP_BIN"
+        # 清理本工具写入 /etc/mimic 的 .conf / .xdp（否则随后 dpkg purge mimic 会报「目录非空未删」）
+        rm -f "${MIMIC_CONF_DIR}"/*.conf "${MIMIC_CONF_DIR}"/*.xdp 2>/dev/null || true
         rm -rf "$CONFIG_DIR" "$LIBEXEC_DIR"
     fi
     systemctl disable --now wg-mimic-ddns.timer 2>/dev/null || true
@@ -3853,7 +3855,15 @@ MENU
                 ;;
             16) if id="$(menu_pick_profile)"; then delete_profile "$id"; fi ;;
             17) upgrade_script; ok "重新加载菜单以应用新版本..."; exec "$WM_BIN" ;;
-            18) uninstall_from_menu ;;
+            18)
+                # 子 shell 隔离：内部确认时若用户取消（die→exit）只退出子 shell、返回菜单，
+                # 不再误杀整个会话。卸载/清理成功后 wm 本体已删除，自动退出菜单而非循环回显。
+                ( uninstall_from_menu ) || true
+                if [[ ! -e "$WM_BIN" ]]; then
+                    printf '\n[OK] wm 已移除，退出菜单。\n'
+                    exit 0
+                fi
+                ;;
             0|q|Q) exit 0 ;;
             *) warn "无效选择" ;;
         esac

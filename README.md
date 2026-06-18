@@ -4,7 +4,7 @@
 
 | | |
 |------|------|
-| **版本** | `v1.3.4` |
+| **版本** | `v1.3.5` |
 | **仓库** | https://github.com/ike-sh/wg-mimic-fabric |
 | **许可** | MIT |
 
@@ -407,7 +407,7 @@ wm health-all
 
 | 变量 | 说明 |
 |------|------|
-| `WMF_TAG=v1.3.4` | 安装 / 升级时指定版本 |
+| `WMF_TAG=v1.3.5` | 安装 / 升级时指定版本 |
 | `WMF_REPO` | GitHub 仓库（默认 `ike-sh/wg-mimic-fabric`） |
 | `WMF_SKIP_MIMIC=1` | 跳过 mimic 自动安装 |
 | `WMF_AUTO_MIMIC=0` | 执行 `install-wm-cli` 时不自动安装 mimic |
