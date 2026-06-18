@@ -4,7 +4,7 @@
 
 | | |
 |------|------|
-| **版本** | `v1.3.2` |
+| **版本** | `v1.3.3` |
 | **仓库** | https://github.com/ike-sh/wg-mimic-fabric |
 | **许可** | MIT |
 
@@ -407,7 +407,7 @@ wm health-all
 
 | 变量 | 说明 |
 |------|------|
-| `WMF_TAG=v1.3.2` | 安装 / 升级时指定版本 |
+| `WMF_TAG=v1.3.3` | 安装 / 升级时指定版本 |
 | `WMF_REPO` | GitHub 仓库（默认 `ike-sh/wg-mimic-fabric`） |
 | `WMF_SKIP_MIMIC=1` | 跳过 mimic 自动安装 |
 | `WMF_AUTO_MIMIC=0` | 执行 `install-wm-cli` 时不自动安装 mimic |
@@ -416,6 +416,7 @@ wm health-all
 | `WMF_GITHUB_MIRRORS=url,...` | GitHub 下载镜像（适用于国内网络） |
 | `MIMIC_UPSTREAM_TAG` | 源码编译 mimic 的版本（默认 `v0.7.0`） |
 | `MIMIC_LOCAL_IP` | 覆盖 IX / 出口侧 Mimic 绑定的本机 IP |
+| `WMF_NO_OFFLOAD_DISABLE=1` | 跳过自动关闭网卡硬件 offload（默认会关闭以兼容 Mimic） |
 
 ---
 

@@ -1,5 +1,28 @@
 # Changelog
 
+## [1.3.3] - 2026-06-18
+
+### Added（网卡硬件 offload 自动关闭 → Mimic 兼容性）
+
+- **自动、持久关闭 Mimic 绑定网卡的硬件 offload**：Mimic 在 XDP/TC 上逐包改写报文，网卡的 **GRO/GSO/TSO/LRO/收发校验和** 卸载会把多个包合并成超大帧或改写报文，导致隧道异常（GRO 尤其影响原生 XDP attach）。此前需用户手动 `ethtool -K` 且重启即失效。现新增 systemd 模板 **`wg-mimic-offload@<网卡>.service`**：
+  - **强绑定物理网卡**（`BindsTo=` + `WantedBy=sys-subsystem-net-devices-<网卡>.device`），**开机、甚至网卡断开重连后都会自动重新关闭 offload，绝不漏网**。
+  - 每个 offload 项为独立的容错 `ExecStart=-`，某网卡不支持某项（如 virtio 无 LRO）也不影响其余项。
+  - 在 `wm start`（经 `ensure_mimic_service_up`）时**先于 XDP attach 自动启用并立即生效**；按需自动安装 `ethtool`。
+  - `wm stop` / `delete-line`：当该网卡已无 mimic 线路时自动撤销该服务；`uninstall` / `purge` 一并清理模板与实例。
+  - `wm health` 增加 `NIC offload: disabled (<网卡>)` 状态行。
+- 新增环境变量 **`WMF_NO_OFFLOAD_DISABLE=1`**：极少数无需关闭 offload 的网卡可跳过。
+
+### Security（高危漏洞修复）
+
+- **修复「导入恶意接入码 → root 任意命令执行」（严重）**：此前接入码字段（`ix_endpoint_host` / `wg_mesh_subnet` / `swgp_psk` / 规则 `landing_host` 等）未经校验即写入 profile/rule env，随后 `load_profile` / `load_rule` 以 **`source`** 读取——值中若含 `$(...)`、反引号或注入换行即在导入时以 **root** 执行。攻击者只需提供一个 `WMGF1:` 接入码（如「免费出口节点」）或在分发链路 MITM，受害者执行 `wm import-exit-code` / `import-code` 即被植入后门。
+  - **根因修复**：新增 `safe_load_env`——逐行解析 `KEY=VALUE` 并用 `printf -v` 赋值，**绝不 `source`** 受接入码影响的数据；非法键名跳过，`PATH`/`IFS`/`LD_*` 等加黑名单。全量替换 profile/rule/client env 的 14 处内部 `source`（仅保留 `/etc/os-release`）。
+  - **纵深防御**：`parse_code` 对全部不可信字段做严格白名单校验（IP/CIDR/主机名/端口/base64 密钥/模式枚举/keepalive），规则 TSV 逐行校验，伪造字段直接拒绝导入。
+- **修复「下载链路供应链/MITM 风险」（高）**：
+  - 下载改为**直连 GitHub 优先、第三方镜像仅兜底**（`gh_curl` / `download_with_mirrors`），不再默认信任 `gh.ddlc.top` 等镜像。
+  - 新增 `verify_sha256` 完整性闸门：可经 `WMF_SWGP_SHA256` / `WMF_MIMIC_SHA256` / `WMF_MIMIC_DKMS_SHA256` / `WMF_INSTALL_SHA256` 锁哈希，校验失败拒装。
+  - `wm upgrade-script` 安装前强制 `bash -n` 语法 + 脚本指纹校验，拒绝被篡改/截断的脚本。
+- 接入码 schema(5/6) 与既有线路/CLI/菜单**完全兼容**，纯安全加固，无功能行为变更。
+
 ## [1.3.2] - 2026-06-16
 
 ### Changed

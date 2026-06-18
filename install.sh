@@ -2,7 +2,7 @@
 # wg-mimic-fabric — WireGuard + Mimic tunnel orchestrator (MVP)
 set -Eeuo pipefail
 
-SCRIPT_VERSION="1.3.2"
+SCRIPT_VERSION="1.3.3"
 MIMIC_UPSTREAM_TAG="${MIMIC_UPSTREAM_TAG:-v0.7.0}"
 
 CONFIG_DIR="/etc/wg-mimic-fabric"
@@ -23,6 +23,7 @@ MIMIC_CONF_DIR="/etc/mimic"
 WG_CONF_DIR="/etc/wireguard"
 SYSTEMD_MIMIC_TEMPLATE="/etc/systemd/system/wg-mimic-mimic@.service"
 SYSTEMD_TUNNEL_TEMPLATE="/etc/systemd/system/wg-mimic-tunnel@.service"
+SYSTEMD_OFFLOAD_TEMPLATE="/etc/systemd/system/wg-mimic-offload@.service"
 SYSCTL_FILE="/etc/sysctl.d/99-wg-mimic-fabric.conf"
 SYSTEMD_DDNS_SERVICE="/etc/systemd/system/wg-mimic-ddns.service"
 SYSTEMD_DDNS_TIMER="/etc/systemd/system/wg-mimic-ddns.timer"
@@ -144,12 +145,35 @@ write_profile_kv() {
     rm -f "$tmp"
 }
 
+# Safely load KEY=VALUE pairs from a generated env file WITHOUT executing it.
+# SECURITY: never `source` data that can be influenced by an access code — a value
+# carrying $(...), backticks or a smuggled newline would otherwise run as root on
+# import (load_profile/load_rule). We parse literally and assign with `printf -v`,
+# which never evaluates the value. Keys must be valid identifiers; a denylist drops
+# shell-sensitive names so a forged line can't poison PATH/IFS/LD_* etc.
+safe_load_env() {
+    local __f="$1" __line __k __v
+    [[ -f "$__f" ]] || return 0
+    while IFS= read -r __line || [[ -n "$__line" ]]; do
+        __line="${__line%$'\r'}"
+        [[ -z "$__line" || "${__line:0:1}" == "#" ]] && continue
+        [[ "$__line" == *=* ]] || continue
+        __k="${__line%%=*}"
+        __v="${__line#*=}"
+        [[ "$__k" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
+        case "$__k" in
+            PATH|IFS|LD_*|BASH_ENV|ENV|SHELLOPTS|BASHOPTS|PROMPT_COMMAND|PS1|PS2|PS4) continue ;;
+        esac
+        printf -v "$__k" '%s' "$__v"
+    done <"$__f"
+    return 0
+}
+
 load_profile() {
     local id="$1"
     local path; path="$(profile_env_path "$id")"
     [[ -f "$path" ]] || die "线路不存在：$id"
-    # shellcheck disable=SC1090
-    source "$path"
+    safe_load_env "$path"
     PROFILE_ID="$(sanitize_id "${PROFILE_ID:-$id}")"
 }
 
@@ -339,6 +363,42 @@ validate_proto() {
     case "$1" in tcp|udp|both) return 0 ;; *) return 1 ;; esac
 }
 
+# ── access-code field validators ────────────────────────────────────────────
+# Defense-in-depth on top of safe_load_env: reject forged/injected fields from an
+# untrusted WMGF1 code BEFORE they are written to disk. Strict allowlists only.
+code_is_key()       { [[ "$1" =~ ^[A-Za-z0-9+/_-]+={0,2}$ ]]; }          # WG / base64(url) key
+code_is_ipany()     { [[ "$1" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || [[ "$1" =~ ^[0-9A-Fa-f:]{2,45}$ ]]; }
+code_is_cidr()      { [[ "$1" =~ ^[0-9A-Fa-f:.]{2,45}/[0-9]{1,3}$ ]]; }
+code_is_host()      { [[ "$1" =~ ^[A-Za-z0-9._-]{1,253}$ ]] || [[ "$1" =~ ^[0-9A-Fa-f:]{2,45}$ ]]; }
+code_is_uint()      { [[ "$1" =~ ^[0-9]{1,5}$ ]]; }
+code_is_keepalive() { [[ "$1" =~ ^[0-9:]{1,32}$ ]]; }
+code_is_token()     { [[ "$1" =~ ^[A-Za-z0-9._+-]{1,32}$ ]]; }          # ip_version / obfs / swgp mode / exit_mode
+
+code_require() {  # field value validator
+    local n="$1" v="$2" fn="$3"
+    [[ -n "$v" ]] || die "接入码缺少必填字段：${n}（疑似伪造，已拒绝导入）"
+    "$fn" "$v" || die "接入码字段 ${n} 含非法字符（疑似伪造/注入），已拒绝导入"
+}
+code_optional() {
+    local n="$1" v="$2" fn="$3"
+    [[ -n "$v" ]] || return 0
+    "$fn" "$v" || die "接入码字段 ${n} 含非法字符（疑似伪造/注入），已拒绝导入"
+}
+
+# Validate the decoded rules TSV (transit code) row by row.
+validate_rules_tsv() {
+    local tsv="$1" rid note tport lhost lport rproto
+    while IFS=$'\t' read -r rid note tport lhost lport rproto; do
+        [[ -z "$rid" ]] && continue
+        [[ "$rid" =~ ^[A-Za-z0-9._-]{1,64}$ ]] || die "接入码规则 ID 非法（疑似注入），已拒绝导入"
+        [[ -z "$tport"  ]] || code_is_uint "$tport"  || die "接入码规则中转端口非法，已拒绝导入"
+        [[ -z "$lport"  ]] || code_is_uint "$lport"  || die "接入码规则落地端口非法，已拒绝导入"
+        [[ -z "$lhost"  ]] || code_is_host "$lhost"  || die "接入码规则落地地址非法（疑似注入），已拒绝导入"
+        [[ -z "$rproto" ]] || validate_proto "$rproto" || die "接入码规则协议非法，已拒绝导入"
+        : "${note:-}"   # note 可含中文，safe_load_env 不执行其内容、且 TSV 已按行切分（无法注入换行）
+    done <<<"$tsv"
+}
+
 # ── WireGuard mesh helpers ─────────────────────────────────────────────────
 
 wg_genkey() { wg genkey; }
@@ -381,7 +441,7 @@ load_rule() {
     RULE_ID=""; RULE_NOTE=""; RULE_ENABLED="true"; TRANSIT_PORT=""
     LANDING_HOST=""; LANDING_PORT=""; FORWARD_PROTO="both"; CLIENT_PORT=""
     # shellcheck disable=SC1090
-    source "$p"
+    safe_load_env "$p"
 }
 
 write_rule() {
@@ -626,6 +686,32 @@ parse_code() {
     else
         die "不是有效的接入码（需 nat-transit-code/schema5 或 nat-exit-code/schema6）"
     fi
+
+    # ── SECURITY: 强校验所有不可信字段，拒绝伪造/注入的接入码 ──────────────────
+    code_require  profile_id       "$CODE_PROFILE_ID"          code_is_token
+    code_require  wg_mesh_subnet   "$CODE_WG_MESH_SUBNET"      code_is_cidr
+    code_require  ix_wg_ip         "$CODE_IX_WG_IP"            code_is_ipany
+    code_require  ingress_wg_ip    "$CODE_INGRESS_WG_IP"       code_is_ipany
+    code_require  ix_wg_pubkey     "$CODE_IX_WG_PUBKEY"        code_is_key
+    code_require  ingress_privkey  "$CODE_INGRESS_PRIVKEY_B64" code_is_key
+    code_require  ix_endpoint_host "$CODE_IX_ENDPOINT_HOST"    code_is_host
+    code_require  wg_port          "$CODE_WG_PORT"             code_is_uint
+    code_require  wg_mtu           "$CODE_WG_MTU"              code_is_uint
+    code_optional ip_version       "$CODE_IP_VERSION"          code_is_token
+    code_optional mimic_keepalive  "$CODE_MIMIC_KEEPALIVE"     code_is_keepalive
+    code_optional wg_mesh_subnet6  "$CODE_WG_MESH_SUBNET6"     code_is_cidr
+    code_optional ix_wg_ip6        "$CODE_IX_WG_IP6"           code_is_ipany
+    code_optional ingress_wg_ip6   "$CODE_INGRESS_WG_IP6"      code_is_ipany
+    if [[ "$CODE_KIND" == "transit" ]]; then
+        code_optional forward_proto "$CODE_FORWARD_PROTO" validate_proto
+        validate_rules_tsv "$CODE_RULES_TSV"
+    else
+        code_require  obfs_mode  "$CODE_OBFS_MODE"  code_is_token
+        code_optional swgp_mode  "$CODE_SWGP_MODE"  code_is_token
+        code_optional swgp_psk   "$CODE_SWGP_PSK"   code_is_key
+        code_optional swgp_port  "$CODE_SWGP_PORT"  code_is_uint
+        code_optional exit_mode  "$CODE_EXIT_MODE"  code_is_token
+    fi
 }
 
 ensure_mimic() {
@@ -756,6 +842,27 @@ mirror_url() {
     printf '%s%s' "${base%/}/" "${path#/}"
 }
 
+# Optional integrity gate. When a pinned SHA256 (hex) is supplied via env, a
+# download MUST match it or is rejected — defends against tampered third-party
+# mirrors / MITM even over HTTPS (the mirror itself is the TLS endpoint). Without
+# a pin this is a no-op (we cannot fabricate upstream hashes in the script).
+verify_sha256() {
+    local f="$1" want="$2" got=""
+    [[ -n "$want" ]] || return 0
+    [[ -f "$f" ]] || { warn "SHA256 校验失败：文件不存在 $f"; return 1; }
+    if command_exists sha256sum; then got="$(sha256sum "$f" 2>/dev/null | awk '{print $1}')"
+    elif command_exists shasum; then got="$(shasum -a 256 "$f" 2>/dev/null | awk '{print $1}')"
+    else warn "无 sha256sum/shasum，无法执行 SHA256 校验"; return 1; fi
+    if [[ "${got,,}" != "${want,,}" ]]; then
+        warn "SHA256 校验失败：期望 ${want}，实得 ${got:-空}（疑似被篡改，已拒绝）"
+        return 1
+    fi
+    ok "SHA256 校验通过：$(basename "$f")"
+    return 0
+}
+
+# SECURITY: 直连 GitHub 优先（受信 TLS 端点），第三方镜像仅作国内不可达时的兜底，
+# 不再默认信任镜像。download_with_mirrors 也同理（API/raw 直连优先于镜像）。
 download_with_mirrors() {
     local relpath="$1" dest="$2" ref="${3:-main}"
     local repo="${WMF_REPO:-ike-sh/wg-mimic-fabric}"
@@ -765,7 +872,7 @@ download_with_mirrors() {
         -o "$dest" "https://api.github.com/repos/${repo}/contents/${relpath}?ref=${ref}" 2>/dev/null; then
         return 0
     fi
-    for m in "${mirrors[@]}" "" ; do
+    for m in "" "${mirrors[@]}" ; do
         local url
         if [[ -n "$m" ]]; then
             url="$(mirror_url "$m" "https://raw.githubusercontent.com/${repo}/${ref}/${relpath}")"
@@ -777,12 +884,12 @@ download_with_mirrors() {
     return 1
 }
 
-# 下载任意 GitHub/api/raw 资源：优先走镜像（国内可达），逐个轮询，最后直连兜底。
+# 下载任意 GitHub/api/raw 资源：直连优先，镜像兜底（国内直连不可达时）。
 # $1=完整 URL（github.com / api.github.com / *.githubusercontent.com）  $2=落地文件
 gh_curl() {
     local url="$1" dest="$2" m u mirrors=()
     IFS=',' read -ra mirrors <<< "${WMF_GITHUB_MIRRORS:-$DEFAULT_GITHUB_MIRRORS}"
-    for m in "${mirrors[@]}" "" ; do
+    for m in "" "${mirrors[@]}" ; do
         if [[ -n "$m" ]]; then u="$(mirror_url "$m" "$url")"; else u="$url"; fi
         if curl -fsSL --connect-timeout 10 --max-time 300 --retry 1 -o "$dest" "$u" 2>/dev/null \
             && [[ -s "$dest" ]]; then
@@ -800,6 +907,14 @@ upgrade_script() {
     tmp="$(mktemp)"
     info "下载 ${WMF_REPO:-ike-sh/wg-mimic-fabric} @ ${ref} ..."
     download_with_mirrors "install.sh" "$tmp" "$ref" || die "下载 install.sh 失败"
+    # SECURITY: 安装前完整性闸门——可选 SHA256 锁定 + 强制 bash 语法校验，
+    # 拒绝被篡改/截断/损坏的脚本（避免镜像投毒或断点续传残档写入并以 root 运行）。
+    verify_sha256 "$tmp" "${WMF_INSTALL_SHA256:-}" \
+        || { rm -f "$tmp"; die "install.sh SHA256 校验失败，已中止升级"; }
+    bash -n "$tmp" 2>/dev/null \
+        || { rm -f "$tmp"; die "下载的 install.sh 语法校验未通过（疑似损坏/被篡改），已中止升级"; }
+    grep -q '^# wg-mimic-fabric' "$tmp" \
+        || { rm -f "$tmp"; die "下载内容不是 wg-mimic-fabric 脚本，已中止升级"; }
     remote_ver="$(grep -m1 '^SCRIPT_VERSION=' "$tmp" | sed -E 's/^SCRIPT_VERSION="([^"]+)".*/\1/')"
     local cur="$SCRIPT_VERSION"
     if [[ -n "$remote_ver" && "$remote_ver" == "$cur" && "${WMF_UPGRADE_YES:-}" != "1" ]]; then
@@ -862,7 +977,7 @@ ddns_refresh() {
         [[ -f "$p" ]] || continue
         (
             # shellcheck disable=SC1090
-            source "$p"
+            safe_load_env "$p"
             [[ "${ENABLED:-true}" == "true" ]] || exit 0
             [[ "${ROLE:-}" == "nat-ingress" && -n "${IX_ENDPOINT_HOST:-}" ]] || exit 0
             [[ "$IX_ENDPOINT_HOST" =~ [a-zA-Z] ]] || exit 0
@@ -952,7 +1067,7 @@ group_members() {
         [[ -f "$p" ]] || continue
         (
             # shellcheck disable=SC1090
-            source "$p"
+            safe_load_env "$p"
             [[ "${LINE_GROUP:-}" == "$grp" ]] && printf '%s\n' "$PROFILE_ID"
         )
     done
@@ -979,7 +1094,7 @@ list_groups() {
             [[ -f "$p" ]] || continue
             (
                 # shellcheck disable=SC1090
-                source "$p"
+                safe_load_env "$p"
                 [[ -n "${LINE_GROUP:-}" ]] || exit 0
                 printf '%s\t%s\t%s\t%s\t%s\n' "$LINE_GROUP" "$PROFILE_ID" \
                     "${LINE_ROLE:-standalone}" "${LINE_PRIORITY:-100}" "${ENABLED:-true}"
@@ -1080,7 +1195,7 @@ render_mimic_conf_iface() {
             [[ -f "$p" ]] || continue
             (
                 # shellcheck disable=SC1090
-                source "$p"
+                safe_load_env "$p"
                 [[ "${WAN_IFACE:-}" == "$iface" ]] || exit 0
                 [[ "${ENABLED:-true}" == "true" ]] || exit 0
                 render_mimic_conf_for_profile
@@ -1098,7 +1213,7 @@ iface_xdp_mode() {
         [[ -f "$p" ]] || continue
         mode="$(
             # shellcheck disable=SC1090
-            source "$p" 2>/dev/null
+            safe_load_env "$p" 2>/dev/null
             [[ "${WAN_IFACE:-}" == "$iface" ]] || exit 0
             [[ "${ENABLED:-true}" == "true" ]] || exit 0
             printf '%s' "${MIMIC_XDP_MODE:-}"
@@ -1219,7 +1334,7 @@ PersistentKeepalive = 25
 EOF
         for c in $(list_client_ids "$PROFILE_ID"); do
             ( # shellcheck disable=SC1090
-              source "$(client_env_path "$PROFILE_ID" "$c")" 2>/dev/null
+              safe_load_env "$(client_env_path "$PROFILE_ID" "$c")" 2>/dev/null
               [[ -n "${CLIENT_PUBKEY:-}" && -n "${CLIENT_IP:-}" ]] || exit 0
               printf '\n[Peer]\n# client %s\nPublicKey = %s\nAllowedIPs = %s/32\n' \
                   "${CLIENT_NAME:-$c}" "$CLIENT_PUBKEY" "$CLIENT_IP" )
@@ -1274,7 +1389,7 @@ collect_dnat_entries() {
         [[ -f "$p" ]] || continue
         (
             # shellcheck disable=SC1090
-            source "$p"
+            safe_load_env "$p"
             [[ "${ENABLED:-true}" == "true" ]] || exit 0
             local rid fam mesh_ip landing_ip
             for rid in $(list_rule_ids "$PROFILE_ID"); do
@@ -1309,7 +1424,7 @@ collect_input_ports() {
         [[ -f "$p" ]] || continue
         (
             # shellcheck disable=SC1090
-            source "$p"
+            safe_load_env "$p"
             [[ "${ENABLED:-true}" == "true" && "${FW_OPEN_PORT:-true}" == "true" ]] || exit 0
             if [[ "${ROLE:-}" == "nat-transit" ]]; then
                 printf '%s\t%s\n' "${PROFILE_ID}-wg" "$WG_PORT"
@@ -1394,7 +1509,7 @@ nft_emit_gw_masq() {
         [[ -f "$p" ]] || continue
         (
             # shellcheck disable=SC1090
-            source "$p"
+            safe_load_env "$p"
             [[ "${ENABLED:-true}" == "true" ]] || exit 0
             if [[ "${ROLE:-}" == "relay" && -n "${CLIENT_SUBNET:-}" ]]; then
                 printf '        ip saddr %s oifname "%s" counter masquerade comment "wm-%s-cli"\n' \
@@ -1463,12 +1578,13 @@ resolve_bin() {
 }
 
 install_systemd_units() {
-    local tmp mimic_bin wgquick_bin modprobe_bin
+    local tmp mimic_bin wgquick_bin modprobe_bin ethtool_bin
     # mimic/wg-quick paths vary by distro (Debian ships mimic under /usr/sbin),
     # so never hardcode /usr/bin — a wrong path makes the unit fail 203/EXEC.
     mimic_bin="$(resolve_bin mimic /usr/bin/mimic)"
     wgquick_bin="$(resolve_bin wg-quick /usr/bin/wg-quick)"
     modprobe_bin="$(resolve_bin modprobe /sbin/modprobe)"
+    ethtool_bin="$(resolve_bin ethtool /usr/sbin/ethtool)"
     tmp="$(mktemp)"
     cat >"$tmp" <<EOF
 [Unit]
@@ -1505,6 +1621,33 @@ ExecStop=${wgquick_bin} down /etc/wireguard/wm-%i.conf
 WantedBy=multi-user.target
 EOF
     install -m 644 "$tmp" "$SYSTEMD_TUNNEL_TEMPLATE"
+
+    # NIC hardware-offload disable, keyed by interface (%i), bound to the NIC device
+    # so it re-applies on every boot AND on NIC unplug/replug. Mimic rewrites packets
+    # in XDP/TC; GRO/GSO/TSO/LRO/checksum offload coalesce or alter frames and break
+    # it (GRO especially vs XDP). Each feature is a tolerant (-) ExecStart so a NIC
+    # that lacks one (e.g. virtio has no LRO) doesn't abort the rest.
+    cat >"$tmp" <<EOF
+[Unit]
+Description=wg-mimic-fabric disable NIC offloads on %i (Mimic eBPF compatibility)
+After=network-pre.target sys-subsystem-net-devices-%i.device
+Wants=network-pre.target
+BindsTo=sys-subsystem-net-devices-%i.device
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=-${ethtool_bin} -K %i gro off
+ExecStart=-${ethtool_bin} -K %i gso off
+ExecStart=-${ethtool_bin} -K %i tso off
+ExecStart=-${ethtool_bin} -K %i lro off
+ExecStart=-${ethtool_bin} -K %i tx off
+ExecStart=-${ethtool_bin} -K %i rx off
+
+[Install]
+WantedBy=sys-subsystem-net-devices-%i.device
+EOF
+    install -m 644 "$tmp" "$SYSTEMD_OFFLOAD_TEMPLATE"
     rm -f "$tmp"
     systemctl daemon-reload
 }
@@ -1601,10 +1744,49 @@ force_iface_skb() {
     apply_mimic_conf_iface "$iface"
 }
 
+# ── NIC hardware offload（Mimic eBPF 兼容性）────────────────────────────────
+# 按需安装 ethtool（关闭网卡 offload 用）。
+ensure_ethtool() {
+    command_exists ethtool && return 0
+    if   command_exists apt-get; then DEBIAN_FRONTEND=noninteractive apt-get install -y ethtool >/dev/null 2>&1
+    elif command_exists pacman;  then pacman -Sy --noconfirm --needed ethtool >/dev/null 2>&1
+    elif command_exists dnf;     then dnf install -y ethtool >/dev/null 2>&1
+    elif command_exists apk;     then apk add --no-cache ethtool >/dev/null 2>&1
+    elif command_exists zypper;  then zypper -n install ethtool >/dev/null 2>&1
+    fi
+    command_exists ethtool
+}
+
+# 启用并立即应用「关闭网卡硬件 offload」服务：绑定到该网卡设备，开机 / 网卡重连后
+# 自动持续生效（不漏网）。WMF_NO_OFFLOAD_DISABLE=1 可跳过（极少数 NIC 不需要时）。
+ensure_offload_disabled() {
+    local iface="$1"
+    [[ -n "$iface" ]] || return 0
+    [[ "${WMF_NO_OFFLOAD_DISABLE:-}" == "1" ]] && return 0
+    ensure_ethtool || { warn "ethtool 不可用，跳过关闭 ${iface} 硬件 offload（Mimic 可能受 GRO/GSO 影响）"; return 0; }
+    systemctl enable "wg-mimic-offload@${iface}.service" 2>/dev/null || true
+    systemctl restart "wg-mimic-offload@${iface}.service" 2>/dev/null || true
+    if systemctl is-active --quiet "wg-mimic-offload@${iface}.service" 2>/dev/null; then
+        ok "已关闭 ${iface} 硬件 offload（GRO/GSO/TSO/LRO/校验和），并随网卡绑定开机自启"
+    else
+        warn "关闭 ${iface} offload 未生效，排查：journalctl -u wg-mimic-offload@${iface}.service"
+    fi
+}
+
+# 该网卡已无 mimic 线路时撤销 offload 关闭服务（NIC 行为下次重启恢复默认）。
+disable_offload_service() {
+    local iface="$1"
+    [[ -n "$iface" ]] || return 0
+    systemctl disable --now "wg-mimic-offload@${iface}.service" 2>/dev/null || true
+}
+
 # Start mimic@<iface> and verify it actually came up. On failure (e.g. XDP native
 # rejected on virtio_net + GRO), force skb mode for that nic's profiles and retry.
 ensure_mimic_service_up() {
     local iface="$1"
+    # 先关闭网卡硬件 offload（GRO/GSO/TSO/LRO 会破坏 mimic 的逐包改写，GRO 尤其影响
+    # 原生 XDP attach）——必须在 detach/attach XDP 之前完成。
+    ensure_offload_disabled "$iface"
     # 总是按最新 unit/conf/env(含命令行 -x XDP 模式)干净重启 mimic。
     # 旧逻辑“见 active 就 return 0”会在 set-mtu/restart/upgrade 后遗留旧 mimic 进程
     # (旧 XDP 模式 / 解析失败丢 filter)→ virtio 网卡上重启后隧道直接不通,必须手动救。
@@ -1675,9 +1857,11 @@ stop_profile() {
         systemctl try-restart "wg-mimic-mimic@${WAN_IFACE}.service" 2>/dev/null \
             || systemctl stop "wg-mimic-mimic@${WAN_IFACE}.service" 2>/dev/null || true
         # If mimic no longer runs on this nic (no other profile uses it), clear its
-        # XDP program so the NIC is left clean and the next start attaches cleanly.
-        systemctl is-active --quiet "wg-mimic-mimic@${WAN_IFACE}.service" 2>/dev/null \
-            || detach_xdp "$WAN_IFACE"
+        # XDP program and drop the offload-disable service so the NIC is left clean.
+        if ! systemctl is-active --quiet "wg-mimic-mimic@${WAN_IFACE}.service" 2>/dev/null; then
+            detach_xdp "$WAN_IFACE"
+            disable_offload_service "$WAN_IFACE"
+        fi
     fi
     ok "已停止线路：${PROFILE_ID}"
 }
@@ -1704,7 +1888,10 @@ delete_profile() {
     if [[ -n "$iface" ]]; then
         apply_mimic_conf_iface "$iface"
         systemctl try-restart "wg-mimic-mimic@${iface}.service" 2>/dev/null || true
-        systemctl is-active --quiet "wg-mimic-mimic@${iface}.service" 2>/dev/null || detach_xdp "$iface"
+        if ! systemctl is-active --quiet "wg-mimic-mimic@${iface}.service" 2>/dev/null; then
+            detach_xdp "$iface"
+            disable_offload_service "$iface"
+        fi
     fi
     ok "已删除线路：${id}"
 }
@@ -1866,7 +2053,7 @@ alloc_client_ip() {
     base="${subnet%.*}"
     used="$(for c in $(list_client_ids "$pid"); do
         ( # shellcheck disable=SC1090
-          source "$(client_env_path "$pid" "$c")" 2>/dev/null; printf '%s\n' "${CLIENT_IP:-}" )
+          safe_load_env "$(client_env_path "$pid" "$c")" 2>/dev/null; printf '%s\n' "${CLIENT_IP:-}" )
     done)"
     for ((n = 2; n <= 254; n++)); do
         ip="${base}.${n}"
@@ -1938,7 +2125,7 @@ list_clients() {
     printf '网关 %s 客户端：\n' "$PROFILE_ID"
     for c in $(list_client_ids "$PROFILE_ID"); do
         ( # shellcheck disable=SC1090
-          source "$(client_env_path "$PROFILE_ID" "$c")" 2>/dev/null
+          safe_load_env "$(client_env_path "$PROFILE_ID" "$c")" 2>/dev/null
           printf '  - %s\t%s\n' "${CLIENT_NAME:-$c}" "${CLIENT_IP:-?}" )
     done
     [[ -n "$(list_client_ids "$PROFILE_ID")" ]] || printf '  (无客户端；wm add-client %s <名>)\n' "$PROFILE_ID"
@@ -2412,6 +2599,10 @@ health_profile() {
         fi
     else
         printf 'Mimic: not installed\n'; status="degraded"
+    fi
+
+    if [[ -n "${WAN_IFACE:-}" ]] && systemctl is-active --quiet "wg-mimic-offload@${WAN_IFACE}.service" 2>/dev/null; then
+        printf 'NIC offload: disabled (%s, Mimic 兼容)\n' "$WAN_IFACE"
     fi
 
     if systemctl is-active --quiet "wg-mimic-tunnel@${PROFILE_ID}.service" 2>/dev/null; then
@@ -2970,6 +3161,9 @@ PY
     [[ -n "$mimic_deb" && -n "$dkms_deb" ]] || { rm -rf "$tmpd"; return 1; }
     gh_curl "$mimic_deb" "$tmpd/mimic.deb" || { rm -rf "$tmpd"; return 1; }
     gh_curl "$dkms_deb" "$tmpd/mimic-dkms.deb" || { rm -rf "$tmpd"; return 1; }
+    # 可选完整性校验（WMF_MIMIC_SHA256 / WMF_MIMIC_DKMS_SHA256）：拒绝被篡改的 .deb
+    verify_sha256 "$tmpd/mimic.deb" "${WMF_MIMIC_SHA256:-}" || { rm -rf "$tmpd"; return 1; }
+    verify_sha256 "$tmpd/mimic-dkms.deb" "${WMF_MIMIC_DKMS_SHA256:-}" || { rm -rf "$tmpd"; return 1; }
     DEBIAN_FRONTEND=noninteractive apt-get install -y "$tmpd/mimic.deb" "$tmpd/mimic-dkms.deb" \
         || { rm -rf "$tmpd"; return 1; }
     rm -rf "$tmpd"
@@ -3095,7 +3289,7 @@ update_mimic() {
         for p in "$PROFILES_DIR"/*.env; do
             [[ -f "$p" ]] || continue
             # shellcheck disable=SC1090
-            ( source "$p"; [[ "${ENABLED:-true}" == "true" ]] && printf '%s\n' "$PROFILE_ID" )
+            ( safe_load_env "$p"; [[ "${ENABLED:-true}" == "true" ]] && printf '%s\n' "$PROFILE_ID" )
         done)
     case "$id" in
         debian|ubuntu)
@@ -3201,6 +3395,8 @@ PY
 )"
     [[ -n "$url" ]] || { rm -rf "$tmpd"; return 1; }
     gh_curl "$url" "$tmpd/pkg" || { rm -rf "$tmpd"; return 1; }
+    # 可选完整性校验（WMF_SWGP_SHA256）：拒绝被篡改的下载资产
+    verify_sha256 "$tmpd/pkg" "${WMF_SWGP_SHA256:-}" || { rm -rf "$tmpd"; return 1; }
     case "$url" in
         *.zip)              command_exists unzip && unzip -o "$tmpd/pkg" -d "$tmpd" >/dev/null 2>&1 ;;
         *.tar.gz|*.tgz)     tar -xzf "$tmpd/pkg" -C "$tmpd" 2>/dev/null ;;
@@ -3404,6 +3600,7 @@ uninstall_wm_core() {
     for iface in $(printf '%s\n' "${ifaces[@]}" | sort -u); do
         [[ -n "$iface" ]] || continue
         systemctl disable "wg-mimic-mimic@${iface}.service" 2>/dev/null || true
+        systemctl disable --now "wg-mimic-offload@${iface}.service" 2>/dev/null || true
         if [[ "$remove_configs" == "true" ]]; then
             rm -f "${MIMIC_CONF_DIR}/${iface}.conf"
         fi
@@ -3421,7 +3618,7 @@ uninstall_wm_core() {
     for _asw in $(systemctl list-units --all --no-legend 'wg-mimic-autoswitch@*.timer' 2>/dev/null | awk '{print $1}'); do
         systemctl disable --now "$_asw" 2>/dev/null || true
     done
-    rm -f "$WM_BIN" "$SYSTEMD_MIMIC_TEMPLATE" "$SYSTEMD_TUNNEL_TEMPLATE" "$SYSTEMD_SWGP_TEMPLATE" "$SYSTEMD_DDNS_SERVICE" "$SYSTEMD_DDNS_TIMER" "$SYSTEMD_AUTOSWITCH_SERVICE" "$SYSTEMD_AUTOSWITCH_TIMER" "$SYSTEMD_RESUME_SERVICE"
+    rm -f "$WM_BIN" "$SYSTEMD_MIMIC_TEMPLATE" "$SYSTEMD_TUNNEL_TEMPLATE" "$SYSTEMD_OFFLOAD_TEMPLATE" "$SYSTEMD_SWGP_TEMPLATE" "$SYSTEMD_DDNS_SERVICE" "$SYSTEMD_DDNS_TIMER" "$SYSTEMD_AUTOSWITCH_SERVICE" "$SYSTEMD_AUTOSWITCH_TIMER" "$SYSTEMD_RESUME_SERVICE"
     # 大写别名（若存在）
     rm -f "$WM_ALIAS" "/usr/local/bin/WG" 2>/dev/null || true
     if [[ "$remove_configs" == "true" ]]; then
