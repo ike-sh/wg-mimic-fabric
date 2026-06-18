@@ -2,7 +2,7 @@
 # wg-mimic-fabric — WireGuard + Mimic tunnel orchestrator (MVP)
 set -Eeuo pipefail
 
-SCRIPT_VERSION="1.4.1"
+SCRIPT_VERSION="1.4.2"
 MIMIC_UPSTREAM_TAG="${MIMIC_UPSTREAM_TAG:-v0.7.0}"
 
 CONFIG_DIR="/etc/wg-mimic-fabric"
@@ -2137,13 +2137,16 @@ add_client() {
     ip="$(alloc_client_ip "$id" "${CLIENT_SUBNET:-$CLIENT_SUBNET_DEFAULT}")" || die "客户端子网已满"
     prompt cdns "客户端 DNS（回车用默认；国内直连可填 223.5.5.5）" "${CLIENT_DNS:-1.1.1.1}"
     [[ -n "$cdns" ]] || cdns="1.1.1.1"
-    prompt cmtu "客户端 MTU（回车用默认；卡顿可调低，地板 1280）" "${CLIENT_MTU:-1280}"
-    [[ "$cmtu" =~ ^[0-9]+$ ]] && (( cmtu >= 1280 && cmtu <= 1500 )) || cmtu="${CLIENT_MTU:-1280}"
+    local cmtu_def=$(( ${WG_MTU:-1400} - 80 )); (( cmtu_def < 1280 )) && cmtu_def=1280
+    prompt cmtu "客户端 MTU（回车=跟随隧道派生 ${cmtu_def}；卡顿可手填调低，地板 1280）" "$cmtu_def"
+    [[ "$cmtu" =~ ^[0-9]+$ ]] && (( cmtu >= 1280 && cmtu <= 1500 )) || cmtu="$cmtu_def"
+    # 仅当手填了与派生值不同的 MTU 才写入该客户端；否则不写 → show-client 按当前隧道 MTU 实时派生
+    local mtu_kv=""; [[ "$cmtu" != "$cmtu_def" ]] && mtu_kv="CLIENT_MTU=${cmtu}"
     priv="$(wg_genkey)"; pub="$(wg_pubkey_of "$priv")"
     install -d -m 700 "$(clients_dir_for "$id")"
     tmp="$(mktemp)"
     printf '%s\n' "CLIENT_ID=${name}" "CLIENT_NAME=${name}" "CLIENT_PRIVKEY=${priv}" \
-        "CLIENT_PUBKEY=${pub}" "CLIENT_IP=${ip}" "CLIENT_DNS=${cdns}" "CLIENT_MTU=${cmtu}" >"$tmp"
+        "CLIENT_PUBKEY=${pub}" "CLIENT_IP=${ip}" "CLIENT_DNS=${cdns}" ${mtu_kv:+"$mtu_kv"} >"$tmp"
     install -m 600 "$tmp" "$(client_env_path "$id" "$name")"; rm -f "$tmp"
     apply_profile_configs
     systemctl is-active --quiet "wg-mimic-tunnel@${PROFILE_ID}.service" 2>/dev/null \
@@ -2192,8 +2195,11 @@ show_client() {
     # shellcheck disable=SC1090
     safe_load_env "$p"
     [[ -n "${CLIENT_PRIVKEY:-}" && -n "${CLIENT_IP:-}" ]] || die "客户端配置缺失：$name"
+    # MTU：该客户端单独设过就用其值，否则按当前隧道 MTU 实时派生（WG_MTU-80，地板1280）→ 改隧道 MTU 即时反映
+    local cmtu
+    if grep -q '^CLIENT_MTU=' "$p"; then cmtu="${CLIENT_MTU:-1280}"; else cmtu=$(( ${WG_MTU:-1400} - 80 )); (( cmtu < 1280 )) && cmtu=1280; fi
     local conf; conf="$(render_client_conf "$CLIENT_PRIVKEY" "$CLIENT_IP" "$WG_PUBLIC_KEY" \
-        "$(format_mimic_ip "$A_PUBLIC_HOST"):${CLIENT_WG_PORT}" "${CLIENT_DNS:-1.1.1.1}" "${CLIENT_MTU:-1280}")"
+        "$(format_mimic_ip "$A_PUBLIC_HOST"):${CLIENT_WG_PORT}" "${CLIENT_DNS:-1.1.1.1}" "$cmtu")"
     emit_client_conf "$name" "$conf"
 }
 
