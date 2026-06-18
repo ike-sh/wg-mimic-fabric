@@ -2,7 +2,7 @@
 # wg-mimic-fabric — WireGuard + Mimic tunnel orchestrator (MVP)
 set -Eeuo pipefail
 
-SCRIPT_VERSION="1.3.3"
+SCRIPT_VERSION="1.3.4"
 MIMIC_UPSTREAM_TAG="${MIMIC_UPSTREAM_TAG:-v0.7.0}"
 
 CONFIG_DIR="/etc/wg-mimic-fabric"
@@ -3764,19 +3764,19 @@ show_menu() {
      2) 导入接入码（公网服务器入口接入）
 
  ▸ 模式二：全局出口（混淆翻墙，国内 A → 国外 B）
-    11) 创建国外出口 B（生成出口接入码）
-    12) 导入出口接入码（国内服务器 A 接入）
-    13) 客户端管理（新增 / 列出 / 删除，自动出二维码）
+     3) 创建国外出口 B（生成出口接入码）
+     4) 导入出口接入码（国内服务器 A 接入）
+     5) 客户端管理（新增 / 列出 / 删除，自动出二维码）
 
  ▸ 线路运维（两种模式通用）
-     3) 启动线路     4) 停止线路     5) 健康检查     6) 列出线路
-     7) 显示接入码     8) 刷新接入码     9) 端口地图     10) 转发规则管理
+     6) 启动线路      7) 停止线路      8) 健康检查      9) 列出线路
+    10) 显示接入码    11) 刷新接入码    12) 端口地图    13) 转发规则管理
 
  ▸ 组件维护（内核模块 / 混淆代理）
-    17) 更新 Mimic 模块     18) 安装 / 修复 swgp-go
+    14) 更新 Mimic 模块    15) 安装 / 修复 swgp-go
 
  ▸ 系统维护
-    14) 删除线路     15) 升级 wm 脚本     16) 卸载 / 完全清理     0) 退出
+    16) 删除线路    17) 升级 wm 脚本    18) 卸载 / 完全清理     0) 退出
 ────────────────────────────────────────────────
 MENU
         local choice id rid
@@ -3784,14 +3784,32 @@ MENU
         case "$(trim "$choice")" in
             1) create_transit_interactive ;;
             2) import_code_interactive ;;
-            3) if id="$(menu_pick_profile)"; then start_profile "$id"; fi ;;
-            4) if id="$(menu_pick_profile)"; then stop_profile "$id"; fi ;;
-            5) if id="$(menu_pick_profile)"; then health_profile "$id"; fi ;;
-            6) list_profile_ids | sed 's/^/  /' || printf '  (无线路)\n' ;;
-            7) if id="$(menu_pick_profile)"; then show_code "$id"; fi ;;
-            8) if id="$(menu_pick_profile)"; then refresh_code "$id"; fi ;;
-            9) if id="$(menu_pick_profile)"; then show_port_map "$id"; fi ;;
-            10)
+            3) create_exit_interactive ;;
+            4) import_exit_code ;;
+            5)
+                if id="$(menu_pick_profile relay)"; then
+                    printf '  操作:\n'
+                    printf '    1) 新增客户端\n'
+                    printf '    2) 列出客户端\n'
+                    printf '    3) 删除客户端\n'
+                    printf '    回车) 返回\n'
+                    read -r -p "选择操作: " rid </dev/tty
+                    case "$(trim "$rid")" in
+                        1) read -r -p "客户端名: " rid </dev/tty; add_client "$id" "$(trim "$rid")" ;;
+                        2) list_clients "$id" ;;
+                        3) if rid="$(menu_pick_client "$id")"; then del_client "$id" "$rid"; fi ;;
+                        *) : ;;
+                    esac
+                fi
+                ;;
+            6) if id="$(menu_pick_profile)"; then start_profile "$id"; fi ;;
+            7) if id="$(menu_pick_profile)"; then stop_profile "$id"; fi ;;
+            8) if id="$(menu_pick_profile)"; then health_profile "$id"; fi ;;
+            9) list_profile_ids | sed 's/^/  /' || printf '  (无线路)\n' ;;
+            10) if id="$(menu_pick_profile)"; then show_code "$id"; fi ;;
+            11) if id="$(menu_pick_profile)"; then refresh_code "$id"; fi ;;
+            12) if id="$(menu_pick_profile)"; then show_port_map "$id"; fi ;;
+            13)
                 local _lines _l
                 _lines="$(list_profile_ids)"
                 if [[ -z "$_lines" ]]; then
@@ -3817,43 +3835,25 @@ MENU
                     fi
                 fi
                 ;;
-            11) create_exit_interactive ;;
-            12) import_exit_code ;;
-            13)
-                if id="$(menu_pick_profile relay)"; then
-                    printf '  操作:\n'
-                    printf '    1) 新增客户端\n'
-                    printf '    2) 列出客户端\n'
-                    printf '    3) 删除客户端\n'
-                    printf '    回车) 返回\n'
-                    read -r -p "选择操作: " rid </dev/tty
-                    case "$(trim "$rid")" in
-                        1) read -r -p "客户端名: " rid </dev/tty; add_client "$id" "$(trim "$rid")" ;;
-                        2) list_clients "$id" ;;
-                        3) if rid="$(menu_pick_client "$id")"; then del_client "$id" "$rid"; fi ;;
-                        *) : ;;
-                    esac
-                fi
-                ;;
-            14) if id="$(menu_pick_profile)"; then delete_profile "$id"; fi ;;
-            15) upgrade_script; ok "重新加载菜单以应用新版本..."; exec "$WM_BIN" ;;
-            16) uninstall_from_menu ;;
-            17)
+            14)
                 local _mv=""
                 prompt _mv "Mimic 目标版本（留空=apt 仓库最新）" ""
                 update_mimic "$_mv"
                 ;;
-            18)
+            15)
                 local _sf="N"
                 if swgp_installed_ok 2>/dev/null; then
                     prompt _sf "swgp-go 已安装，强制重装为最新 release？[y/N]" "N"
                 fi
                 case "$_sf" in
                     [Yy]*) rm -f "$SWGP_BIN"; install_swgp \
-                        && info "新二进制已就位；请重启使用 swgp 的线路使其生效（菜单 4 停止 → 3 启动，或 wm restart <线路>）" ;;
+                        && info "新二进制已就位；请重启使用 swgp 的线路使其生效（菜单 7 停止 → 6 启动，或 wm restart <线路>）" ;;
                     *) install_swgp ;;
                 esac
                 ;;
+            16) if id="$(menu_pick_profile)"; then delete_profile "$id"; fi ;;
+            17) upgrade_script; ok "重新加载菜单以应用新版本..."; exec "$WM_BIN" ;;
+            18) uninstall_from_menu ;;
             0|q|Q) exit 0 ;;
             *) warn "无效选择" ;;
         esac
