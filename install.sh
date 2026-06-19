@@ -2,7 +2,7 @@
 # wg-mimic-fabric — WireGuard + Mimic tunnel orchestrator (MVP)
 set -Eeuo pipefail
 
-SCRIPT_VERSION="1.4.6"
+SCRIPT_VERSION="1.4.7"
 MIMIC_UPSTREAM_TAG="${MIMIC_UPSTREAM_TAG:-v0.7.0}"
 
 CONFIG_DIR="/etc/wg-mimic-fabric"
@@ -2158,13 +2158,16 @@ add_client() {
 }
 
 list_clients() {
-    local id c; id="$(resolve_profile_id "${1:-}")"
+    local id c _i=1; id="$(resolve_profile_id "${1:-}")"
     load_profile "$id"
     printf '网关 %s 客户端：\n' "$PROFILE_ID"
     for c in $(list_client_ids "$PROFILE_ID"); do
+        # 每个客户端在子 shell 内 safe_load_env 隔离环境变量；序号 $_i 由子 shell 继承读取，
+        # 自增放在子 shell 外（子 shell 内自增不会回传父进程）。
         ( # shellcheck disable=SC1090
           safe_load_env "$(client_env_path "$PROFILE_ID" "$c")" 2>/dev/null
-          printf '  - %s\t%s\n' "${CLIENT_NAME:-$c}" "${CLIENT_IP:-?}" )
+          printf '  %d) %s\t%s\n' "$_i" "${CLIENT_NAME:-$c}" "${CLIENT_IP:-?}" )
+        _i=$((_i + 1))
     done
     [[ -n "$(list_client_ids "$PROFILE_ID")" ]] || printf '  (无客户端；wm add-client %s <名>)\n' "$PROFILE_ID"
 }
