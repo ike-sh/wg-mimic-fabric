@@ -2,7 +2,7 @@
 # wg-mimic-fabric — WireGuard + Mimic tunnel orchestrator (MVP)
 set -Eeuo pipefail
 
-SCRIPT_VERSION="1.4.4"
+SCRIPT_VERSION="1.4.5"
 MIMIC_UPSTREAM_TAG="${MIMIC_UPSTREAM_TAG:-v0.7.0}"
 
 CONFIG_DIR="/etc/wg-mimic-fabric"
@@ -3822,11 +3822,17 @@ wg-mimic-fabric ${SCRIPT_VERSION} — 公网入口 ⇄ IX WireGuard 组网 + Mim
 EOF
 }
 
+# 清屏：交互菜单每轮在固定位置重绘，避免每次操作后整页向下无限滚动、把上一步结果挤出屏幕。
+clear_screen() {
+    if command -v clear >/dev/null 2>&1; then clear; else printf '\033[2J\033[3J\033[H'; fi
+}
+
 show_menu() {
     require_tty() { [[ -t 0 ]] || die "需要交互终端"; }
     require_tty
+    local choice id rid
     while true; do
-        printf '\n'
+        clear_screen
         printf '  wg-mimic-fabric  v%s\n' "$SCRIPT_VERSION"
         cat <<'MENU'
   WireGuard 组网 · Mimic 伪 TCP · swgp 流量混淆
@@ -3853,9 +3859,9 @@ show_menu() {
      16   删除线路    17   升级脚本    18   卸载 / 清理     0   退出
   ──────────────────────────────────────────────────
 MENU
-        local choice id rid
         read -r -p "  请输入序号 › " choice </dev/tty
         case "$(trim "$choice")" in
+            "") continue ;;
             1) create_transit_interactive ;;
             2) import_code_interactive ;;
             3) create_exit_interactive ;;
@@ -3949,9 +3955,11 @@ MENU
                     esac
                 fi
                 ;;
-            0|q|Q) exit 0 ;;
-            *) warn "无效选择" ;;
+            0|q|Q) clear_screen; exit 0 ;;
+            *) warn "无效选择：$choice" ;;
         esac
+        printf '\n'
+        read -r -p "  ── 回车返回菜单 ── " _ </dev/tty || true
     done
 }
 
