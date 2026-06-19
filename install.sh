@@ -2,7 +2,7 @@
 # wg-mimic-fabric — WireGuard + Mimic tunnel orchestrator (MVP)
 set -Eeuo pipefail
 
-SCRIPT_VERSION="1.4.5"
+SCRIPT_VERSION="1.4.6"
 MIMIC_UPSTREAM_TAG="${MIMIC_UPSTREAM_TAG:-v0.7.0}"
 
 CONFIG_DIR="/etc/wg-mimic-fabric"
@@ -3827,10 +3827,106 @@ clear_screen() {
     if command -v clear >/dev/null 2>&1; then clear; else printf '\033[2J\033[3J\033[H'; fi
 }
 
+# 单个菜单动作的执行体。由 show_menu 放入隔离子 shell 调用——分支内部任何
+# die / exit / 命令失败都只会终止那个子 shell（随后自动回到菜单），绝不再杀掉
+# 整个交互会话。需要替换/退出主进程的特例（17 升级后 exec、18 卸载后退出）这里
+# 只做“工作”本身，由 show_menu 在子 shell 结束后于主进程内收尾。
+menu_dispatch() {
+    local choice="$1" id rid
+    case "$choice" in
+        1) create_transit_interactive ;;
+        2) import_code_interactive ;;
+        3) create_exit_interactive ;;
+        4) import_exit_code ;;
+        5)
+            if id="$(menu_pick_profile relay)"; then
+                printf '  操作:\n'
+                printf '    1) 新增客户端\n'
+                printf '    2) 列出客户端\n'
+                printf '    3) 删除客户端\n'
+                printf '    4) 显示配置 / 二维码\n'
+                printf '    回车) 返回\n'
+                read -r -p "选择操作: " rid </dev/tty
+                case "$(trim "$rid")" in
+                    1) read -r -p "客户端名: " rid </dev/tty; add_client "$id" "$(trim "$rid")" ;;
+                    2) list_clients "$id" ;;
+                    3) if rid="$(menu_pick_client "$id")"; then del_client "$id" "$rid"; fi ;;
+                    4) if rid="$(menu_pick_client "$id")"; then show_client "$id" "$rid"; fi ;;
+                    *) : ;;
+                esac
+            fi
+            ;;
+        6) if id="$(menu_pick_profile)"; then start_profile "$id"; fi ;;
+        7) if id="$(menu_pick_profile)"; then stop_profile "$id"; fi ;;
+        8) if id="$(menu_pick_profile)"; then health_profile "$id"; fi ;;
+        9) list_profile_ids | sed 's/^/  /' || printf '  (无线路)\n' ;;
+        10) if id="$(menu_pick_profile)"; then show_code "$id"; fi ;;
+        11) if id="$(menu_pick_profile)"; then refresh_code "$id"; fi ;;
+        12) if id="$(menu_pick_profile)"; then show_port_map "$id"; fi ;;
+        13)
+            local _lines _l
+            _lines="$(list_profile_ids)"
+            if [[ -z "$_lines" ]]; then
+                warn "暂无线路，请先用 1)IX 创建 或 2)入口导入"
+            else
+                printf '\n现有线路与规则：\n'
+                while IFS= read -r _l; do [[ -n "$_l" ]] && list_rules "$_l"; done <<<"$_lines"
+                if id="$(menu_pick_profile)"; then
+                    printf '  操作:\n'
+                    printf '    1) 新增规则\n'
+                    printf '    2) 编辑规则\n'
+                    printf '    3) 删除规则\n'
+                    printf '    4) 设置端口池\n'
+                    printf '    回车) 返回\n'
+                    read -r -p "选择操作: " rid </dev/tty
+                    case "$(trim "$rid")" in
+                        1|add) add_rule "$id" ;;
+                        2|edit) if rid="$(menu_pick_rule "$id")"; then edit_rule "$id" "$rid"; fi ;;
+                        3|del) if rid="$(menu_pick_rule "$id")"; then delete_rule "$id" "$rid"; fi ;;
+                        4|pool) read -r -p "端口池(如 18300-18399；留空=清除): " rid </dev/tty; set_transit_pool "$id" "$(trim "$rid")" ;;
+                        *) : ;;
+                    esac
+                fi
+            fi
+            ;;
+        14)
+            local _mv=""
+            prompt _mv "Mimic 目标版本（留空=apt 仓库最新）" ""
+            update_mimic "$_mv"
+            ;;
+        15)
+            local _sf="N"
+            if swgp_installed_ok 2>/dev/null; then
+                prompt _sf "swgp-go 已安装，强制重装为最新 release？[y/N]" "N"
+            fi
+            case "$_sf" in
+                [Yy]*) rm -f "$SWGP_BIN"; install_swgp \
+                    && info "新二进制已就位；请重启使用 swgp 的线路使其生效（菜单 7 停止 → 6 启动，或 wm restart <线路>）" ;;
+                *) install_swgp ;;
+            esac
+            ;;
+        16) if id="$(menu_pick_profile)"; then delete_profile "$id"; fi ;;
+        17) upgrade_script ;;
+        18) uninstall_from_menu ;;
+        19)
+            if id="$(menu_pick_profile)"; then
+                printf '  MTU 操作:\n    1) 自动探测并设置（automtu，推荐；两端各跑一次）\n    2) 手动设置\n    回车) 返回\n'
+                read -r -p "选择操作: " rid </dev/tty
+                case "$(trim "$rid")" in
+                    1) auto_mtu "$id" ;;
+                    2) read -r -p "MTU 值(1280-1500): " rid </dev/tty; set_profile_mtu "$id" "$(trim "$rid")" ;;
+                    *) : ;;
+                esac
+            fi
+            ;;
+        *) warn "无效选择：$choice" ;;
+    esac
+}
+
 show_menu() {
     require_tty() { [[ -t 0 ]] || die "需要交互终端"; }
     require_tty
-    local choice id rid
+    local choice id rid _rc
     while true; do
         clear_screen
         printf '  wg-mimic-fabric  v%s\n' "$SCRIPT_VERSION"
@@ -3860,103 +3956,24 @@ show_menu() {
   ──────────────────────────────────────────────────
 MENU
         read -r -p "  请输入序号 › " choice </dev/tty
-        case "$(trim "$choice")" in
+        choice="$(trim "$choice")"
+        # 控制流（空回车刷新 / 退出）必须作用于主进程本身，不能放进子 shell
+        case "$choice" in
             "") continue ;;
-            1) create_transit_interactive ;;
-            2) import_code_interactive ;;
-            3) create_exit_interactive ;;
-            4) import_exit_code ;;
-            5)
-                if id="$(menu_pick_profile relay)"; then
-                    printf '  操作:\n'
-                    printf '    1) 新增客户端\n'
-                    printf '    2) 列出客户端\n'
-                    printf '    3) 删除客户端\n'
-                    printf '    4) 显示配置 / 二维码\n'
-                    printf '    回车) 返回\n'
-                    read -r -p "选择操作: " rid </dev/tty
-                    case "$(trim "$rid")" in
-                        1) read -r -p "客户端名: " rid </dev/tty; add_client "$id" "$(trim "$rid")" ;;
-                        2) list_clients "$id" ;;
-                        3) if rid="$(menu_pick_client "$id")"; then del_client "$id" "$rid"; fi ;;
-                        4) if rid="$(menu_pick_client "$id")"; then show_client "$id" "$rid"; fi ;;
-                        *) : ;;
-                    esac
-                fi
-                ;;
-            6) if id="$(menu_pick_profile)"; then start_profile "$id"; fi ;;
-            7) if id="$(menu_pick_profile)"; then stop_profile "$id"; fi ;;
-            8) if id="$(menu_pick_profile)"; then health_profile "$id"; fi ;;
-            9) list_profile_ids | sed 's/^/  /' || printf '  (无线路)\n' ;;
-            10) if id="$(menu_pick_profile)"; then show_code "$id"; fi ;;
-            11) if id="$(menu_pick_profile)"; then refresh_code "$id"; fi ;;
-            12) if id="$(menu_pick_profile)"; then show_port_map "$id"; fi ;;
-            13)
-                local _lines _l
-                _lines="$(list_profile_ids)"
-                if [[ -z "$_lines" ]]; then
-                    warn "暂无线路，请先用 1)IX 创建 或 2)入口导入"
-                else
-                    printf '\n现有线路与规则：\n'
-                    while IFS= read -r _l; do [[ -n "$_l" ]] && list_rules "$_l"; done <<<"$_lines"
-                    if id="$(menu_pick_profile)"; then
-                        printf '  操作:\n'
-                        printf '    1) 新增规则\n'
-                        printf '    2) 编辑规则\n'
-                        printf '    3) 删除规则\n'
-                        printf '    4) 设置端口池\n'
-                        printf '    回车) 返回\n'
-                        read -r -p "选择操作: " rid </dev/tty
-                        case "$(trim "$rid")" in
-                            1|add) add_rule "$id" ;;
-                            2|edit) if rid="$(menu_pick_rule "$id")"; then edit_rule "$id" "$rid"; fi ;;
-                            3|del) if rid="$(menu_pick_rule "$id")"; then delete_rule "$id" "$rid"; fi ;;
-                            4|pool) read -r -p "端口池(如 18300-18399；留空=清除): " rid </dev/tty; set_transit_pool "$id" "$(trim "$rid")" ;;
-                            *) : ;;
-                        esac
-                    fi
-                fi
-                ;;
-            14)
-                local _mv=""
-                prompt _mv "Mimic 目标版本（留空=apt 仓库最新）" ""
-                update_mimic "$_mv"
-                ;;
-            15)
-                local _sf="N"
-                if swgp_installed_ok 2>/dev/null; then
-                    prompt _sf "swgp-go 已安装，强制重装为最新 release？[y/N]" "N"
-                fi
-                case "$_sf" in
-                    [Yy]*) rm -f "$SWGP_BIN"; install_swgp \
-                        && info "新二进制已就位；请重启使用 swgp 的线路使其生效（菜单 7 停止 → 6 启动，或 wm restart <线路>）" ;;
-                    *) install_swgp ;;
-                esac
-                ;;
-            16) if id="$(menu_pick_profile)"; then delete_profile "$id"; fi ;;
-            17) upgrade_script; ok "重新加载菜单以应用新版本..."; exec "$WM_BIN" ;;
-            18)
-                # 子 shell 隔离：内部确认时若用户取消（die→exit）只退出子 shell、返回菜单，
-                # 不再误杀整个会话。卸载/清理成功后 wm 本体已删除，自动退出菜单而非循环回显。
-                ( uninstall_from_menu ) || true
-                if [[ ! -e "$WM_BIN" ]]; then
-                    printf '\n[OK] wm 已移除，退出菜单。\n'
-                    exit 0
-                fi
-                ;;
-            19)
-                if id="$(menu_pick_profile)"; then
-                    printf '  MTU 操作:\n    1) 自动探测并设置（automtu，推荐；两端各跑一次）\n    2) 手动设置\n    回车) 返回\n'
-                    read -r -p "选择操作: " rid </dev/tty
-                    case "$(trim "$rid")" in
-                        1) auto_mtu "$id" ;;
-                        2) read -r -p "MTU 值(1280-1500): " rid </dev/tty; set_profile_mtu "$id" "$(trim "$rid")" ;;
-                        *) : ;;
-                    esac
-                fi
-                ;;
             0|q|Q) clear_screen; exit 0 ;;
-            *) warn "无效选择：$choice" ;;
+        esac
+        # 业务动作隔离执行：临时关闭父 shell 的 errexit，子 shell 内重新开启完整
+        # set -Eeuo pipefail（与 CLI 报错语义完全一致）→ 动作内部任何 die/exit/命令
+        # 失败都只终止该子 shell → 捕获返回码 → 恢复父 errexit → 回到菜单。从此单个
+        # 操作报错不再杀掉整个交互会话。
+        set +e
+        ( set -Eeuo pipefail; menu_dispatch "$choice" )
+        _rc=$?
+        set -e
+        # 需要替换 / 退出主进程的两个特例，在子 shell 成功结束后于主进程内收尾
+        case "$choice" in
+            17) if (( _rc == 0 )); then ok "重新加载菜单以应用新版本..."; exec "$WM_BIN"; fi ;;
+            18) if [[ ! -e "$WM_BIN" ]]; then printf '\n[OK] wm 已移除，退出菜单。\n'; exit 0; fi ;;
         esac
         printf '\n'
         read -r -p "  ── 回车返回菜单 ── " _ </dev/tty || true
