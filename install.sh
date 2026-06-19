@@ -2,7 +2,7 @@
 # wg-mimic-fabric — WireGuard + Mimic tunnel orchestrator (MVP)
 set -Eeuo pipefail
 
-SCRIPT_VERSION="1.4.7"
+SCRIPT_VERSION="1.4.8"
 MIMIC_UPSTREAM_TAG="${MIMIC_UPSTREAM_TAG:-v0.7.0}"
 
 CONFIG_DIR="/etc/wg-mimic-fabric"
@@ -2998,7 +2998,7 @@ auto_mtu() {
         case "${ROLE:-}" in
             exit|nat-transit)
                 # 被动监听端：对端(网关/入口)常在 NAT 后，无法从这里主动探测；引导手动同步 MTU
-                die "本端是被动监听端（${ROLE}），对端(网关/入口)多在 NAT 后、无法从这里主动探测。请在【对端机】跑 'wm automtu <对端线路>' 得到 MTU，再回本端 'wm set-mtu ${id} <该值>' 设为同值（菜单 19 → 2 手动设置）" ;;
+                die "本端是被动监听端（${ROLE}），对端(网关/入口)多在 NAT 后、无法从这里主动探测。请在【对端机】跑 'wm automtu <对端线路>' 得到 MTU，再回本端 'wm set-mtu ${id} <该值>' 设为同值（菜单 14 → 2 手动设置）" ;;
             *)
                 die "隧道不通（ping ${peer} 失败）——先确保 wm test ${id} 能通再 automtu" ;;
         esac
@@ -3832,7 +3832,7 @@ clear_screen() {
 
 # 单个菜单动作的执行体。由 show_menu 放入隔离子 shell 调用——分支内部任何
 # die / exit / 命令失败都只会终止那个子 shell（随后自动回到菜单），绝不再杀掉
-# 整个交互会话。需要替换/退出主进程的特例（17 升级后 exec、18 卸载后退出）这里
+# 整个交互会话。需要替换/退出主进程的特例（18 升级后 exec、19 卸载后退出）这里
 # 只做“工作”本身，由 show_menu 在子 shell 结束后于主进程内收尾。
 menu_dispatch() {
     local choice="$1" id rid
@@ -3893,25 +3893,6 @@ menu_dispatch() {
             fi
             ;;
         14)
-            local _mv=""
-            prompt _mv "Mimic 目标版本（留空=apt 仓库最新）" ""
-            update_mimic "$_mv"
-            ;;
-        15)
-            local _sf="N"
-            if swgp_installed_ok 2>/dev/null; then
-                prompt _sf "swgp-go 已安装，强制重装为最新 release？[y/N]" "N"
-            fi
-            case "$_sf" in
-                [Yy]*) rm -f "$SWGP_BIN"; install_swgp \
-                    && info "新二进制已就位；请重启使用 swgp 的线路使其生效（菜单 7 停止 → 6 启动，或 wm restart <线路>）" ;;
-                *) install_swgp ;;
-            esac
-            ;;
-        16) if id="$(menu_pick_profile)"; then delete_profile "$id"; fi ;;
-        17) upgrade_script ;;
-        18) uninstall_from_menu ;;
-        19)
             if id="$(menu_pick_profile)"; then
                 printf '  MTU 操作:\n    1) 自动探测并设置（automtu，推荐；两端各跑一次）\n    2) 手动设置\n    回车) 返回\n'
                 read -r -p "选择操作: " rid </dev/tty
@@ -3922,6 +3903,25 @@ menu_dispatch() {
                 esac
             fi
             ;;
+        15)
+            local _mv=""
+            prompt _mv "Mimic 目标版本（留空=apt 仓库最新）" ""
+            update_mimic "$_mv"
+            ;;
+        16)
+            local _sf="N"
+            if swgp_installed_ok 2>/dev/null; then
+                prompt _sf "swgp-go 已安装，强制重装为最新 release？[y/N]" "N"
+            fi
+            case "$_sf" in
+                [Yy]*) rm -f "$SWGP_BIN"; install_swgp \
+                    && info "新二进制已就位；请重启使用 swgp 的线路使其生效（菜单 7 停止 → 6 启动，或 wm restart <线路>）" ;;
+                *) install_swgp ;;
+            esac
+            ;;
+        17) if id="$(menu_pick_profile)"; then delete_profile "$id"; fi ;;
+        18) upgrade_script ;;
+        19) uninstall_from_menu ;;
         *) warn "无效选择：$choice" ;;
     esac
 }
@@ -3949,13 +3949,13 @@ show_menu() {
   【线路运维】两种模式通用
       6   启动       7   停止       8   健康检查    9   列出线路
      10   接入码    11   刷新码    12   端口地图   13   规则管理
-     19   MTU 调整（自动探测 / 手动设置）
+     14   MTU 调整（自动探测 / 手动设置）
 
   【组件维护】内核模块 / 混淆代理
-     14   更新 Mimic 模块     15   安装 / 修复 swgp-go
+     15   更新 Mimic 模块     16   安装 / 修复 swgp-go
 
   【系统维护】
-     16   删除线路    17   升级脚本    18   卸载 / 清理     0   退出
+     17   删除线路    18   升级脚本    19   卸载 / 清理     0   退出
   ──────────────────────────────────────────────────
 MENU
         read -r -p "  请输入序号 › " choice </dev/tty
@@ -3975,8 +3975,8 @@ MENU
         set -e
         # 需要替换 / 退出主进程的两个特例，在子 shell 成功结束后于主进程内收尾
         case "$choice" in
-            17) if (( _rc == 0 )); then ok "重新加载菜单以应用新版本..."; exec "$WM_BIN"; fi ;;
-            18) if [[ ! -e "$WM_BIN" ]]; then printf '\n[OK] wm 已移除，退出菜单。\n'; exit 0; fi ;;
+            18) if (( _rc == 0 )); then ok "重新加载菜单以应用新版本..."; exec "$WM_BIN"; fi ;;
+            19) if [[ ! -e "$WM_BIN" ]]; then printf '\n[OK] wm 已移除，退出菜单。\n'; exit 0; fi ;;
         esac
         printf '\n'
         read -r -p "  ── 回车返回菜单 ── " _ </dev/tty || true
