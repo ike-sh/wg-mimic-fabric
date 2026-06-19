@@ -1,6 +1,6 @@
 # 公网入口 ⇄ IX（WireGuard 组网）→ 落地
 
-对标 [ix-transit-fabric](https://github.com/ike-sh/ix-transit-fabric)，但组网改用 **WireGuard**：公网入口与 IX 经 WG 点对点互联，链路由 **Mimic** 伪装成 TCP；IX 经 nft 转发到落地。
+对标同类 IX 中转方案，但组网改用 **WireGuard**：公网入口与 IX 经 WG 点对点互联，链路由 **Mimic** 伪装成 TCP；IX 经 nft 转发到落地。
 
 ## 架构
 

@@ -2,7 +2,7 @@
 # wg-mimic-fabric — WireGuard + Mimic tunnel orchestrator (MVP)
 set -Eeuo pipefail
 
-SCRIPT_VERSION="1.4.3"
+SCRIPT_VERSION="1.4.4"
 MIMIC_UPSTREAM_TAG="${MIMIC_UPSTREAM_TAG:-v0.7.0}"
 
 CONFIG_DIR="/etc/wg-mimic-fabric"
@@ -3827,36 +3827,34 @@ show_menu() {
     require_tty
     while true; do
         printf '\n'
-        printf '════════════════════════════════════════════════\n'
-        printf '   wg-mimic-fabric · 管理控制台    v%s\n' "$SCRIPT_VERSION"
+        printf '  wg-mimic-fabric  v%s\n' "$SCRIPT_VERSION"
         cat <<'MENU'
-   WireGuard 组网 · Mimic 伪 TCP 伪装 · swgp 流量混淆
-   作者 ike · github.com/ike-sh/wg-mimic-fabric
-════════════════════════════════════════════════
+  WireGuard 组网 · Mimic 伪 TCP · swgp 流量混淆
+  ──────────────────────────────────────────────────
 
- ▸ 模式一：IX 中转组网（端口转发 / 中转加速）
-     1) 创建中转线路（IX 侧，生成接入码）
-     2) 导入接入码（公网服务器入口接入）
+  【模式一】IX 中转组网 · 端口转发 / 中转加速
+      1   创建中转线路（IX 侧，生成接入码）
+      2   导入接入码（公网入口接入）
 
- ▸ 模式二：全局出口（混淆翻墙，国内 A → 国外 B）
-     3) 创建国外出口 B（生成出口接入码）
-     4) 导入出口接入码（国内服务器 A 接入）
-     5) 客户端管理（新增 / 列出 / 删除，自动出二维码）
+  【模式二】全局出口 · 混淆翻墙（国内 A → 国外 B）
+      3   创建国外出口 B（生成出口接入码）
+      4   导入出口接入码（国内 A 接入）
+      5   客户端管理（新增 / 列出 / 删除，自动二维码）
 
- ▸ 线路运维（两种模式通用）
-     6) 启动线路      7) 停止线路      8) 健康检查      9) 列出线路
-    10) 显示接入码    11) 刷新接入码    12) 端口地图    13) 转发规则管理
-    19) MTU 调整（自动探测 automtu / 手动设置）
+  【线路运维】两种模式通用
+      6   启动       7   停止       8   健康检查    9   列出线路
+     10   接入码    11   刷新码    12   端口地图   13   规则管理
+     19   MTU 调整（自动探测 / 手动设置）
 
- ▸ 组件维护（内核模块 / 混淆代理）
-    14) 更新 Mimic 模块    15) 安装 / 修复 swgp-go
+  【组件维护】内核模块 / 混淆代理
+     14   更新 Mimic 模块     15   安装 / 修复 swgp-go
 
- ▸ 系统维护
-    16) 删除线路    17) 升级 wm 脚本    18) 卸载 / 完全清理     0) 退出
-────────────────────────────────────────────────
+  【系统维护】
+     16   删除线路    17   升级脚本    18   卸载 / 清理     0   退出
+  ──────────────────────────────────────────────────
 MENU
         local choice id rid
-        read -r -p "选择: " choice </dev/tty
+        read -r -p "  请输入序号 › " choice </dev/tty
         case "$(trim "$choice")" in
             1) create_transit_interactive ;;
             2) import_code_interactive ;;
