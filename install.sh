@@ -2,7 +2,7 @@
 # wg-mimic-fabric — WireGuard + Mimic tunnel orchestrator (MVP)
 set -Eeuo pipefail
 
-SCRIPT_VERSION="1.4.8"
+SCRIPT_VERSION="1.4.9"
 MIMIC_UPSTREAM_TAG="${MIMIC_UPSTREAM_TAG:-v0.7.0}"
 
 CONFIG_DIR="/etc/wg-mimic-fabric"
@@ -25,6 +25,7 @@ SYSTEMD_MIMIC_TEMPLATE="/etc/systemd/system/wg-mimic-mimic@.service"
 SYSTEMD_TUNNEL_TEMPLATE="/etc/systemd/system/wg-mimic-tunnel@.service"
 SYSTEMD_OFFLOAD_TEMPLATE="/etc/systemd/system/wg-mimic-offload@.service"
 SYSCTL_FILE="/etc/sysctl.d/99-wg-mimic-fabric.conf"
+SYSCTL_QOS_FILE="/etc/sysctl.d/98-wg-mimic-fabric-qos.conf"
 SYSTEMD_DDNS_SERVICE="/etc/systemd/system/wg-mimic-ddns.service"
 SYSTEMD_DDNS_TIMER="/etc/systemd/system/wg-mimic-ddns.timer"
 SYSTEMD_AUTOSWITCH_SERVICE="/etc/systemd/system/wg-mimic-autoswitch@.service"
@@ -57,6 +58,25 @@ kernel_ge_61() {
     }'
 }
 
+# 云厂商精简「cloud」内核（如 Debian 13 cloud-amd64）常裁剪/魔改网络栈，
+# 即便内核≥6.1 且有 BTF，Mimic 的 XDP/eBPF 仍可能挂载崩溃（dmesg 见 Tainted / XDP
+# 报错）、隧道单通或假死。标准内核可规避。
+kernel_is_cloud() {
+    case "$(uname -r)" in
+        *-cloud-*|*-cloud) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+cloud_kernel_advisory() {
+    kernel_is_cloud || return 1
+    local std="linux-image-amd64"
+    case "$(uname -m)" in aarch64|arm64) std="linux-image-arm64" ;; esac
+    warn "检测到 cloud 精简内核（$(uname -r)）：其网络栈常被裁剪/魔改，可能令 Mimic 的 XDP/eBPF 挂载崩溃（dmesg 见 Tainted / XDP 报错）、隧道单通或假死。"
+    warn "建议改用标准内核后重试：apt install -y ${std} && reboot，重启后再 wm start。"
+    return 0
+}
+
 compat_os_report() {
     local id tier note
     id="$(detect_os_id)"
@@ -75,8 +95,11 @@ compat_os_report() {
     if ! kernel_ge_61; then
         tier="unsupported"
         note="内核 $(uname -r) < 6.1，Mimic 无法运行"
+    elif kernel_is_cloud; then
+        note="${note}；⚠ 检测到 cloud 内核，XDP 可能崩溃，建议换标准内核 linux-image-amd64"
     fi
-    printf 'OS_ID=%s\nCOMPAT_TIER=%s\nCOMPAT_NOTE=%s\n' "$id" "$tier" "$note"
+    printf 'OS_ID=%s\nCOMPAT_TIER=%s\nCOMPAT_NOTE=%s\nCLOUD_KERNEL=%s\n' \
+        "$id" "$tier" "$note" "$(kernel_is_cloud && printf yes || printf no)"
 }
 
 ensure_ip_forward() {
@@ -86,6 +109,30 @@ ensure_ip_forward() {
         printf 'net.ipv4.ip_forward=1\n'
         printf 'net.ipv6.conf.all.forwarding=1\n'
     } >"$SYSCTL_FILE"
+}
+
+# 按角色优化队列调度与拥塞控制（持久化到独立 sysctl 文件）：
+#  - 纯 NAT 转发节点(nat-transit / nat-ingress)：数据包不过本地 TCP 状态机，BBR 无效，
+#    仅启用 FQ 做发包 pacing，削平并发微突发对跨国隧道的冲击、压低抖动。
+#  - 终结 TCP 的落地/出口(exit / relay)：FQ + BBR(若内核可用) 由实际 TCP 连接精准探测
+#    带宽、控速，消除 bufferbloat（缓冲膨胀）。
+apply_net_tuning() {
+    local role="${1:-${ROLE:-}}"
+    local qdisc="fq" cc=""
+    case "$role" in
+        exit|relay) cc="bbr" ;;
+    esac
+    if [[ -n "$cc" ]]; then
+        modprobe tcp_bbr 2>/dev/null || true
+        sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -qw bbr || cc=""
+    fi
+    sysctl -w net.core.default_qdisc="$qdisc" >/dev/null 2>&1 || true
+    [[ -n "$cc" ]] && sysctl -w net.ipv4.tcp_congestion_control="$cc" >/dev/null 2>&1 || true
+    {
+        printf '# wg-mimic-fabric 网络调优（角色: %s）— 中转/入口仅 FQ；出口/落地 FQ+BBR\n' "${role:-?}"
+        printf 'net.core.default_qdisc=%s\n' "$qdisc"
+        if [[ -n "$cc" ]]; then printf 'net.ipv4.tcp_congestion_control=%s\n' "$cc"; fi
+    } >"$SYSCTL_QOS_FILE"
 }
 
 # ── utilities ──────────────────────────────────────────────────────────────
@@ -1820,6 +1867,7 @@ start_profile() {
     load_profile "$1"
     if obfs_has_mimic; then
         mimic_needs_reboot && offer_reboot "start ${PROFILE_ID}"
+        cloud_kernel_advisory || true
         ensure_mimic
     fi
     install_systemd_units
@@ -1827,6 +1875,7 @@ start_profile() {
     apply_profile_configs
     apply_nft_all
     ensure_ip_forward
+    apply_net_tuning "${ROLE:-}"
     # swgp 必须先于 WG 隧道起来（relay 的 WG 拨本机 swgp client）
     if obfs_has_swgp; then systemctl enable --now "wg-mimic-swgp@${PROFILE_ID}.service" 2>/dev/null || true; fi
     if obfs_has_mimic; then ensure_mimic_service_up "$WAN_IFACE"; fi
@@ -1997,12 +2046,13 @@ import_exit_code() {
     parse_code "$code"
     [[ "${CODE_KIND:-}" == "exit" ]] || die "这不是出口接入码（需 nat-exit-code）；普通中转码请用 wm import-code"
     relay_id="${CODE_PROFILE_ID}-relay"
-    local prev_ahost="" prev_cport=""
+    local prev_ahost="" prev_cport="" prev_mtu=""
     if [[ -f "$(profile_env_path "$relay_id")" ]]; then
         local _u="Y"; prompt _u "网关线路 ${relay_id} 已存在，用此码更新它吗？[Y/n]" "Y"
         case "$_u" in [Nn]*) die "已取消" ;; esac
-        local _pv; _pv="$(load_profile "$relay_id" 2>/dev/null; printf '%s\t%s' "${A_PUBLIC_HOST:-}" "${CLIENT_WG_PORT:-}")" || _pv=""
-        prev_ahost="${_pv%%$'\t'*}"; prev_cport="${_pv#*$'\t'}"
+        local _pv _rest; _pv="$(load_profile "$relay_id" 2>/dev/null; printf '%s\t%s\t%s' "${A_PUBLIC_HOST:-}" "${CLIENT_WG_PORT:-}" "${WG_MTU:-}")" || _pv=""
+        prev_ahost="${_pv%%$'\t'*}"; _rest="${_pv#*$'\t'}"; prev_cport="${_rest%%$'\t'*}"; prev_mtu="${_rest#*$'\t'}"
+        [[ -n "$prev_mtu" && "$prev_mtu" != "${CODE_WG_MTU}" ]] && info "保留本机已设隧道 MTU ${prev_mtu}（接入码内为 ${CODE_WG_MTU}；如需改用码内值: wm set-mtu ${relay_id} ${CODE_WG_MTU}）"
         stop_profile "$relay_id" >/dev/null 2>&1 || true
     fi
     a_priv="$(printf '%s' "$CODE_INGRESS_PRIVKEY_B64" | base64url_decode)"
@@ -2027,14 +2077,15 @@ import_exit_code() {
     if [[ -n "$egress_ip" && -n "$local_ip" && "$egress_ip" != "$local_ip" ]]; then
         warn "本机疑似 NAT 机：客户端走 WireGuard=UDP，需商家把 ${a_public}:${client_port} 的【UDP】转发到内网 ${local_ip}；只转 TCP 客户端永远握手不上"
     fi
-    # 客户端 MTU 从隧道 MTU 派生（再减客户端↔A 那层 WG 的 ~80B 头部），避免「隧道1400/客户端却1280」的不一致
-    local client_mtu=$(( ${CODE_WG_MTU:-1400} - 80 )); (( client_mtu < 1280 )) && client_mtu=1280
+    # 客户端 MTU 从隧道 MTU 派生（再减客户端↔A 那层 WG 的 ~80B 头部）；更新时跟随本机已设隧道 MTU
+    local eff_wg_mtu="${prev_mtu:-${CODE_WG_MTU:-1400}}"
+    local client_mtu=$(( eff_wg_mtu - 80 )); (( client_mtu < 1280 )) && client_mtu=1280
 
     write_profile_kv "$(profile_env_path "$relay_id")" \
         "PROFILE_ID=${relay_id}" "PROFILE_NAME=${relay_id}" "ROLE=relay" "ENABLED=true" \
         "WAN_IFACE=${wan_iface}" "WG_MESH_SUBNET=${CODE_WG_MESH_SUBNET}" "WG_IX_IP=${CODE_IX_WG_IP}" \
         "WG_INGRESS_IP=${CODE_INGRESS_WG_IP}" "IP_VERSION=${CODE_IP_VERSION:-4}" \
-        "WG_PORT=${CODE_WG_PORT}" "WG_MTU=${CODE_WG_MTU}" "IX_ENDPOINT_HOST=${CODE_IX_ENDPOINT_HOST}" \
+        "WG_PORT=${CODE_WG_PORT}" "WG_MTU=${eff_wg_mtu}" "IX_ENDPOINT_HOST=${CODE_IX_ENDPOINT_HOST}" \
         "WG_PRIVATE_KEY=${a_priv}" "WG_PUBLIC_KEY=${a_pub}" "WG_PEER_PUBLIC_KEY=${CODE_IX_WG_PUBKEY}" \
         "MIMIC_KEEPALIVE=${CODE_MIMIC_KEEPALIVE:-300:::}" "MIMIC_XDP_MODE=${xdp}" \
         "OBFS_MODE=${CODE_OBFS_MODE}" "SWGP_MODE=${CODE_SWGP_MODE}" "SWGP_PSK=${CODE_SWGP_PSK}" \
@@ -2340,7 +2391,7 @@ import_code_interactive() {
     ensure_mimic_kmod_loaded || warn "mimic 内核模块未加载，请 reboot 或安装 linux-headers-\$(uname -r)"
 
     local code ingress_id wan_iface public_ip ing_priv ing_pub
-    local updating=0 prev_host="" prev_iface=""
+    local updating=0 prev_host="" prev_iface="" prev_mtu=""
     printf '\n── 导入接入码（模式一 · 公网入口接入）──\n' >&2
     printf '把 IX 侧「创建中转线路」时生成的 WMGF1 接入码粘贴到此处，公网入口将自动建立到 IX 的 mimic 隧道并按规则开放入口端口。\n\n' >&2
     printf '请粘贴接入码（WMGF1: 开头）：' >&2
@@ -2359,11 +2410,14 @@ import_code_interactive() {
             [Nn]*) die "已取消（如需彻底重建：wm stop ${ingress_id} 后删除其 profile 再重导）" ;;
         esac
         updating=1
-        # 保留本机已配置的公网IP/网卡作默认值
-        local _pv
-        _pv="$(load_profile "$ingress_id" 2>/dev/null; printf '%s\t%s' "${INGRESS_PUBLIC_HOST:-}" "${WAN_IFACE:-}")" || _pv=""
+        # 保留本机已配置的公网IP/网卡/已手动设定的隧道 MTU 作默认值
+        local _pv _rest
+        _pv="$(load_profile "$ingress_id" 2>/dev/null; printf '%s\t%s\t%s' "${INGRESS_PUBLIC_HOST:-}" "${WAN_IFACE:-}" "${WG_MTU:-}")" || _pv=""
         prev_host="${_pv%%$'\t'*}"
-        prev_iface="${_pv#*$'\t'}"
+        _rest="${_pv#*$'\t'}"
+        prev_iface="${_rest%%$'\t'*}"
+        prev_mtu="${_rest#*$'\t'}"
+        [[ -n "$prev_mtu" && "$prev_mtu" != "${CODE_WG_MTU}" ]] && info "保留本机已设隧道 MTU ${prev_mtu}（接入码内为 ${CODE_WG_MTU}；如需改用码内值: wm set-mtu ${ingress_id} ${CODE_WG_MTU}）"
         info "更新模式：停止旧线路 → 同步新接入码的规则集（保留各规则已选客户端入口端口）"
         stop_profile "$ingress_id" >/dev/null 2>&1 || true
     fi
@@ -2402,7 +2456,7 @@ import_code_interactive() {
         "WG_IX_IP6=${CODE_IX_WG_IP6}" \
         "WG_INGRESS_IP6=${CODE_INGRESS_WG_IP6}" \
         "WG_PORT=${CODE_WG_PORT}" \
-        "WG_MTU=${CODE_WG_MTU}" \
+        "WG_MTU=${prev_mtu:-${CODE_WG_MTU}}" \
         "IX_ENDPOINT_HOST=${CODE_IX_ENDPOINT_HOST}" \
         "WG_PRIVATE_KEY=${ing_priv}" \
         "WG_PUBLIC_KEY=${ing_pub}" \
@@ -2689,6 +2743,7 @@ diagnose_profile() {
     command_exists mimic && ok "mimic CLI" || warn "缺少 mimic"
     mimic_module_loaded && ok "mimic kernel module" || warn "mimic 内核模块未加载"
     if kernel_ge_61; then ok "kernel >= 6.1 ($(uname -r))"; else warn "kernel < 6.1 ($(uname -r))"; fi
+    if kernel_is_cloud; then warn "cloud 精简内核 ($(uname -r))：XDP/eBPF 易崩（隧道单通/假死），建议换标准内核 linux-image-amd64 后 reboot"; else ok "非 cloud 内核 ($(uname -r))"; fi
     [[ -f /sys/kernel/btf/vmlinux ]] && ok "BTF vmlinux" || warn "无 BTF（精简内核可能需 kprobe 编 mimic）"
     [[ "$(sysctl -n net.ipv4.ip_forward 2>/dev/null)" == "1" ]] && ok "ip_forward" || warn "ip_forward 未开启"
     [[ -n "${WAN_IFACE:-}" ]] && printf '  Mimic 绑定网卡: %s（驱动 %s，XDP %s）\n' \
@@ -2847,6 +2902,11 @@ test_profile() {
     if   (( loss <= 2 ));  then ok   "线路质量良好（丢包 ${loss}%）"
     elif (( loss <= 10 )); then warn "线路质量一般（丢包 ${loss}%，TCP/延迟测速可能受影响）"
     else                        warn "线路质量差（丢包 ${loss}%，建议换中转：wm set-endpoint ${PROFILE_ID} <新中转IP>）"
+    fi
+    if (( loss <= 10 )); then
+        printf '  提示：若「能 ping 通但网页打不开 / 大文件卡死」，常见两因：\n'
+        printf '    1) MTU 黑洞——跨海链路实际 MTU 偏小且 ICMP 被静默丢弃，automtu 可能高估；两端试 wm set-mtu %s 1380。\n' "$PROFILE_ID"
+        printf '    2) 上游 DDoS 清洗——清洗时放行 ICMP/长连接却拦截 TCP 握手（ping 通却连不上），多为暂时性，待清洗结束自愈。\n'
     fi
 }
 
@@ -3685,7 +3745,7 @@ uninstall_wm_core() {
         if nft list table inet "$NFT_TABLE" >/dev/null 2>&1; then
             nft delete table inet "$NFT_TABLE" 2>/dev/null || true
         fi
-        rm -f "$NFT_FILE" "$SYSCTL_FILE" "$SWGP_BIN"
+        rm -f "$NFT_FILE" "$SYSCTL_FILE" "$SYSCTL_QOS_FILE" "$SWGP_BIN"
         # 清理本工具写入 /etc/mimic 的 .conf / .xdp（否则随后 dpkg purge mimic 会报「目录非空未删」）
         rm -f "${MIMIC_CONF_DIR}"/*.conf "${MIMIC_CONF_DIR}"/*.xdp 2>/dev/null || true
         rm -rf "$CONFIG_DIR" "$LIBEXEC_DIR"

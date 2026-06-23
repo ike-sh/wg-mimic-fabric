@@ -1,5 +1,24 @@
 # Changelog
 
+## [1.4.9] - 2026-06-23
+
+### Added（按今晚真机复盘固化的运维经验）
+
+- **Cloud 精简内核识别与换核引导**：云厂商 `cloud` 内核（如 Debian 13 `cloud-amd64`）即便内核 ≥6.1 且有 BTF，仍常裁剪/魔改网络栈，导致 Mimic 的 XDP/eBPF 挂载崩溃（dmesg 见 `Tainted: G W OE` / XDP 报错）、隧道单通或假死——此前 `compat`/`diagnose` 两项检查都「通过」却查不出真因。新增 `kernel_is_cloud` 检测（`uname -r` 含 `-cloud`），并在 `wm compat`（新增 `CLOUD_KERNEL=` 行）、`wm diagnose`（显式告警）、以及 `wm start` 启用 mimic 前给出明确提示：建议 `apt install -y linux-image-amd64 && reboot` 换标准内核。
+- **按角色自动优化队列调度 / 拥塞控制（FQ vs BBR）**：新增 `apply_net_tuning`，`wm start` 时按线路角色写入 `/etc/sysctl.d/98-wg-mimic-fabric-qos.conf`——
+  - **中转 / 入口**（`nat-transit` / `nat-ingress`，纯 NAT 端口转发不过本地 TCP 状态机，BBR 无效）：仅启用 `fq`，靠 pacing 平滑发包、削平并发微突发对跨国隧道的冲击、压低抖动；
+  - **出口 / 落地**（`exit` / `relay`，实际终结 TCP）：`fq` + `bbr`（内核 `tcp_bbr` 可用时），由真实 TCP 连接精准探测带宽控速、消除 bufferbloat。`purge` 一并清理该文件。
+
+### Fixed
+
+- **「更新接入码」会重置本机手动设定的隧道 MTU（重大体验 BUG）**：`import-code` / `import-exit-code` 在更新模式下直接把 `WG_MTU` 写回接入码内的值，覆盖了此前 `wm set-mtu` 的手动值——跨海线路常需手动钳到 1380 避开 MTU 黑洞，IX 一刷新接入码、入口重导后 MTU 被打回，故障复现。现更新模式**保留本机已设 MTU**（与已有「保留入口端口 / 公网IP / 网卡」同思路），并提示如何改回码内值；relay 客户端 MTU 也随保留后的隧道 MTU 派生。
+
+### Changed
+
+- **`wm test` 增加「能 ping 通但卡 / 打不开」的诊断引导**：丢包 ≤10% 时补充提示两类常见根因——① MTU 黑洞（跨海实际 MTU 偏小且 ICMP 静默丢弃、automtu 可能高估 → 两端 `wm set-mtu <ID> 1380`）；② 上游 DDoS 清洗（放行 ICMP/长连接却拦 TCP 握手，多为暂时性、待清洗结束自愈）。
+
+> 接入码 schema、菜单编号、CLI 子命令均不变；纯运维加固与体验改进。
+
 ## [1.4.8] - 2026-06-19
 
 ### Changed
