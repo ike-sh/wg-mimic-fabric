@@ -1,4 +1,4 @@
-# wg-mimic-fabric 运维示例（v0.6）
+# wg-mimic-fabric 运维示例
 
 ## 依赖
 
@@ -36,6 +36,18 @@ wm import-code
 wm start ix-nat-ingress
 wm show-port-map ix-nat-ingress
 wm health ix-nat-ingress
+```
+
+## Mimic 全局出口（exit / relay）
+
+```bash
+# 国外出口 B
+wm create-exit                 # 选择 mimic（推荐）或 direct，复制出口接入码
+
+# 国内网关 A
+wm import-exit-code            # 粘贴出口接入码
+wm add-client exit-relay phone # 生成 WireGuard 客户端配置与二维码
+wm test exit-relay
 ```
 
 ## 多规则

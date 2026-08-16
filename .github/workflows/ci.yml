@@ -1,0 +1,69 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  shell:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install ShellCheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+      - name: Check shell syntax
+        run: bash -n install.sh scripts/bootstrap.sh scripts/smoke.sh
+      - name: Run ShellCheck
+        run: shellcheck -S warning install.sh scripts/bootstrap.sh scripts/smoke.sh
+      - name: Run smoke tests
+        run: bash scripts/smoke.sh all
+
+  docker-install:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: ubuntu-24.04
+            image: ubuntu:24.04
+          - name: debian-13
+            image: debian:13-slim
+          - name: arch
+            image: archlinux:base
+          - name: fedora-42
+            image: fedora:42
+          - name: rocky-9
+            image: rockylinux:9
+          - name: opensuse-15.6
+            image: opensuse/leap:15.6
+    name: docker-install (${{ matrix.name }})
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify direct-mode installation
+        run: |
+          docker run --rm -v "$PWD:/work:ro" -w /work "${{ matrix.image }}" bash -lc '
+            systemctl() { return 0; }
+            export -f systemctl
+            WMF_SKIP_MIMIC=1 WMF_AUTO_MIMIC=0 bash install.sh install-all
+            for cmd in bash python3 wg wg-quick nft ip curl flock systemctl modprobe ethtool; do
+              command -v "$cmd" >/dev/null
+            done
+            test -x /usr/local/bin/wm
+            test -f /etc/systemd/system/wg-mimic-nft.service
+            grep -q "Requires=wg-mimic-nft.service" /etc/systemd/system/wg-mimic-tunnel@.service
+          '
+
+  docker-unsupported:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify unsupported Alpine fails clearly
+        run: |
+          docker run --rm -v "$PWD:/work:ro" -w /work alpine:3.22 sh -lc '
+            apk add --no-cache bash >/dev/null
+            if WMF_SKIP_MIMIC=1 bash install.sh install-all >/tmp/wmf.out 2>&1; then exit 1; fi
+            grep -q "当前系统不受支持" /tmp/wmf.out
+          '

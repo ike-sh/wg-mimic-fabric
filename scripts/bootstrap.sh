@@ -1,31 +1,45 @@
 #!/usr/bin/env bash
 # One-line installer: curl -fsSL .../bootstrap.sh | sudo bash
-# Optional: WMF_TAG=v0.3.0 to pin a release
+# Optional: WMF_TAG=v1.4.10 to pin a release
 # Optional: WMF_SKIP_MIMIC=1 to skip mimic apt install
 set -euo pipefail
 
 REPO="${WMF_REPO:-ike-sh/wg-mimic-fabric}"
 TAG="${WMF_TAG:-}"
 TS="$(date +%s)"
-DEFAULT_MIRRORS="https://gh.ddlc.top/,https://gh-proxy.com/,https://ghproxy.net/"
+DEFAULT_MIRRORS=""
+
+verify_download() {
+    local f="$1" want="${WMF_INSTALL_SHA256:-}" got
+    [[ -n "$want" ]] || return 0
+    command -v sha256sum >/dev/null 2>&1 || { echo "[ERROR] 缺少 sha256sum，无法校验安装脚本" >&2; return 1; }
+    got="$(sha256sum "$f" | awk '{print $1}')"
+    [[ "${got,,}" == "${want,,}" ]] || { echo "[ERROR] install.sh SHA256 不匹配" >&2; return 1; }
+}
 
 # 国内可达：直连 GitHub 失败时，逐个镜像轮询拉取 install.sh
 fetch_repo_file() {
     local relpath="$1" dest="$2" ref="${3:-main}" m url mirrors=()
     if curl -fsSL -H "Accept: application/vnd.github.raw+json" \
         -o "$dest" "https://api.github.com/repos/${REPO}/contents/${relpath}?ref=${ref}" 2>/dev/null \
-        && [[ -s "$dest" ]]; then
+        && [[ -s "$dest" ]] && verify_download "$dest"; then
+        return 0
+    fi
+    url="https://raw.githubusercontent.com/${REPO}/${ref}/${relpath}?ts=${TS}"
+    if curl -fsSL --connect-timeout 10 --max-time 120 -o "$dest" "$url" 2>/dev/null \
+        && [[ -s "$dest" ]] && verify_download "$dest"; then
         return 0
     fi
     IFS=',' read -ra mirrors <<< "${WMF_GITHUB_MIRRORS:-$DEFAULT_MIRRORS}"
-    for m in "${mirrors[@]}" "" ; do
-        if [[ -n "$m" ]]; then
-            url="${m%/}/https://raw.githubusercontent.com/${REPO}/${ref}/${relpath}"
-        else
-            url="https://raw.githubusercontent.com/${REPO}/${ref}/${relpath}?ts=${TS}"
-        fi
+    [[ -n "${WMF_INSTALL_SHA256:-}" ]] || {
+        [[ -n "${WMF_GITHUB_MIRRORS:-}" ]] && echo "[ERROR] 第三方镜像下载必须同时设置 WMF_INSTALL_SHA256" >&2
+        return 1
+    }
+    for m in "${mirrors[@]}" ; do
+        [[ -n "$m" ]] || continue
+        url="${m%/}/https://raw.githubusercontent.com/${REPO}/${ref}/${relpath}"
         if curl -fsSL --connect-timeout 10 --max-time 120 -o "$dest" "$url" 2>/dev/null \
-            && [[ -s "$dest" ]]; then
+            && [[ -s "$dest" ]] && verify_download "$dest"; then
             return 0
         fi
     done
@@ -43,6 +57,14 @@ else
     echo "[INFO] 下载 ${REPO} main（最新 install.sh）..."
     fetch_repo_file "install.sh" "$tmp" "main"
 fi
+if ! bash -n "$tmp"; then
+    echo "[ERROR] 下载的 install.sh 语法校验失败" >&2
+    exit 1
+fi
+if ! grep -q '^# wg-mimic-fabric' "$tmp"; then
+    echo "[ERROR] 下载内容不是 wg-mimic-fabric 安装脚本" >&2
+    exit 1
+fi
 chmod +x "$tmp"
 remote_ver="$(grep -m1 '^SCRIPT_VERSION=' "$tmp" | sed -E 's/^SCRIPT_VERSION="([^"]+)".*/\1/')"
 [[ -n "$remote_ver" ]] && echo "[INFO] 远端版本：${remote_ver}"
@@ -50,7 +72,12 @@ remote_ver="$(grep -m1 '^SCRIPT_VERSION=' "$tmp" | sed -E 's/^SCRIPT_VERSION="([
 if [[ "$(id -u)" -eq 0 ]]; then
     bash "$tmp" install-all
     ver="$(/usr/local/bin/wm --version 2>/dev/null || true)"
-    [[ -n "$ver" ]] && echo "[OK] ${ver}" || { echo "[ERROR] wm 仍不可用" >&2; exit 1; }
+    if [[ -n "$ver" ]]; then
+        echo "[OK] ${ver}"
+    else
+        echo "[ERROR] wm 仍不可用" >&2
+        exit 1
+    fi
     if [[ "${WMF_NO_MENU:-}" != "1" ]]; then
         if [[ -e /dev/tty && -r /dev/tty && -w /dev/tty ]]; then
             exec /usr/local/bin/wm </dev/tty >/dev/tty 2>&1

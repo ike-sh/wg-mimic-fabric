@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2329
 # Smoke tests for wg-mimic-fabric pure functions (no root / systemd / kernel).
 # Exercises rule IO, access-code round-trip, wg.conf and nft rendering.
 # Usage: bash scripts/smoke.sh [rule|code|wgconf|nft|all]
@@ -14,8 +15,10 @@ trap 'rm -rf "$TMP"' EXIT
 CONFIG_DIR="$TMP/etc"
 PROFILES_DIR="$CONFIG_DIR/profiles"
 CODES_DIR="$CONFIG_DIR/codes"
-KEYS_DIR="$CONFIG_DIR/keys"
+# shellcheck disable=SC2034
 STATE_DIR="$CONFIG_DIR/state"
+NFT_DIR="$TMP/nftables.d"
+NFT_FILE="$NFT_DIR/wg-mimic-fabric.nft"
 install -d -m 700 "$PROFILES_DIR" "$CODES_DIR"
 
 fail() { printf 'FAIL: %s\n' "$1" >&2; exit 1; }
@@ -168,11 +171,11 @@ seed_exit() {
     write_profile_kv "$(profile_env_path ex)" \
         "PROFILE_ID=ex" "PROFILE_NAME=ex" "ROLE=exit" "ENABLED=true" "WAN_IFACE=eth0" \
         "WG_MESH_SUBNET=10.88.0.0/24" "WG_IX_IP=10.88.0.2" "WG_INGRESS_IP=10.88.0.1" \
-        "IP_VERSION=4" "WG_PORT=51820" "WG_MTU=1420" "IX_ENDPOINT_HOST=b.example" \
+        "IP_VERSION=dual" "WG_MESH_SUBNET6=fd88::/64" "WG_IX_IP6=fd88::2" "WG_INGRESS_IP6=fd88::1" \
+        "WG_PORT=51820" "WG_MTU=1408" "IX_ENDPOINT_HOST=203.0.113.8" \
         "WG_PRIVATE_KEY=k" "WG_PUBLIC_KEY=BPUB" "WG_PEER_PUBLIC_KEY=APUB" \
         "INGRESS_PRIVKEY_B64=YQ" "MIMIC_KEEPALIVE=300:::" \
-        "OBFS_MODE=swgp+mimic" "SWGP_MODE=zero-overhead-2026" "SWGP_PSK=PSKB64" "SWGP_PORT=18443" \
-        "EXIT_MODE=global" "FW_OPEN_PORT=true"
+        "OBFS_MODE=mimic" "EXIT_MODE=global" "FW_OPEN_PORT=true"
 }
 
 test_code6() {
@@ -182,12 +185,10 @@ test_code6() {
     [[ "$code" == WMGF1:* ]] || fail "exit code prefix"
     parse_code "$code"
     [[ "$CODE_KIND" == "exit" ]] || fail "code kind=$CODE_KIND"
-    [[ "$CODE_OBFS_MODE" == "swgp+mimic" ]] || fail "obfs=$CODE_OBFS_MODE"
-    [[ "$CODE_SWGP_MODE" == "zero-overhead-2026" ]] || fail "swgp mode"
-    [[ "$CODE_SWGP_PSK" == "PSKB64" ]] || fail "swgp psk"
-    [[ "$CODE_SWGP_PORT" == "18443" ]] || fail "swgp port=$CODE_SWGP_PORT"
+    [[ "$CODE_OBFS_MODE" == "mimic" ]] || fail "obfs=$CODE_OBFS_MODE"
     [[ "$CODE_EXIT_MODE" == "global" ]] || fail "exit mode"
     [[ "$CODE_IX_WG_PUBKEY" == "BPUB" ]] || fail "ix pubkey"
+    [[ "$CODE_IX_WG_IP6" == "fd88::2" ]] || fail "exit ipv6"
     # 旧 schema-5 transit 码仍可解析（向后兼容）
     seed_transit; load_profile ix-nat
     parse_code "$(generate_code)"
@@ -195,53 +196,51 @@ test_code6() {
     echo "CODE6 OK"
 }
 
-test_swgp() {
-    local s c
-    s="$(render_swgp_conf server 18443 127.0.0.1:51820 zero-overhead-2026 PSKBASE64)"
-    grep -q '"proxyListen": ":18443"' <<<"$s" || fail "swgp server proxyListen"
-    grep -q '"proxyMode": "zero-overhead-2026"' <<<"$s" || fail "swgp server mode"
-    grep -q '"wgEndpoint": "127.0.0.1:51820"' <<<"$s" || fail "swgp server wgEndpoint"
-    grep -q '"proxyPSK": "PSKBASE64"' <<<"$s" || fail "swgp server psk"
-    c="$(render_swgp_conf client 18444 1.2.3.4:18443 zero-overhead-2026 PSKBASE64)"
-    grep -q '"wgListen": ":18444"' <<<"$c" || fail "swgp client wgListen"
-    grep -q '"proxyEndpoint": "1.2.3.4:18443"' <<<"$c" || fail "swgp client proxyEndpoint"
-    echo "SWGP OK"
-}
-
 test_obfs() {
     seed_exit; load_profile ex
-    # exit + swgp+mimic → mimic filter 对准 SWGP_PORT(18443)
+    # exit mimic 直接处理 WireGuard 对外端口。
     local m; m="$(render_mimic_conf_for_profile)"
     grep -q 'local=' <<<"$m" || fail "exit mimic local: $m"
-    grep -q ':18443' <<<"$m" || fail "exit mimic wire port: $m"
-    # relay：swgp 时 WG endpoint 拨本机 swgp，mimic remote 对准 B:SWGP_PORT
+    grep -q ':51820' <<<"$m" || fail "exit mimic wire port: $m"
+    grep -q $'ex-wire\t51820\tboth' <<<"$(collect_input_ports)" || fail "mimic input must allow tcp+udp"
+    set_or_append_kv "$(profile_env_path ex)" OBFS_MODE direct
+    load_profile ex
+    grep -q $'ex-wire\t51820\tudp' <<<"$(collect_input_ports)" || fail "direct input must be udp-only"
+    ! grep -q $'ex-wire\t51820\tboth' <<<"$(collect_input_ports)" || fail "direct input opened tcp"
+    set_or_append_kv "$(profile_env_path ex)" OBFS_MODE mimic
+    # relay 直接拨 B，Mimic remote 也对准同一 WG 端口。
     write_profile_kv "$(profile_env_path rl)" \
         "PROFILE_ID=rl" "ROLE=relay" "ENABLED=true" "WAN_IFACE=eth0" \
         "WG_MESH_SUBNET=10.88.0.0/24" "WG_IX_IP=10.88.0.2" "WG_INGRESS_IP=10.88.0.1" \
         "WG_PORT=51820" "WG_MTU=1420" "IX_ENDPOINT_HOST=1.2.3.4" \
         "WG_PRIVATE_KEY=k" "WG_PUBLIC_KEY=p" "WG_PEER_PUBLIC_KEY=BPUB" \
-        "OBFS_MODE=swgp+mimic" "SWGP_MODE=zero-overhead-2026" "SWGP_PSK=x" "SWGP_PORT=18443"
+        "OBFS_MODE=mimic"
     load_profile rl
     local w; w="$(render_wg_conf)"
-    grep -q 'Endpoint = 127.0.0.1:18443' <<<"$w" || fail "relay swgp endpoint: $w"
+    grep -q 'Endpoint = 1.2.3.4:51820' <<<"$w" || fail "relay endpoint: $w"
     grep -qF 'relay rl' <<<"$w" || fail "relay header"
     local mr; mr="$(render_mimic_conf_for_profile)"
-    grep -q 'remote=1.2.3.4:18443' <<<"$mr" || fail "relay mimic remote: $mr"
+    grep -q 'remote=1.2.3.4:51820' <<<"$mr" || fail "relay mimic remote: $mr"
+    set_or_append_kv "$(profile_env_path rl)" OBFS_MODE direct
+    load_profile rl
+    [[ -z "$(render_mimic_conf_for_profile)" ]] || fail "direct mode emitted mimic filter"
+    ! obfs_has_mimic || fail "direct mode requires mimic"
     echo "OBFS OK"
 }
 
 test_mss() {
     # MSS 钳制必须无条件出现在 forward 链——即便「仅全局出口(mode2)、无任何中转 DNAT 规则」也要
-    # 自动生成，否则 swgp+mimic 全局出口大包黑洞/网页卡半截。用独立 profiles 目录隔离出 mode2-only。
+    # 自动生成，否则 Mimic 全局出口可能出现大包黑洞。用独立 profiles 目录隔离。
     local save="$PROFILES_DIR"
     PROFILES_DIR="$TMP/mss-only"; install -d -m 700 "$PROFILES_DIR"
     write_profile_kv "$(profile_env_path exonly)" \
         "PROFILE_ID=exonly" "ROLE=exit" "ENABLED=true" "WAN_IFACE=eth0" \
         "WG_MESH_SUBNET=10.90.0.0/24" "WG_IX_IP=10.90.0.2" "WG_INGRESS_IP=10.90.0.1" \
-        "WG_PORT=51820" "WG_MTU=1400" "OBFS_MODE=swgp+mimic" "SWGP_PORT=18310" "EXIT_MODE=global"
+        "WG_PORT=51820" "WG_MTU=1400" "OBFS_MODE=mimic" "EXIT_MODE=global"
     local out; out="$(render_nft_all)"
     PROFILES_DIR="$save"
-    grep -q 'tcp flags syn tcp option maxseg size set rt mtu' <<<"$out" || fail "mss clamp missing for mode2-only (relay/exit)"
+    grep -q 'iifname "wm-\*" tcp flags syn tcp option maxseg size set rt mtu' <<<"$out" || fail "scoped input mss clamp missing"
+    grep -q 'oifname "wm-\*" tcp flags syn tcp option maxseg size set rt mtu' <<<"$out" || fail "scoped output mss clamp missing"
     grep -q 'ip saddr 10.90.0.0/24 oifname "eth0" counter masquerade' <<<"$out" || fail "exit masq missing: $out"
     echo "MSS OK"
 }
@@ -252,9 +251,10 @@ test_client() {
         "WG_MESH_SUBNET=10.88.0.0/24" "WG_IX_IP=10.88.0.2" "WG_INGRESS_IP=10.88.0.1" \
         "WG_PORT=51820" "WG_MTU=1400" "IX_ENDPOINT_HOST=1.2.3.4" \
         "WG_PRIVATE_KEY=k" "WG_PUBLIC_KEY=GWPUB" "WG_PEER_PUBLIC_KEY=BPUB" \
-        "OBFS_MODE=swgp+mimic" "SWGP_MODE=zero-overhead-2026" "SWGP_PSK=x" "SWGP_PORT=18443" \
+        "OBFS_MODE=mimic" \
         "EXIT_MODE=global" "A_PUBLIC_HOST=8.8.8.8" "CLIENT_WG_PORT=51820" \
-        "CLIENT_SUBNET=10.89.0.0/24" "CLIENT_DNS=1.1.1.1" "CLIENT_MTU=1280" "FW_OPEN_PORT=true"
+        "CLIENT_SUBNET=10.89.0.0/24" "CLIENT_DNS=1.1.1.1" "CLIENT_MTU=1280" \
+        "ROUTE_TABLE=12345" "FW_OPEN_PORT=true"
     install -d -m 700 "$(clients_dir_for gw)"
     printf '%s\n' "CLIENT_ID=ph" "CLIENT_NAME=ph" "CLIENT_PRIVKEY=cpriv" "CLIENT_PUBKEY=CPUB" "CLIENT_IP=10.89.0.2" \
         >"$(client_env_path gw ph)"
@@ -262,7 +262,7 @@ test_client() {
     local w; w="$(render_wg_conf)"
     grep -q 'ListenPort = 51820' <<<"$w" || fail "relay listenport: $w"
     grep -qF 'Table = off' <<<"$w" || fail "relay table off (avoid main-route hijack)"
-    grep -q 'PostUp = ip route replace default dev %i table' <<<"$w" || fail "relay policy route"
+    grep -q 'PostUp = ip route replace default dev %i table 12345' <<<"$w" || fail "relay policy route"
     grep -q 'ip rule add from 10.89.0.0/24 lookup' <<<"$w" || fail "relay client rule"
     grep -qF 'AllowedIPs = 0.0.0.0/0' <<<"$w" || fail "relay peerB 0/0"
     grep -qF 'Address = 10.89.0.1/24' <<<"$w" || fail "relay client subnet addr"
@@ -277,6 +277,221 @@ test_client() {
     echo "CLIENT OK"
 }
 
+forge_code_field() {
+    local code="$1" field="$2" json_value="$3"
+    parse_wmgf_code "$code" \
+        | python3 -c 'import json,sys; o=json.load(sys.stdin); o[sys.argv[1]]=json.loads(sys.argv[2]); print(json.dumps(o,separators=(",",":")))' \
+            "$field" "$json_value" \
+        | base64url_encode | sed 's/^/WMGF1:/'
+}
+
+test_security() {
+    validate_port 65535 || fail "port upper bound rejected"
+    ! validate_port 65536 || fail "invalid port accepted"
+    ! validate_port 999999999999999999999999 || fail "oversized port accepted"
+    if ! code_is_mtu 1280 || ! code_is_mtu 1500; then fail "valid MTU rejected"; fi
+    ! code_is_mtu 1501 || fail "invalid MTU accepted"
+    seed_exit; load_profile ex
+    local code bad
+    code="$(generate_exit_code)"
+    bad="$(forge_code_field "$code" project '"other-project"')"
+    ! (parse_code "$bad" >/dev/null 2>&1) || fail "foreign project accepted"
+    bad="$(forge_code_field "$code" wg_port '70000')"
+    ! (parse_code "$bad" >/dev/null 2>&1) || fail "out-of-range WG port accepted"
+    bad="$(forge_code_field "$code" wg_mesh_subnet6 '"10.0.0.0/24"')"
+    ! (parse_code "$bad" >/dev/null 2>&1) || fail "IPv4 accepted in IPv6 field"
+    bad="$(forge_code_field "$code" obfs_mode '"invalid"')"
+    ! (parse_code "$bad" >/dev/null 2>&1) || fail "invalid obfs mode accepted"
+    bad="$(forge_code_field "$code" mimic_keepalive '":"')"
+    ! (parse_code "$bad" >/dev/null 2>&1) || fail "invalid Mimic keepalive accepted"
+    local shown
+    shown="$(show_config ex 2>/dev/null)"
+    grep -q '^WG_PRIVATE_KEY=<redacted>$' <<<"$shown" || fail "show-config did not redact private key"
+    ! grep -q '^WG_PRIVATE_KEY=k$' <<<"$shown" || fail "show-config leaked private key"
+    shown="$(WMF_SHOW_SECRETS=1 show_config ex 2>/dev/null)"
+    grep -q '^WG_PRIVATE_KEY=k$' <<<"$shown" || fail "show-config secret opt-in failed"
+    write_profile_kv "$(profile_env_path minimal)" \
+        "PROFILE_ID=minimal" "ROLE=nat-transit" "WAN_IFACE=eth1" "WG_PORT=12345"
+    load_profile ex; load_profile minimal
+    [[ -z "${OBFS_MODE:-}" && -z "${WG_MESH_SUBNET6:-}" ]] || fail "profile fields leaked across loads"
+    rm -f "$(profile_env_path minimal)"
+    echo "SECURITY OK"
+}
+
+test_nft_apply() {
+    seed_transit
+    local log="$TMP/nft.calls"
+    NFT_TEST_FAIL_CHECK=0
+    NFT_TEST_FAIL_LOAD=0
+    nft() {
+        printf '%s\n' "$*" >>"$log"
+        [[ "${1:-}" == "list" ]] && return 0
+        [[ "${1:-}" == "-c" && "$NFT_TEST_FAIL_CHECK" == "1" ]] && return 1
+        [[ "${1:-}" == "-f" && "$NFT_TEST_FAIL_LOAD" == "1" ]] && return 1
+        return 0
+    }
+    : >"$log"
+    apply_nft_all
+    grep -q '^-c -f ' "$log" || fail "nft preflight missing"
+    grep -q '^-f ' "$log" || fail "nft atomic apply missing"
+    [[ -s "$NFT_FILE" ]] || fail "nft canonical file missing"
+    : >"$log"; NFT_TEST_FAIL_CHECK=1
+    ! (apply_nft_all >/dev/null 2>&1) || fail "nft preflight failure was ignored"
+    ! grep -q '^-f ' "$log" || fail "nft applied after failed preflight"
+    : >"$log"; NFT_TEST_FAIL_CHECK=0; NFT_TEST_FAIL_LOAD=1
+    write_rule ix-nat rule-main "RULE_ID=rule-main" "RULE_NOTE=main" "RULE_ENABLED=true" \
+        "TRANSIT_PORT=40000" "LANDING_HOST=192.0.2.200" "LANDING_PORT=50000" "FORWARD_PROTO=both"
+    ! (apply_nft_all >/dev/null 2>&1) || fail "nft live-load failure was ignored"
+    ! grep -q '192.0.2.200' "$NFT_FILE" || fail "failed live load left new persistent rules"
+    unset -f nft
+    echo "NFT APPLY OK"
+}
+
+test_network_alloc() {
+    local save="$PROFILES_DIR" first second six reserved table1 table2
+    PROFILES_DIR="$TMP/network-alloc"; install -d -m 700 "$PROFILES_DIR"
+    first="$(next_free_mesh_subnet)" || fail "first IPv4 subnet allocation failed"
+    code_is_cidr4 "$first" || fail "invalid allocated IPv4 subnet: $first"
+    write_profile_kv "$(profile_env_path one)" \
+        "PROFILE_ID=one" "ROLE=exit" "WG_MESH_SUBNET=${first}" "WG_MESH_SUBNET6=fd42:1::/64"
+    second="$(next_free_mesh_subnet)" || fail "second IPv4 subnet allocation failed"
+    ! networks_overlap "$first" "$second" || fail "allocated IPv4 subnets overlap"
+    network_conflicts_existing "$first" || fail "existing IPv4 conflict was missed"
+    six="$(next_free_mesh_subnet6)" || fail "IPv6 subnet allocation failed"
+    ! networks_overlap "$six" "fd42:1::/64" || fail "allocated IPv6 subnet overlaps"
+    reserved="$(next_free_mesh_subnet "" "$second")" || fail "reserved subnet allocation failed"
+    ! networks_overlap "$reserved" "$second" || fail "explicit reserved subnet was reused"
+    table1="$(next_free_route_table one)" || fail "route table allocation failed"
+    set_or_append_kv "$(profile_env_path one)" ROUTE_TABLE "$table1"
+    table2="$(next_free_route_table two)" || fail "second route table allocation failed"
+    [[ "$table1" != "$table2" ]] || fail "route table allocator returned a collision"
+    PROFILES_DIR="$save"
+    echo "NETWORK ALLOC OK"
+}
+
+test_global_client_ports() {
+    local save="$PROFILES_DIR"
+    PROFILES_DIR="$TMP/client-ports"; install -d -m 700 "$PROFILES_DIR"
+    write_profile_kv "$(profile_env_path in-a)" "PROFILE_ID=in-a" "ROLE=nat-ingress"
+    write_profile_kv "$(profile_env_path in-b)" "PROFILE_ID=in-b" "ROLE=nat-ingress"
+    write_rule in-a tcp-rule "RULE_ID=tcp-rule" "CLIENT_PORT=30000" "FORWARD_PROTO=tcp"
+    client_port_in_use in-b 30000 "" tcp || fail "cross-profile TCP collision was missed"
+    ! client_port_in_use in-b 30000 "" udp || fail "non-overlapping UDP port was rejected"
+    write_rule in-b udp-rule "RULE_ID=udp-rule" "CLIENT_PORT=30000" "FORWARD_PROTO=udp"
+    client_port_in_use in-a 30000 tcp-rule both || fail "both-protocol collision was missed"
+    ! client_port_in_use in-a 30000 tcp-rule tcp || fail "self exclusion/protocol check failed"
+    write_profile_kv "$(profile_env_path exit)" "PROFILE_ID=exit" "ROLE=exit" "WG_PORT=30001"
+    client_port_in_use in-a 30001 "" udp || fail "client DNAT/listener collision was missed"
+    public_udp_port_in_use 30000 exit || fail "listener/client DNAT collision was missed"
+    PROFILES_DIR="$save"
+    echo "GLOBAL CLIENT PORTS OK"
+}
+
+test_dns_cache() {
+    local save="$PROFILES_DIR" out
+    PROFILES_DIR="$TMP/dns-cache"; install -d -m 700 "$PROFILES_DIR"
+    write_profile_kv "$(profile_env_path dns)" \
+        "PROFILE_ID=dns" "ROLE=nat-transit" "ENABLED=true" "WAN_IFACE=eth0" \
+        "WG_MESH_SUBNET=10.100.10.0/24" "WG_IX_IP=10.100.10.2" "WG_INGRESS_IP=10.100.10.1" \
+        "WG_PORT=51830" "FW_OPEN_PORT=true"
+    write_rule dns rule "RULE_ID=rule" "RULE_ENABLED=true" "TRANSIT_PORT=40100" \
+        "LANDING_HOST=unavailable.invalid" "LANDING_PORT=443" "FORWARD_PROTO=tcp"
+    ! (resolve_host_ip() { :; }; render_nft_all >/dev/null 2>&1) \
+        || fail "DNS failure without cache generated incomplete rules"
+    ddns_state_set "landing:dns:rule" "192.0.2.55"
+    out="$(resolve_host_ip() { :; }; render_nft_all)"
+    grep -q 'dnat to 192.0.2.55:443' <<<"$out" || fail "cached DNS address was not used"
+    PROFILES_DIR="$save"
+    echo "DNS CACHE OK"
+}
+
+test_units_and_dropins() {
+    (
+        local units="$TMP/systemd" long_id="a-very-long-direct-profile" short_iface dropin
+        install -d -m 755 "$units"
+        # shellcheck disable=SC2034
+        SYSTEMD_MIMIC_TEMPLATE="$units/wg-mimic-mimic@.service"
+        SYSTEMD_TUNNEL_TEMPLATE="$units/wg-mimic-tunnel@.service"
+        # shellcheck disable=SC2034
+        SYSTEMD_OFFLOAD_TEMPLATE="$units/wg-mimic-offload@.service"
+        SYSTEMD_NFT_SERVICE="$units/wg-mimic-nft.service"
+        # shellcheck disable=SC2034
+        SYSTEMD_DROPIN_ROOT="$units"
+        WG_CONF_DIR="$TMP/wireguard"
+        systemctl() { :; }
+        install_systemd_units
+        grep -q '^ExecStart=.*/wm apply-nft-all$' "$SYSTEMD_NFT_SERVICE" || fail "nft boot service missing"
+        grep -q '^Requires=wg-mimic-nft.service$' "$SYSTEMD_TUNNEL_TEMPLATE" || fail "tunnel does not require nft service"
+        write_tunnel_dropin "$long_id" eth0 false
+        short_iface="$(wg_iface_for "$long_id")"
+        dropin="$units/wg-mimic-tunnel@${long_id}.service.d/10-profile.conf"
+        grep -q "${WG_CONF_DIR}/${short_iface}.conf" "$dropin" || fail "direct long-id path override missing"
+        ! grep -q 'wg-mimic-mimic@' "$dropin" || fail "direct drop-in incorrectly requires Mimic"
+        write_tunnel_dropin mimic-line eth0 true
+        grep -q '^Requires=wg-mimic-mimic@eth0.service$' \
+            "$units/wg-mimic-tunnel@mimic-line.service.d/10-profile.conf" || fail "Mimic dependency missing"
+    )
+    echo "UNITS/DROPINS OK"
+}
+
+test_keepalive() {
+    local save="$PROFILES_DIR" out
+    PROFILES_DIR="$TMP/keepalive"; install -d -m 700 "$PROFILES_DIR"
+    write_profile_kv "$(profile_env_path keep)" \
+        "PROFILE_ID=keep" "ROLE=nat-transit" "ENABLED=true" "WAN_IFACE=eth9" \
+        "WG_PORT=51820" "MIMIC_KEEPALIVE=123:45:6"
+    out="$(render_mimic_conf_iface eth9)"
+    grep -q '^keepalive = 123:45:6$' <<<"$out" || fail "custom Mimic keepalive was ignored"
+    PROFILES_DIR="$save"
+    echo "KEEPALIVE OK"
+}
+
+test_state_rollback() {
+    (
+        PROFILES_DIR="$TMP/rollback"; install -d -m 700 "$PROFILES_DIR"
+        write_profile_kv "$(profile_env_path rollback)" \
+            "PROFILE_ID=rollback" "ROLE=exit" "ENABLED=false" "WAN_IFACE=eth0" \
+            "OBFS_MODE=direct" "WG_PORT=51820"
+        install_systemd_units() { :; }
+        apply_profile_configs() { :; }
+        apply_nft_all() { :; }
+        ensure_ip_forward() { :; }
+        systemctl() {
+            [[ "${1:-}" == "restart" && "${2:-}" == "wg-mimic-tunnel@rollback.service" ]] && return 1
+            return 0
+        }
+        ! (start_profile rollback >/dev/null 2>&1) || fail "failed start reported success"
+        grep -q '^ENABLED=false$' "$(profile_env_path rollback)" || fail "failed start did not restore ENABLED"
+    )
+    (
+        PROFILES_DIR="$TMP/rollback-stop"; install -d -m 700 "$PROFILES_DIR"
+        write_profile_kv "$(profile_env_path rollback)" \
+            "PROFILE_ID=rollback" "ROLE=exit" "ENABLED=true" "WAN_IFACE=" \
+            "OBFS_MODE=direct" "WG_PORT=51820"
+        local nft_calls=0
+        apply_nft_all() { nft_calls=$((nft_calls + 1)); (( nft_calls > 1 )); }
+        systemctl() { [[ "${1:-}" == "is-active" ]] && return 1; return 0; }
+        ! (stop_profile rollback >/dev/null 2>&1) || fail "failed stop reported success"
+        grep -q '^ENABLED=true$' "$(profile_env_path rollback)" || fail "failed stop did not restore ENABLED"
+    )
+    echo "STATE ROLLBACK OK"
+}
+
+test_lock_errexit() {
+    (
+        # shellcheck disable=SC2034
+        STATE_LOCK_FILE="$TMP/lock/wmf.lock"
+        lock_probe() { false; : >"$TMP/lock-continued"; }
+        set +e
+        with_state_lock lock_probe >/dev/null 2>&1
+        local rc=$?
+        set -e
+        (( rc != 0 )) || fail "locked failing command reported success"
+        [[ ! -e "$TMP/lock-continued" ]] || fail "locked command continued after failure"
+    )
+    echo "LOCK ERREXIT OK"
+}
+
 case "${1:-all}" in
     rule) test_rule ;;
     code) test_code ;;
@@ -287,12 +502,20 @@ case "${1:-all}" in
     pool) test_pool ;;
     mimic) test_mimic ;;
     iface) test_iface ;;
-    swgp) test_swgp ;;
     code6) test_code6 ;;
     obfs) test_obfs ;;
     mss) test_mss ;;
     client) test_client ;;
-    nopy) test_rule; test_wgconf; test_nft; test_ipv6; test_group; test_pool; test_mimic; test_iface; test_obfs; test_mss; test_client; echo "NOPY OK" ;;
-    all) test_rule; test_code; test_code6; test_swgp; test_obfs; test_mss; test_client; test_wgconf; test_nft; test_ipv6; test_group; test_pool; test_mimic; test_iface; echo "ALL OK" ;;
-    *) echo "usage: smoke.sh [rule|code|code6|swgp|obfs|mss|client|wgconf|nft|ipv6|group|pool|mimic|iface|nopy|all]"; exit 1 ;;
+    security) test_security ;;
+    nftapply) test_nft_apply ;;
+    network) test_network_alloc ;;
+    ports) test_global_client_ports ;;
+    dns) test_dns_cache ;;
+    units) test_units_and_dropins ;;
+    keepalive) test_keepalive ;;
+    rollback) test_state_rollback ;;
+    lock) test_lock_errexit ;;
+    nopy) test_rule; test_wgconf; test_nft; test_nft_apply; test_ipv6; test_group; test_pool; test_mimic; test_iface; test_obfs; test_mss; test_client; echo "NOPY OK" ;;
+    all) test_rule; test_code; test_code6; test_security; test_obfs; test_mss; test_client; test_wgconf; test_nft; test_nft_apply; test_ipv6; test_group; test_pool; test_mimic; test_iface; test_network_alloc; test_global_client_ports; test_dns_cache; test_units_and_dropins; test_keepalive; test_state_rollback; test_lock_errexit; echo "ALL OK" ;;
+    *) echo "usage: smoke.sh [rule|code|code6|security|obfs|mss|client|wgconf|nft|nftapply|ipv6|group|pool|mimic|iface|network|ports|dns|units|keepalive|rollback|lock|nopy|all]"; exit 1 ;;
 esac

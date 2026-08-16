@@ -1,5 +1,21 @@
 # Changelog
 
+## [Unreleased]
+
+## [1.4.10] - 2026-08-16
+
+### Changed
+
+- 全局出口传输方式统一为 `mimic`（推荐）和 `direct`。
+- nftables 改为预检后单事务替换，MSS 钳制仅作用于 `wm-*` 接口；移除会改写宿主机全局队列调度与拥塞控制的角色调优。
+- 下载默认直连 GitHub；第三方镜像仅在显式提供对应 SHA-256 时启用。
+- 增强接入码、端口、MTU、IP/IPv6 与重复客户端端口校验，补齐出口接入码刷新/密钥轮换、DDNS 与并发写锁。
+- `show-config` 默认隐藏私钥，设置 `WMF_SHOW_SECRETS=1` 才显示完整配置。
+
+### Tests
+
+- 扩展 smoke 覆盖非法模式拒绝、边界校验、脱敏输出、Mimic/direct 渲染及 nft 原子应用，并新增 CI。
+
 ## [1.4.9] - 2026-06-23
 
 ### Added（按今晚真机复盘固化的运维经验）
@@ -23,7 +39,7 @@
 
 ### Changed
 
-- **交互菜单序号重排为连续递增（修复 19 夹在 14–18 之前的乱序）**：MTU 调整本属「线路运维」却用了最大的 `19`，菜单显示成 …`13`、`19`、再 `14–18`，序号断裂、跳号。现把 **MTU 调整改为 `14`**（归位「线路运维」末项），原 `14–18` 顺延为 `15–19`：组件维护 = `15` 更新 Mimic、`16` 安装/修复 swgp-go；系统维护 = `17` 删除线路、`18` 升级脚本、`19` 卸载/清理、`0` 退出。菜单显示、`menu_dispatch` 分发 `case`、主进程特例（`18` 升级后 `exec` 重载、`19` 卸载后退出）与 `automtu` 提示「菜单 `14` → 2」全部同步,一一对应无错位。CLI 子命令与接入码 schema 不变。
+- **交互菜单序号重排为连续递增**：MTU 调整归位「线路运维」，组件维护与系统维护序号同步顺延；菜单显示、分发逻辑和提示保持一致。
 
 ## [1.4.7] - 2026-06-19
 
@@ -75,7 +91,7 @@
 - **客户端「显示配置 / 二维码」**：新增 `wm show-client <网关> <名>` 与菜单 `5) 客户端管理 → 4) 显示配置/二维码`，无需删了重建即可重新打印已存在客户端的 `.conf` 与二维码；纯配置走 stdout、说明与二维码走 stderr（`wm show-client … > x.conf` 可直接得到干净配置文件）。
 - **新增客户端可交互设置 DNS 与 MTU**：`add-client` 时询问 DNS（默认 `1.1.1.1`，国内可填 `223.5.5.5`）与 MTU，按客户端各自存储。
 - **交互菜单新增 `19) MTU 调整`**：可选「自动探测 `automtu`」或「手动设置」，无需记忆命令行。
-- **创建国外出口的混淆方式改为数字选单**（`1) swgp+mimic 2) mimic 3) swgp 4) direct`），兼容直接输名称，避免手输出错。
+- **创建国外出口的传输方式改为数字选单**（`1) mimic 2) direct`），兼容直接输入名称。
 
 ### Fixed / Changed
 
@@ -104,9 +120,9 @@
   - 模式一：`1` 创建中转线路、`2` 导入接入码
   - 模式二：`3` 创建国外出口 B、`4` 导入出口接入码、`5` 客户端管理
   - 线路运维：`6` 启动、`7` 停止、`8` 健康检查、`9` 列出线路、`10` 显示接入码、`11` 刷新接入码、`12` 端口地图、`13` 转发规则管理
-  - 组件维护：`14` 更新 Mimic、`15` 安装/修复 swgp-go
+  - 组件维护：更新 Mimic
   - 系统维护：`16` 删除线路、`17` 升级 wm 脚本、`18` 卸载/完全清理、`0` 退出
-- 显示与分发 `case` 同步更新（一一对应，无错位）；菜单内提示号（swgp 重装后「停止→启动」指引）随之更新；README「菜单 13 → 菜单 5」同步。
+- 显示与分发 `case` 同步更新（一一对应，无错位）；README 菜单说明同步。
 - **CLI 子命令、接入码 schema、功能行为均不变**——仅菜单序号美化。
 
 ### Audited
@@ -127,12 +143,12 @@
 
 ### Security（高危漏洞修复）
 
-- **修复「导入恶意接入码 → root 任意命令执行」（严重）**：此前接入码字段（`ix_endpoint_host` / `wg_mesh_subnet` / `swgp_psk` / 规则 `landing_host` 等）未经校验即写入 profile/rule env，随后 `load_profile` / `load_rule` 以 **`source`** 读取——值中若含 `$(...)`、反引号或注入换行即在导入时以 **root** 执行。攻击者只需提供一个 `WMGF1:` 接入码（如「免费出口节点」）或在分发链路 MITM，受害者执行 `wm import-exit-code` / `import-code` 即被植入后门。
+- **修复「导入恶意接入码 → root 任意命令执行」（严重）**：接入码字段未经校验即写入 profile/rule env，再由 `source` 读取时可能以 root 执行注入内容；现改为安全解析与严格字段校验。
   - **根因修复**：新增 `safe_load_env`——逐行解析 `KEY=VALUE` 并用 `printf -v` 赋值，**绝不 `source`** 受接入码影响的数据；非法键名跳过，`PATH`/`IFS`/`LD_*` 等加黑名单。全量替换 profile/rule/client env 的 14 处内部 `source`（仅保留 `/etc/os-release`）。
   - **纵深防御**：`parse_code` 对全部不可信字段做严格白名单校验（IP/CIDR/主机名/端口/base64 密钥/模式枚举/keepalive），规则 TSV 逐行校验，伪造字段直接拒绝导入。
 - **修复「下载链路供应链/MITM 风险」（高）**：
   - 下载改为**直连 GitHub 优先、第三方镜像仅兜底**（`gh_curl` / `download_with_mirrors`），不再默认信任 `gh.ddlc.top` 等镜像。
-  - 新增 `verify_sha256` 完整性闸门：可经 `WMF_SWGP_SHA256` / `WMF_MIMIC_SHA256` / `WMF_MIMIC_DKMS_SHA256` / `WMF_INSTALL_SHA256` 锁哈希，校验失败拒装。
+  - 新增 `verify_sha256` 完整性闸门：可经 `WMF_MIMIC_SHA256` / `WMF_MIMIC_DKMS_SHA256` / `WMF_INSTALL_SHA256` 锁哈希，校验失败拒装。
   - `wm upgrade-script` 安装前强制 `bash -n` 语法 + 脚本指纹校验，拒绝被篡改/截断的脚本。
 - 接入码 schema(5/6) 与既有线路/CLI/菜单**完全兼容**，纯安全加固，无功能行为变更。
 
@@ -152,7 +168,6 @@
 
 ### Fixed
 
-- **purge / 卸载补全 swgp 清理**：此前「完全清理 purge」仅移除配置、wm 脚本与 mimic 系统包，遗留 swgp-go 二进制、`wg-mimic-swgp@` systemd 模板与服务。现新增 `stop_swgp_services` 停用所有 swgp 服务、卸载时移除 swgp systemd 模板、purge 额外删除 `/usr/local/bin/swgp-go`；purge 确认文案与卸载菜单文案同步标注。
 
 ### Added
 
@@ -169,7 +184,6 @@
 
 - **菜单新增「组件维护」分组**，补齐此前仅 CLI 可用的组件维护操作（交互菜单与 CLI 现完全等价）：
   - `17) 更新 Mimic 模块`：等价 `wm update-mimic`，可选填目标版本（留空 = apt 仓库最新），自动重载内核模块并重启已启用线路。
-  - `18) 安装 / 修复 swgp-go`：等价 `wm install-swgp`，自动校验并自愈损坏二进制；当已安装有效二进制时可选「强制重装为最新 release」。
 - `15) 升级脚本` 文案明确为 `升级 wm 脚本`，与组件更新区分。
 
 ### Verified
@@ -201,7 +215,7 @@
 ### Changed（交互体验）
 
 - **管理菜单重构**：弃用易在 CJK 宽字符下错位的 ASCII 边框菜单，改为按「模式一 IX 中转组网 / 模式二 全局出口 / 线路运维 / 系统维护」分组的清晰版式，并在标题栏显示当前版本号。菜单项编号与分发逻辑保持不变。
-- **交互文案专业化**：`create-exit` / `import-exit-code` / `create-transit` / `import-code` 四大流程统一补充场景引导语与字段释义（如 swgp 对外端口、出网网卡、隧道内 IP、MTU 自动建议值等），降低术语门槛与误填概率，行为与默认值不变。
+- **交互文案专业化**：四大创建/导入流程统一补充场景引导语与字段释义，降低术语门槛与误填概率。
 
 ### Changed（文档）
 
@@ -219,18 +233,17 @@
 
 ### Verified（复核 mode2 全局出口的 MTU / MSS 行为，确认无需修复）
 
-- **MTU 自动计算**：`create-exit` 按混淆方式自动给隧道 MTU 默认值（`direct`=1420 / `swgp+mimic`=1400 / `paranoid`=1360）；A 端 `import-exit-code` 经接入码继承该 MTU；`wm automtu` 可自适应探测；MSS 钳制用 `rt mtu` 自动跟随 `WG_MTU`，无需手算。
+- **MTU 自动计算**：`create-exit` 按 IP 版本给出隧道 MTU 默认值；A 端继承该 MTU，`wm automtu` 可自适应探测，MSS 钳制自动跟随。
 - **MSS 钳制对「仅 mode2 全局出口」也自动生成**：`render_nft_all` 的 forward 链**无条件**输出 `tcp flags syn tcp option maxseg size set rt mtu`，且 `start_profile` / `create-exit` / `import-exit-code` 均调用 `apply_nft_all`——故只用全局出口（relay/exit、无任何中转规则）时 MSS 钳制照常生成。新增 `smoke mss` 用例（用独立 profiles 目录隔离出 mode2-only）作为永久回归守卫。
 - 验证：`bash -n` 通过；`smoke nopy` 全 11 项通过（含新增 MSS）。
 
 ## [1.1.0] - 2026-06-16
 
-首个稳定版：在 `1.0.0`（IX 中转组网）基础上新增「**混淆全局出口**」整条能力线，并在真机（国内网关 A ⇄ 国外出口 B）完整验证（`swgp+mimic` 全局出口 `wm test` 0% 丢包 / ~28–32ms、手机扫码全局出网正常）。聚合 `beta.8`–`beta.16` 全部变更。
+首个稳定版：在 `1.0.0`（IX 中转组网）基础上新增「**混淆全局出口**」整条能力线，并完成真机验证。
 
 ### Added（混淆组网 / 全局出口）
 
 - **国外出口 B（`create-exit`）+ 国内网关 A（`import-exit-code`）**：搭建 A↔B 全局出口隧道，A 侧客户端流量经隧道从 B 出网。新增角色 `exit`（B 落地出口）/ `relay`（A 全局网关）。
-- **swgp-go 流量混淆**：混淆方式可选 `direct / mimic / swgp / swgp+mimic`；swgp-go 在 WG 之外再加一层 UDP 混淆并叠加 mimic 伪 TCP，强化抗 DPI/封锁。swgp-go 按需自动安装（GitHub release，优先静态 `x86-64-v2`，ELF 魔数校验，损坏自愈重装）。
 - **客户端管理（菜单 `13` / `add-client`）**：A 网关上一键新增/列出/删除客户端，自动生成 `.conf` + 终端二维码（按需自动装 `qrencode`），手机 WireGuard 扫码即走全局出口。
 - **删除整条线路（菜单 `14` / `delete-line`）**：安全删除线路的配置/密钥/接入码/客户端/服务，并重渲染同机其它线路的 nft + mimic。
 - **交互菜单 ID 列表编号选择**：线路/规则/客户端选择改为输入阿拉伯数字（仍兼容输 ID/名称）。
@@ -238,7 +251,6 @@
 ### Fixed（本轮真机定位）
 
 - **relay 全局出口漏配对端 mesh 路由（真凶）**：`Table = off` 下仅建客户端子网策略路由，漏了到对端 mesh IP 的隧道路由，mesh 流量漏到物理网卡 → A↔B 100% 丢包。现 relay 全局出口 PostUp 自动 `ip route replace <对端 mesh IP>/32 dev %i`（IPv6 同理），PostDown 清理。真机实测从 100% 丢包变 0% / ~32ms。
-- **swgp-go 被装成损坏文件（`Exec format error`）**：上游 v1.10.0 起只发 `.tar.zst`，旧解压逻辑把压缩包当二进制安装 → 崩溃重启、端口从不监听。现支持 `.tar.zst`/`.tar`/`.zst` 解压 + ELF 校验 + 损坏自愈重装。
 - **`wm test` 对 relay 假通过**：`peer_mesh_ip` 此前让 relay ping 自身 IP；现改为真正 ping 对端 B。
 - relay `PostUp/PostDown` 的 `ip rule del` 幂等化（`|| true`），避免 wg-quick `set -e` 首启被中止。
 - 自动选取空闲 mesh 网段并派生虚拟 IP，避免多条线路撞 `10.88` 网段。
@@ -264,24 +276,13 @@
 ### Fixed（relay 全局出口漏配对端 mesh 路由 → `wm test` / A↔B mesh ping 100% 丢包；真机定位）
 
 - **relay 全局出口补对端 mesh 路由**：`relay` 角色在 `EXIT_MODE=global` 下用 `Table = off`（避免 wg-quick 把 `0.0.0.0/0` 塞进主表劫持 A 自身 SSH/现有线路），但**只为客户端子网建了策略路由，漏了到对端 mesh IP（B=`WG_IX_IP`）的隧道路由**。结果主表里 `10.90.0.2` 落到物理网卡默认路由（`ip route get 10.90.0.2 → via <gw> dev eth0/ens5`），mesh 流量根本没进隧道 → `wm test` / `ping 对端` 100% 丢包（而隧道握手与 keepalive 其实正常、收发计数对等，极具迷惑性）。现 relay 全局出口的 PostUp 显式 `ip route replace <对端 mesh IP>/32 dev %i`（IPv6 用 `ip -6` 同理），PostDown 清理。**真机实测**：加这条路由后 `ping 10.90.0.2` 从 100% 丢包变为 0% 丢包、延迟 ~32ms。
-- 说明：此前 beta.14 修的 swgp `.tar.zst` / `Exec format error`、以及 GSO 排查都是真实问题，但都不是 mesh ping 不通的根因——真正拦路的是这条漏掉的路由（数据包压根没进隧道）。
 - 验证：`bash -n` 通过；`smoke nopy` 全 10 项通过；relay 全局出口渲染实测 `wg.conf` 含 `PostUp = ip route replace <peer-mesh-ip>/32 dev %i`。
-
-## [1.1.0-beta.14] - 2026-06-16
-
-### Fixed（swgp-go 被装成损坏文件导致 `Exec format error`，A↔B 骨干 100% 丢包的真正根因）
-
-- **`download_swgp_release` 支持 `.tar.zst` 解压**：swgp-go 上游（database64128）自 v1.10.0 起**只发布 `.tar.zst` 资产**（无 `.tar.gz`/`.zip`）。旧代码的 `case "$url"` 只认 `.zip`/`.tar.gz`/`.tgz`，`.tar.zst` 落入 `*)` 兜底分支——**把压缩包原样 `cp` 成 `/usr/local/bin/swgp-go` 并 `chmod +x`**，于是「二进制」其实是个 zstd 压缩档，systemd 启动即 `Failed to execute ... Exec format error`（status=203/EXEC）疯狂重启，swgp 端口从不监听 → A 发包 B 不回 → `wm test` / `ping 10.90.0.2` 100% 丢包。现新增 `.tar.zst`/`.tar`/`.zst` 分支（GNU `tar --zstd`，回退 `zstd -d | tar`），并按需 `apt install zstd`。
-- **资产选型优先「静态构建 + x86-64-v2」**：上游同时提供 glibc/静态、v2/v3 多档；旧打分逻辑遇全 `.tar.zst` 时一律打平、取首个（glibc-v2），可能引入 glibc 版本依赖或 AVX2(v3) 指令兼容问题。现优先选**静态构建**（更可移植）与 **x86-64-v2**（兼容性最广），降低换机即崩风险。
-- **下载产物强制 ELF 魔数校验**：`install` 前用 `is_elf_bin` 确认产物确为 ELF（`7f 45 4c 46`），任何「未解压归档/坏档」一律拒装，从源头杜绝再装出 `Exec format error`。
-- **`install_swgp` 守卫自愈损坏二进制**：旧守卫 `[[ -x "$SWGP_BIN" ]]` 见到带 +x 的坏档即判「已安装」直接返回，导致反复 `bootstrap`/`upgrade` 永远绕过重装、坏档一直在（用户多次重装仍报「swgp-go 已安装」却始终不通的元凶）。现改为 `swgp_installed_ok`——仅当是真 ELF 才算已装，否则删除坏档并重新下载，**升级即自愈**。
-- 验证：`bash -n` 语法通过；`smoke nopy` 回归全 10 项通过；并以真实 v1.10.0 资产核对解包路径（`./swgp-go`）与选型（`linux-x86-64-v2.tar.zst`）。
 
 ## [1.1.0-beta.13] - 2026-06-15
 
 ### Fixed（`wm test` 对 relay 线路假通过：ping 的是自己而非对端 B）
 
-- **`peer_mesh_ip` 修复 relay 角色**：此前只有 `nat-ingress` 返回对端 IX/出口 IP（`WG_IX_IP`），其余角色一律返回 `WG_INGRESS_IP`。但 **relay（A 网关全局出口）自身 mesh 地址正是 `WG_INGRESS_IP`**，于是 `wm test <relay>` ping 的是 A 自己（`10.x.0.1`，延迟 0.0xx ms、0% 丢包），看似「线路质量良好」实为白测，根本没验证 A↔B 隧道。现把 relay 与 nat-ingress 同等对待（拨号侧对端 = `WG_IX_IP`），`wm test` 改为真正 ping 对端 B（`10.x.0.2`），能如实暴露 swgp 端口不通等问题。
+- **`peer_mesh_ip` 修复 relay 角色**：此前 relay ping 自身 IP，看似健康但没有验证 A↔B 隧道；现改为真正 ping 对端 B。
 
 ## [1.1.0-beta.12] - 2026-06-15
 
@@ -302,7 +303,7 @@
 
 ### Added（安全删除整条线路，便于反复建/删测试）
 
-- **新增 `wm delete-line <ID>`（别名 `remove`）安全删除单条线路**：此前只有 `delete-rule` 删单条转发规则，**没有删除整条线路的命令**——反复测试混淆出口/组网时只能手动 `rm` 配置/密钥/接入码/客户端，极易误删，且在「同一网卡多线路共用 mimic」的机器上贸然删除会波及其它线路。新命令一条龙：停并 disable 该线路的 tunnel/swgp 服务 → 删除 `profiles/<id>.env`、`/etc/wireguard/<wg-iface>.conf`、`codes/<id>.code`、`swgp/<id>.json`、`profiles/<id>/`（含 clients）、tunnel 的 systemd drop-in → `daemon-reload` → **重渲染 nft 与该网卡 mimic（保留同机其它线路，按当前 filter 重新挂载，无残留 XDP）**。默认二次确认，`WMF_DELETE_YES=1` 跳过确认（脚本化）。已接入 CLI 分发与 `usage`。
+- **新增 `wm delete-line <ID>`（别名 `remove`）安全删除单条线路**：停止并禁用线路，删除 profile、WireGuard 配置、接入码、客户端和 systemd drop-in，再重渲染 nft 与同网卡 Mimic 配置。
 
 
 
@@ -344,7 +345,7 @@
 
 - **引导脚本 `scripts/bootstrap.sh` 拉取 install.sh 改走镜像轮询**：之前 `fetch_repo_file` 仅「GitHub API raw → 直连 `raw.githubusercontent.com`」两步，国内（中国大陆）直连常超时/被墙，导致 `curl -fsSL .../bootstrap.sh | sudo bash` 一键安装在**第一步下载**就卡死。
 - 现新增镜像兜底：API 失败后按 `WMF_GITHUB_MIRRORS`（默认 `gh.ddlc.top / gh-proxy.com / ghproxy.net`）逐个镜像拉取，最后回退直连；每次下载加 `[[ -s ]]` 非空校验 + `--connect-timeout 10 --max-time 120`，全部失败才 `return 1` 报错退出。
-- 与 beta.3 给 install.sh 内部 release 下载加 `gh_curl` 镜像同思路，至此整条安装链路（引导脚本 → install.sh → swgp-go/mimic 资产）国内全程可达。
+- 与 install.sh 内部 release 下载使用同一思路，整条安装链路覆盖脚本与 Mimic 资产。
 
 ## [1.1.0-beta.4] - 2026-06-15
 
@@ -352,7 +353,7 @@
 
 - **relay(A) 全局出口不再劫持 A 自身路由**：之前 peer B 用 `AllowedIPs=0.0.0.0/0` 时，wg-quick 默认把 `0/0` 装进主路由表，导致 **A 的 SSH 与现有 nat-ingress 线路一起断**。
 - 现改为 **`Table = off` + 按客户端子网的策略路由**：`PostUp` 把默认路由只写进**每条线路独立的路由表**（`8000+hash(profile)%1000`），并 `ip rule from <客户端子网> lookup <表>`；`PostDown` 清理。**A 自身流量保持原默认路由不变**，只有客户端子网经隧道出 B。
-- 移除 relay 接口上的 `FwMark`（策略路由已替代其防环作用；swgp 的 `proxyFwmark` 保留无害）。
+- 移除 relay 接口上的 `FwMark`，由策略路由承担防环作用。
 - smoke `client` 用例改断言 `Table = off` + 策略路由规则。
 
 > ⚠️ 升级后需在 A 上 `wm stop exit-relay` 再 `wm start exit-relay`（或重新 import）以重渲染配置。
@@ -361,7 +362,7 @@
 
 ### Fixed（国内服务器拉取 GitHub release）
 
-- **swgp-go / mimic 的 release 下载改走镜像**：新增通用 `gh_curl`（镜像优先轮询 + 直连兜底 + 连接/总超时 + 重试），替换原先裸连 `api.github.com` / `browser_download_url` 的 `curl`。国内（中国大陆）网关机 `import-exit-code` / `install-swgp` / `install-mimic` 不再因直连 GitHub 失败而卡死。
+- **Mimic release 下载支持镜像兜底**：新增通用 `gh_curl`，统一连接超时、总超时与重试行为。
 - 镜像源沿用 `WMF_GITHUB_MIRRORS`（默认 `gh.ddlc.top / gh-proxy.com / ghproxy.net`），API 与资产下载统一走同一套；mimic 源码 tarball 同样改为镜像下载后解压。
 - `test`：非数字 ping 包数自动回退默认值（避免误报 100% 丢包）。
 
@@ -372,7 +373,7 @@
 - **客户端 WG 入口**：relay(A) 单 WG 接口同时当客户端服务端（`ListenPort`）+ 拨 B 出口（peer B `AllowedIPs=0.0.0.0/0`）；客户端 peer 用最长前缀匹配各走各路。
 - **`wm add-client <网关> <名>` / `list-clients` / `del-client`**：生成标准 WG `.conf`（`AllowedIPs=0.0.0.0/0`、`DNS=1.1.1.1`、`MTU=1280`）+ `qrencode` 二维码，官方App/小火箭/mihomo/sing-box 通吃。
 - **全局出口路由/NAT**：A 把客户端子网 masquerade 到上行(src→A mesh IP，B 才认)；B 把 mesh 子网 masquerade 出网卡 → 客户端对外即 B 出口IP。
-- **防路由环**：relay 全局出口用 `FwMark` + swgp `proxyFwmark`，让 A 自身/swgp 到 B 的流量避开 WG 默认路由。
+- **防路由环**：relay 全局出口使用独立策略路由表，避免 A 自身流量进入 WG 默认路由。
 - `import-exit-code` 增「A 公网IP / 客户端端口」配置（更新模式保留旧值）；smoke 新增 `client` 用例。
 
 > ⚠️ beta：Phase 2 路由/NAT/fwmark **必须真机验证**（本机无法运行期测试，仅 `bash -n` + smoke 渲染断言）。先在测试机：B `wm create-exit` → A `wm import-exit-code` → `wm test` 通后 `wm add-client` 扫码连。
@@ -381,15 +382,10 @@
 
 ### Added（混淆组网 / 全局出口 Phase 1：A↔B 混淆链）
 
-- **swgp-go 集成**：`wm install-swgp`（GitHub release 动态匹配 linux+arch 资产，回退 `go install`）；`render_swgp_conf`/`apply_swgp_conf` 生成 server/client JSON；`wg-mimic-swgp@.service` systemd 单元。
 - **新角色 `exit`(B 国外出口) / `relay`(A 国内网关)**，与现有 `nat-transit`/`nat-ingress` 并列：
-  - `wm create-exit`（B）：建 WG 监听 + 可选 swgp/mimic + 出口；生成**出口接入码**（`code_schema=6` `nat-exit-code`，向后兼容 5）。
-  - `wm import-exit-code`（A）：建到 B 的混淆隧道（`WG→swgp-go→mimic`）。
-- **混淆四选一** `OBFS_MODE=direct/mimic/swgp/swgp+mimic`：mimic 的 filter 自动对准**线上端口**（含 swgp 时为 swgp 端口）；swgp 默认 `zero-overhead-2026`（不减 MTU）。
-- **自动 MTU**：direct 1420 / mimic·swgp 1400 / paranoid 1360。
-- smoke 新增 `swgp`/`code6`/`obfs` 用例；现有用例保持回归。
-
-> Phase 1 仅打通 A↔B 混淆隧道（`wm test <relay>` 验证）。客户端 WG 入口 + 全局出口路由为 Phase 2。详见 `docs/plans/2026-06-15-obfuscation-mesh-gateway-{design,plan}.md`。
+  - `wm create-exit`（B）：建立 WG 监听、Mimic 或 direct 传输与出口，生成 schema 6 接入码。
+  - `wm import-exit-code`（A）：建立到 B 的隧道。
+- **传输模式**：`OBFS_MODE=direct|mimic`。
 >
 > ⚠️ beta：新角色未在真机充分验证；现有 nat-transit/nat-ingress 路径按 role 分支隔离、未改动（升级后建议先 `bash scripts/smoke.sh all` + `wm health`/`wm test` 确认现有线路无恙）。
 

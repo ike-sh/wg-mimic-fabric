@@ -2,19 +2,18 @@
 # wg-mimic-fabric — WireGuard + Mimic tunnel orchestrator (MVP)
 set -Eeuo pipefail
 
-SCRIPT_VERSION="1.4.9"
+SCRIPT_VERSION="1.4.10"
 MIMIC_UPSTREAM_TAG="${MIMIC_UPSTREAM_TAG:-v0.7.0}"
 
 CONFIG_DIR="/etc/wg-mimic-fabric"
 PROFILES_DIR="${CONFIG_DIR}/profiles"
 CODES_DIR="${CONFIG_DIR}/codes"
-KEYS_DIR="${CONFIG_DIR}/keys"
 STATE_DIR="${CONFIG_DIR}/state"
 NFT_DIR="/etc/nftables.d"
 NFT_FILE="${NFT_DIR}/wg-mimic-fabric.nft"
 NFT_TABLE="wg_mimic_fabric"
 BACKUP_DIR="/var/backups/wg-mimic-fabric"
-DEFAULT_GITHUB_MIRRORS="https://gh.ddlc.top/,https://gh-proxy.com/,https://ghproxy.net/"
+DEFAULT_GITHUB_MIRRORS=""
 LIBEXEC_DIR="/usr/local/libexec/wg-mimic-fabric"
 WM_CLI_INSTALL_SH="${LIBEXEC_DIR}/install.sh"
 WM_BIN="/usr/local/bin/wm"
@@ -24,20 +23,18 @@ WG_CONF_DIR="/etc/wireguard"
 SYSTEMD_MIMIC_TEMPLATE="/etc/systemd/system/wg-mimic-mimic@.service"
 SYSTEMD_TUNNEL_TEMPLATE="/etc/systemd/system/wg-mimic-tunnel@.service"
 SYSTEMD_OFFLOAD_TEMPLATE="/etc/systemd/system/wg-mimic-offload@.service"
+SYSTEMD_NFT_SERVICE="/etc/systemd/system/wg-mimic-nft.service"
+SYSTEMD_DROPIN_ROOT="/etc/systemd/system"
 SYSCTL_FILE="/etc/sysctl.d/99-wg-mimic-fabric.conf"
-SYSCTL_QOS_FILE="/etc/sysctl.d/98-wg-mimic-fabric-qos.conf"
 SYSTEMD_DDNS_SERVICE="/etc/systemd/system/wg-mimic-ddns.service"
 SYSTEMD_DDNS_TIMER="/etc/systemd/system/wg-mimic-ddns.timer"
 SYSTEMD_AUTOSWITCH_SERVICE="/etc/systemd/system/wg-mimic-autoswitch@.service"
 SYSTEMD_AUTOSWITCH_TIMER="/etc/systemd/system/wg-mimic-autoswitch@.timer"
-SWGP_BIN="/usr/local/bin/swgp-go"
-SWGP_CONF_DIR="${CONFIG_DIR}/swgp"
-SWGP_REPO="${SWGP_REPO:-database64128/swgp-go}"
-SYSTEMD_SWGP_TEMPLATE="/etc/systemd/system/wg-mimic-swgp@.service"
 CLIENT_SUBNET_DEFAULT="10.89.0.0/24"   # relay 客户端 WG 子网（A=.1，客户端 .2+）
-WMF_FWMARK="0x8c20"                      # relay 全局出口用：标记 swgp/WG 自身流量以避免路由环
 SYSTEMD_RESUME_SERVICE="/etc/systemd/system/wg-mimic-resume.service"
 RESUME_MARKER="${STATE_DIR}/resume.cmd"
+STATE_LOCK_FILE="/run/lock/wg-mimic-fabric.lock"
+MIMIC_SOURCE_MANIFEST="/var/lib/wg-mimic-fabric/mimic-source-files"
 
 # ── OS / kernel compatibility ──────────────────────────────────────────────
 
@@ -88,8 +85,8 @@ compat_os_report() {
         rhel|centos|rocky|almalinux|ol)
             tier="conditional"
             note="默认内核可能<6.1，需 elrepo kernel-ml 或换 Debian/Ubuntu" ;;
-        alpine) tier="experimental"; note="无 DKMS，需源码编译 mimic；生产不推荐" ;;
-        openwrt) tier="experimental"; note="见 mimic openwrt 分支或改用 Forwarder 旁路" ;;
+        alpine) tier="unsupported"; note="wm 依赖 systemd；Alpine/OpenRC 当前不支持" ;;
+        openwrt) tier="unsupported"; note="wm 依赖 systemd；请改用独立 Debian/Ubuntu Linux 网关" ;;
         *) tier="unknown"; note="未验证，需内核≥6.1 + mimic" ;;
     esac
     if ! kernel_ge_61; then
@@ -102,37 +99,23 @@ compat_os_report() {
         "$id" "$tier" "$note" "$(kernel_is_cloud && printf yes || printf no)"
 }
 
+ensure_supported_platform() {
+    case "$(detect_os_id)" in
+        alpine|openwrt) die "当前系统不受支持：wm 依赖 systemd，请使用 Debian 13 / Ubuntu 24.04" ;;
+    esac
+}
+
 ensure_ip_forward() {
-    sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
-    sysctl -w net.ipv6.conf.all.forwarding=1 >/dev/null 2>&1 || true
+    sysctl -w net.ipv4.ip_forward=1 >/dev/null \
+        || die "无法启用 IPv4 转发（net.ipv4.ip_forward）"
+    if [[ "${IP_VERSION:-4}" == "6" || "${IP_VERSION:-4}" == "dual" ]]; then
+        sysctl -w net.ipv6.conf.all.forwarding=1 >/dev/null \
+            || die "无法启用 IPv6 转发（net.ipv6.conf.all.forwarding）"
+    fi
     {
         printf 'net.ipv4.ip_forward=1\n'
         printf 'net.ipv6.conf.all.forwarding=1\n'
     } >"$SYSCTL_FILE"
-}
-
-# 按角色优化队列调度与拥塞控制（持久化到独立 sysctl 文件）：
-#  - 纯 NAT 转发节点(nat-transit / nat-ingress)：数据包不过本地 TCP 状态机，BBR 无效，
-#    仅启用 FQ 做发包 pacing，削平并发微突发对跨国隧道的冲击、压低抖动。
-#  - 终结 TCP 的落地/出口(exit / relay)：FQ + BBR(若内核可用) 由实际 TCP 连接精准探测
-#    带宽、控速，消除 bufferbloat（缓冲膨胀）。
-apply_net_tuning() {
-    local role="${1:-${ROLE:-}}"
-    local qdisc="fq" cc=""
-    case "$role" in
-        exit|relay) cc="bbr" ;;
-    esac
-    if [[ -n "$cc" ]]; then
-        modprobe tcp_bbr 2>/dev/null || true
-        sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -qw bbr || cc=""
-    fi
-    sysctl -w net.core.default_qdisc="$qdisc" >/dev/null 2>&1 || true
-    [[ -n "$cc" ]] && sysctl -w net.ipv4.tcp_congestion_control="$cc" >/dev/null 2>&1 || true
-    {
-        printf '# wg-mimic-fabric 网络调优（角色: %s）— 中转/入口仅 FQ；出口/落地 FQ+BBR\n' "${role:-?}"
-        printf 'net.core.default_qdisc=%s\n' "$qdisc"
-        if [[ -n "$cc" ]]; then printf 'net.ipv4.tcp_congestion_control=%s\n' "$cc"; fi
-    } >"$SYSCTL_QOS_FILE"
 }
 
 # ── utilities ──────────────────────────────────────────────────────────────
@@ -144,6 +127,45 @@ warn() { printf '[WARN] %s\n' "$*" >&2; }
 
 require_root() { [[ "$(id -u)" -eq 0 ]] || die "需要 root 权限"; }
 command_exists() { command -v "$1" >/dev/null 2>&1; }
+
+# Serialize every state-changing CLI/timer operation. All profiles share one nft
+# table and per-NIC Mimic config, so concurrent DDNS/autoswitch/manual writes must
+# never interleave. Nested calls in the same process reuse the held lock.
+with_state_lock() {
+    if [[ "${WMF_LOCK_HELD:-}" == "1" ]]; then "$@"; return; fi
+    require_root
+    local _lock_fd _rc=0 _had_errexit=0
+    [[ $- == *e* ]] && _had_errexit=1
+    if ! command_exists flock; then
+        case "${1:-}" in
+            install_all|install_wm_cli|install_mimic_packages)
+                set +e
+                ( set -Eeuo pipefail; WMF_LOCK_HELD=1 "$@" )
+                _rc=$?
+                if (( _had_errexit == 1 )); then set -e; else set +e; fi
+                return "$_rc"
+                ;;
+            *) die "缺少 flock（util-linux），无法安全修改共享配置" ;;
+        esac
+    fi
+    install -d -m 755 "$(dirname "$STATE_LOCK_FILE")"
+    exec {_lock_fd}>"$STATE_LOCK_FILE"
+    if flock --help 2>&1 | grep -q -- '-w'; then
+        flock -w "${WMF_LOCK_TIMEOUT:-30}" "$_lock_fd" || die "另一个 wm 操作正在运行，请稍后重试"
+    else
+        flock -n "$_lock_fd" || die "另一个 wm 操作正在运行，请稍后重试"
+    fi
+    # Never invoke the target on the left side of `||`: Bash disables errexit
+    # throughout functions used as conditionals, which can turn mid-operation
+    # failures into false success. A dedicated subshell preserves strict mode.
+    set +e
+    ( set -Eeuo pipefail; WMF_LOCK_HELD=1 "$@" )
+    _rc=$?
+    if (( _had_errexit == 1 )); then set -e; else set +e; fi
+    flock -u "$_lock_fd" 2>/dev/null || true
+    exec {_lock_fd}>&-
+    return "$_rc"
+}
 
 trim() { local s="$1"; s="${s#"${s%%[![:space:]]*}"}"; s="${s%"${s##*[![:space:]]}"}"; printf '%s' "$s"; }
 
@@ -170,7 +192,7 @@ wg_iface_for() {
 }
 
 ensure_dirs() {
-    install -d -m 700 "$CONFIG_DIR" "$PROFILES_DIR" "$CODES_DIR" "$KEYS_DIR" "$STATE_DIR"
+    install -d -m 700 "$CONFIG_DIR" "$PROFILES_DIR" "$CODES_DIR" "$STATE_DIR"
     install -d -m 755 "$LIBEXEC_DIR" "$MIMIC_CONF_DIR" "$NFT_DIR"
 }
 
@@ -216,11 +238,30 @@ safe_load_env() {
     return 0
 }
 
+# Profile files evolved over several schemas and many fields are optional. Clear
+# every known profile field before loading so a previous profile cannot leak a
+# missing value into the next one during multi-profile rendering/maintenance.
+clear_profile_env() {
+    unset PROFILE_ID PROFILE_NAME ROLE ENABLED WAN_IFACE \
+        WG_MESH_SUBNET WG_IX_IP WG_INGRESS_IP IP_VERSION \
+        WG_MESH_SUBNET6 WG_IX_IP6 WG_INGRESS_IP6 WG_PORT WG_MTU \
+        IX_ENDPOINT_HOST WG_PRIVATE_KEY WG_PUBLIC_KEY WG_PEER_PUBLIC_KEY \
+        INGRESS_PRIVKEY_B64 FORWARD_PROTO TRANSIT_PORT_POOL MIMIC_KEEPALIVE MIMIC_LOCAL_IP \
+        MIMIC_XDP_MODE FW_OPEN_PORT INGRESS_PUBLIC_HOST OBFS_MODE EXIT_MODE \
+        A_PUBLIC_HOST CLIENT_WG_PORT CLIENT_SUBNET CLIENT_DNS CLIENT_MTU ROUTE_TABLE \
+        LINE_GROUP LINE_ROLE LINE_PRIORITY ENDPOINT_CANDIDATES
+}
+
+load_profile_file() {
+    clear_profile_env
+    safe_load_env "$1"
+}
+
 load_profile() {
     local id="$1"
     local path; path="$(profile_env_path "$id")"
     [[ -f "$path" ]] || die "线路不存在：$id"
-    safe_load_env "$path"
+    load_profile_file "$path"
     PROFILE_ID="$(sanitize_id "${PROFILE_ID:-$id}")"
 }
 
@@ -376,9 +417,15 @@ detect_public_ipv4() {
         || true
 }
 
+detect_public_ipv6() {
+    curl -6 -fsS --max-time 5 https://api64.ipify.org 2>/dev/null \
+        || curl -6 -fsS --max-time 5 https://ifconfig.co/ip 2>/dev/null \
+        || true
+}
+
 validate_port() {
     local p="$1"
-    [[ "$p" =~ ^[0-9]+$ ]] && (( p >= 1 && p <= 65535 ))
+    [[ "$p" =~ ^[0-9]{1,5}$ ]] && (( 10#$p >= 1 && 10#$p <= 65535 ))
 }
 
 prompt_port() {
@@ -401,9 +448,13 @@ json_get() {
 
 validate_ipv4() {
     local ip="$1" o
-    [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
+    [[ "$ip" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]] || return 1
     IFS='.' read -ra o <<<"$ip"
-    (( ${o[0]} <= 255 && ${o[1]} <= 255 && ${o[2]} <= 255 && ${o[3]} <= 255 ))
+    local part
+    for part in "${o[@]}"; do
+        [[ "$part" == "0" || "$part" != 0* ]] || return 1
+        (( 10#$part <= 255 )) || return 1
+    done
 }
 
 validate_proto() {
@@ -414,12 +465,32 @@ validate_proto() {
 # Defense-in-depth on top of safe_load_env: reject forged/injected fields from an
 # untrusted WMGF1 code BEFORE they are written to disk. Strict allowlists only.
 code_is_key()       { [[ "$1" =~ ^[A-Za-z0-9+/_-]+={0,2}$ ]]; }          # WG / base64(url) key
-code_is_ipany()     { [[ "$1" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || [[ "$1" =~ ^[0-9A-Fa-f:]{2,45}$ ]]; }
-code_is_cidr()      { [[ "$1" =~ ^[0-9A-Fa-f:.]{2,45}/[0-9]{1,3}$ ]]; }
-code_is_host()      { [[ "$1" =~ ^[A-Za-z0-9._-]{1,253}$ ]] || [[ "$1" =~ ^[0-9A-Fa-f:]{2,45}$ ]]; }
-code_is_uint()      { [[ "$1" =~ ^[0-9]{1,5}$ ]]; }
-code_is_keepalive() { [[ "$1" =~ ^[0-9:]{1,32}$ ]]; }
-code_is_token()     { [[ "$1" =~ ^[A-Za-z0-9._+-]{1,32}$ ]]; }          # ip_version / obfs / swgp mode / exit_mode
+code_is_ipany()     {
+    python3 -c 'import ipaddress,sys
+try: ipaddress.ip_address(sys.argv[1])
+except ValueError: raise SystemExit(1)' "$1" 2>/dev/null
+}
+code_is_cidr()      {
+    python3 -c 'import ipaddress,sys
+try: ipaddress.ip_network(sys.argv[1], strict=False)
+except ValueError: raise SystemExit(1)' "$1" 2>/dev/null
+}
+code_is_ipv4()      { [[ "$1" != *:* ]] && code_is_ipany "$1"; }
+code_is_ipv6()      { [[ "$1" == *:* ]] && code_is_ipany "$1"; }
+code_is_cidr4()     { code_is_cidr "$1" && [[ "${1%%/*}" != *:* ]]; }
+code_is_cidr6()     { code_is_cidr "$1" && [[ "${1%%/*}" == *:* ]]; }
+code_is_host()      {
+    if [[ "$1" == *:* ]]; then code_is_ipv6 "$1"; return; fi
+    if [[ "$1" =~ ^[0-9.]+$ ]]; then validate_ipv4 "$1"; return; fi
+    [[ "$1" =~ ^[A-Za-z0-9._-]{1,253}$ ]]
+}
+code_is_keepalive() { [[ "$1" =~ ^[0-9]{1,10}:[0-9]{0,10}:[0-9]{0,10}:[0-9]{0,10}$ ]]; }
+code_is_token()     { [[ "$1" =~ ^[A-Za-z0-9._+-]{1,32}$ ]]; }
+code_is_port()      { validate_port "$1"; }
+code_is_mtu()       { [[ "$1" =~ ^[0-9]{4}$ ]] && (( 10#$1 >= 1280 && 10#$1 <= 1500 )); }
+code_is_ip_version(){ case "$1" in 4|6|dual) return 0 ;; *) return 1 ;; esac; }
+code_is_obfs_mode() { case "$1" in mimic|direct) return 0 ;; *) return 1 ;; esac; }
+code_is_exit_mode() { [[ "$1" == "global" ]]; }
 
 code_require() {  # field value validator
     local n="$1" v="$2" fn="$3"
@@ -438,8 +509,8 @@ validate_rules_tsv() {
     while IFS=$'\t' read -r rid note tport lhost lport rproto; do
         [[ -z "$rid" ]] && continue
         [[ "$rid" =~ ^[A-Za-z0-9._-]{1,64}$ ]] || die "接入码规则 ID 非法（疑似注入），已拒绝导入"
-        [[ -z "$tport"  ]] || code_is_uint "$tport"  || die "接入码规则中转端口非法，已拒绝导入"
-        [[ -z "$lport"  ]] || code_is_uint "$lport"  || die "接入码规则落地端口非法，已拒绝导入"
+        [[ -z "$tport"  ]] || code_is_port "$tport"  || die "接入码规则中转端口非法，已拒绝导入"
+        [[ -z "$lport"  ]] || code_is_port "$lport"  || die "接入码规则落地端口非法，已拒绝导入"
         [[ -z "$lhost"  ]] || code_is_host "$lhost"  || die "接入码规则落地地址非法（疑似注入），已拒绝导入"
         [[ -z "$rproto" ]] || validate_proto "$rproto" || die "接入码规则协议非法，已拒绝导入"
         : "${note:-}"   # note 可含中文，safe_load_env 不执行其内容、且 TSV 已按行切分（无法注入换行）
@@ -454,19 +525,97 @@ wg_pubkey_of() { printf '%s' "$1" | wg pubkey; }
 # 从 /24 网段取主机 IP：10.90.0.0/24 + 2 → 10.90.0.2
 mesh_host_ip() { local s="${1%%/*}"; printf '%s.%s' "${s%.*}" "$2"; }
 
-# 扫描已有线路占用的 mesh 网段(10.N.0.0/24 的 N),返回第一个空闲的,避免多条线路
-# 撞同一网段/虚拟IP;预留 10.89(relay 客户端默认子网)。无线路时仍回 10.88(单线路旧默认)。
-next_free_mesh_subnet() {
-    local p sub used=" 89 " n
+networks_overlap() {
+    python3 - "$1" "$2" <<'PY'
+import ipaddress, sys
+try:
+    a = ipaddress.ip_network(sys.argv[1], strict=False)
+    b = ipaddress.ip_network(sys.argv[2], strict=False)
+    raise SystemExit(0 if a.version == b.version and a.overlaps(b) else 1)
+except ValueError:
+    raise SystemExit(2)
+PY
+}
+
+# True if a candidate overlaps any mesh/client subnet already configured locally.
+network_conflicts_existing() {
+    local candidate="$1" exclude="${2:-}" p pid key current
     for p in "$PROFILES_DIR"/*.env; do
         [[ -f "$p" ]] || continue
-        sub="$(grep -m1 '^WG_MESH_SUBNET=' "$p" 2>/dev/null | cut -d= -f2- | tr -d '"' || true)"
-        [[ "$sub" =~ ^10\.([0-9]+)\. ]] && used="${used}${BASH_REMATCH[1]} "
+        pid="$(grep -m1 '^PROFILE_ID=' "$p" 2>/dev/null | cut -d= -f2- || true)"
+        [[ -n "$exclude" && "$pid" == "$exclude" ]] && continue
+        for key in WG_MESH_SUBNET WG_MESH_SUBNET6 CLIENT_SUBNET; do
+            current="$(grep -m1 "^${key}=" "$p" 2>/dev/null | cut -d= -f2- || true)"
+            [[ -n "$current" ]] || continue
+            networks_overlap "$candidate" "$current" && return 0
+        done
     done
-    for n in 88 90 91 92 93 94 95 96 97 98 99; do
-        [[ "$used" == *" $n "* ]] || { printf '10.%s.0.0/24' "$n"; return 0; }
+    return 1
+}
+
+candidate_is_free() {
+    local candidate="$1" exclude="$2" reserved
+    shift 2
+    network_conflicts_existing "$candidate" "$exclude" && return 1
+    for reserved in "$@"; do
+        [[ -n "$reserved" ]] || continue
+        networks_overlap "$candidate" "$reserved" && return 1
     done
-    printf '10.88.0.0/24'
+    return 0
+}
+
+# Random /24 from 10.64.0.0/10 makes independently-created access codes very
+# unlikely to collide; a full deterministic scan guarantees correct exhaustion.
+next_free_mesh_subnet() {
+    local exclude="${1:-}"; shift || true
+    local i idx second third candidate
+    for ((i=0; i<256; i++)); do
+        idx=$(( ((RANDOM << 1) ^ RANDOM) % 16384 ))
+        second=$((64 + idx / 256)); third=$((idx % 256))
+        candidate="10.${second}.${third}.0/24"
+        candidate_is_free "$candidate" "$exclude" "$@" && { printf '%s' "$candidate"; return 0; }
+    done
+    for ((idx=0; idx<16384; idx++)); do
+        second=$((64 + idx / 256)); third=$((idx % 256))
+        candidate="10.${second}.${third}.0/24"
+        candidate_is_free "$candidate" "$exclude" "$@" && { printf '%s' "$candidate"; return 0; }
+    done
+    return 1
+}
+
+next_free_mesh_subnet6() {
+    local i candidate
+    for ((i=0; i<1024; i++)); do
+        printf -v candidate 'fd%02x:%04x:%04x:%04x::/64' \
+            "$((RANDOM % 256))" "$RANDOM" "$RANDOM" "$RANDOM"
+        candidate_is_free "$candidate" "" && { printf '%s' "$candidate"; return 0; }
+    done
+    return 1
+}
+
+mesh_host_ip6() {
+    python3 - "$1" "$2" <<'PY'
+import ipaddress, sys
+n = ipaddress.ip_network(sys.argv[1], strict=False)
+print(n.network_address + int(sys.argv[2]))
+PY
+}
+
+next_free_route_table() {
+    local exclude="${1:-}" p pid table used=" " start offset candidate
+    for p in "$PROFILES_DIR"/*.env; do
+        [[ -f "$p" ]] || continue
+        pid="$(grep -m1 '^PROFILE_ID=' "$p" 2>/dev/null | cut -d= -f2- || true)"
+        [[ -n "$exclude" && "$pid" == "$exclude" ]] && continue
+        table="$(grep -m1 '^ROUTE_TABLE=' "$p" 2>/dev/null | cut -d= -f2- || true)"
+        [[ "$table" =~ ^[0-9]+$ ]] && used="${used}${table} "
+    done
+    start=$(( 10000 + $(printf '%s' "${exclude:-route}" | cksum | cut -d' ' -f1) % 20000 ))
+    for ((offset=0; offset<20000; offset++)); do
+        candidate=$(( 10000 + (start - 10000 + offset) % 20000 ))
+        [[ "$used" == *" ${candidate} "* ]] || { printf '%s' "$candidate"; return 0; }
+    done
+    return 1
 }
 
 # ── rule env I/O (multi-rule) ──────────────────────────────────────────────
@@ -592,6 +741,62 @@ transit_port_in_use() {
     return 1
 }
 
+protocols_overlap() {
+    [[ "$1" == "both" || "$2" == "both" || "$1" == "$2" ]]
+}
+
+local_listener_port_in_use() {
+    local port="$1" exclude_profile="${2:-}" p values pid role listen client_listen
+    for p in "$PROFILES_DIR"/*.env; do
+        [[ -f "$p" ]] || continue
+        values="$(
+            load_profile_file "$p" 2>/dev/null
+            printf '%s|%s|%s|%s' "${PROFILE_ID:-}" "${ROLE:-}" "${WG_PORT:-}" "${CLIENT_WG_PORT:-}"
+        )" || continue
+        IFS='|' read -r pid role listen client_listen <<<"$values"
+        [[ -n "$exclude_profile" && "$pid" == "$exclude_profile" ]] && continue
+        case "$role" in
+            nat-transit|exit) [[ "$listen" == "$port" ]] && return 0 ;;
+            relay) [[ "$client_listen" == "$port" ]] && return 0 ;;
+        esac
+    done
+    return 1
+}
+
+client_rule_port_in_use() {
+    local pid="$1" port="$2" exclude="${3:-}" proto="${4:-both}"
+    local p other_pid rid values existing_port existing_proto
+    for p in "$PROFILES_DIR"/*.env; do
+        [[ -f "$p" ]] || continue
+        other_pid="$(grep -m1 '^PROFILE_ID=' "$p" 2>/dev/null | cut -d= -f2- || true)"
+        [[ -n "$other_pid" ]] || continue
+        for rid in $(list_rule_ids "$other_pid"); do
+            [[ "$other_pid" == "$pid" && "$rid" == "$exclude" ]] && continue
+            values="$(load_rule "$other_pid" "$rid" 2>/dev/null && printf '%s|%s' "${CLIENT_PORT:-}" "${FORWARD_PROTO:-both}")" || continue
+            IFS='|' read -r existing_port existing_proto <<<"$values"
+            [[ "$existing_port" == "$port" ]] || continue
+            protocols_overlap "$proto" "${existing_proto:-both}" && return 0
+        done
+    done
+    return 1
+}
+
+client_port_in_use() {
+    local pid="$1" port="$2" exclude="${3:-}" proto="${4:-both}"
+    client_rule_port_in_use "$pid" "$port" "$exclude" "$proto" && return 0
+    if protocols_overlap "$proto" udp; then
+        local_listener_port_in_use "$port" "$pid" && return 0
+    fi
+    return 1
+}
+
+public_udp_port_in_use() {
+    local port="$1" exclude_profile="${2:-}"
+    local_listener_port_in_use "$port" "$exclude_profile" && return 0
+    client_rule_port_in_use "$exclude_profile" "$port" "" udp && return 0
+    return 1
+}
+
 rules_to_tsv() {
     local pid="$1" rid
     for rid in $(list_rule_ids "$pid"); do
@@ -613,6 +818,8 @@ render_code_json() {
     [[ -n "$rules_tsv" ]] || die "线路 ${PROFILE_ID} 暂无转发规则，无法生成接入码"
     rules_b64="$(printf '%s' "$rules_tsv" | base64url_encode)"
     created="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    # These globals are populated dynamically by load_profile.
+    # shellcheck disable=SC2153
     python3 - "$PROFILE_ID" "${PROFILE_NAME:-$PROFILE_ID}" "$WG_MESH_SUBNET" \
         "$WG_IX_IP" "$WG_INGRESS_IP" "$WG_PUBLIC_KEY" "$INGRESS_PRIVKEY_B64" \
         "$IX_ENDPOINT_HOST" "$WG_PORT" "$WG_MTU" "${MIMIC_KEEPALIVE:-300:::}" \
@@ -661,21 +868,19 @@ generate_code() {
     render_code_json | base64url_encode | sed 's/^/WMGF1:/'
 }
 
-# 出口接入码（code_schema=6, nat-exit-code）：A↔B 混淆组网 + 全局出口用。
-# 复用 transit 的 WG 字段，去掉 rules，加 obfs/swgp/exit_mode。
+# 出口接入码（code_schema=6, nat-exit-code）：A↔B Mimic/WG 组网 + 全局出口用。
+# 复用 transit 的 WG 字段，去掉 rules，加 obfs/exit_mode。
 render_exit_code_json() {
     [[ "${ROLE:-}" == "exit" ]] || die "仅 exit 线路可生成出口接入码"
     local created; created="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     python3 - "$PROFILE_ID" "${PROFILE_NAME:-$PROFILE_ID}" "$WG_MESH_SUBNET" \
         "$WG_IX_IP" "$WG_INGRESS_IP" "$WG_PUBLIC_KEY" "$INGRESS_PRIVKEY_B64" \
         "$IX_ENDPOINT_HOST" "$WG_PORT" "$WG_MTU" "${MIMIC_KEEPALIVE:-300:::}" \
-        "${OBFS_MODE:-swgp+mimic}" "${SWGP_MODE:-zero-overhead-2026}" "${SWGP_PSK:-}" "${SWGP_PORT:-0}" \
-        "${EXIT_MODE:-global}" "$created" \
+        "${OBFS_MODE:-mimic}" "${EXIT_MODE:-global}" "$created" \
         "${IP_VERSION:-4}" "${WG_MESH_SUBNET6:-}" "${WG_IX_IP6:-}" "${WG_INGRESS_IP6:-}" <<'PY'
 import json, sys
 ( pid, pname, subnet, ix_ip, ing_ip, ix_pub, ing_priv_b64, endpoint, wg_port, wg_mtu,
-  keepalive, obfs, swgp_mode, swgp_psk, swgp_port, exit_mode, created,
-  ip_version, subnet6, ix_ip6, ing_ip6 ) = sys.argv[1:22]
+  keepalive, obfs, exit_mode, created, ip_version, subnet6, ix_ip6, ing_ip6 ) = sys.argv[1:19]
 obj = {
     "version": 1, "code_schema": 6, "project": "wg-mimic-fabric",
     "role": "nat-exit-code", "profile_id": pid, "profile_name": pname,
@@ -683,8 +888,7 @@ obj = {
     "wg_mesh_subnet": subnet, "ix_wg_ip": ix_ip, "ingress_wg_ip": ing_ip,
     "ix_wg_pubkey": ix_pub, "ingress_wg_privkey_b64": ing_priv_b64,
     "ix_endpoint_host": endpoint, "wg_port": int(wg_port), "wg_mtu": int(wg_mtu),
-    "mimic_keepalive": keepalive, "obfs_mode": obfs, "swgp_mode": swgp_mode,
-    "swgp_psk": swgp_psk, "swgp_port": int(swgp_port), "exit_mode": exit_mode,
+    "mimic_keepalive": keepalive, "obfs_mode": obfs, "exit_mode": exit_mode,
     "created_at": created,
 }
 if subnet6:
@@ -700,10 +904,12 @@ generate_exit_code() {
 }
 
 parse_code() {
-    local code="$1" json schema role
+    local code="$1" json schema role project
     json="$(parse_wmgf_code "$code")"
     schema="$(json_get "$json" code_schema)"
     role="$(json_get "$json" role)"
+    project="$(json_get "$json" project)"
+    [[ "$project" == "wg-mimic-fabric" ]] || die "接入码 project 非法，已拒绝导入"
     # 公共 WG 字段（transit-code 与 exit-code 都有）
     CODE_PROFILE_ID="$(json_get "$json" profile_id)"
     CODE_WG_MESH_SUBNET="$(json_get "$json" wg_mesh_subnet)"
@@ -726,9 +932,6 @@ parse_code() {
     elif [[ "$role" == "nat-exit-code" && "$schema" == "6" ]]; then
         CODE_KIND="exit"
         CODE_OBFS_MODE="$(json_get "$json" obfs_mode)"
-        CODE_SWGP_MODE="$(json_get "$json" swgp_mode)"
-        CODE_SWGP_PSK="$(json_get "$json" swgp_psk)"
-        CODE_SWGP_PORT="$(json_get "$json" swgp_port)"
         CODE_EXIT_MODE="$(json_get "$json" exit_mode)"
     else
         die "不是有效的接入码（需 nat-transit-code/schema5 或 nat-exit-code/schema6）"
@@ -736,34 +939,37 @@ parse_code() {
 
     # ── SECURITY: 强校验所有不可信字段，拒绝伪造/注入的接入码 ──────────────────
     code_require  profile_id       "$CODE_PROFILE_ID"          code_is_token
-    code_require  wg_mesh_subnet   "$CODE_WG_MESH_SUBNET"      code_is_cidr
-    code_require  ix_wg_ip         "$CODE_IX_WG_IP"            code_is_ipany
-    code_require  ingress_wg_ip    "$CODE_INGRESS_WG_IP"       code_is_ipany
+    code_require  wg_mesh_subnet   "$CODE_WG_MESH_SUBNET"      code_is_cidr4
+    code_require  ix_wg_ip         "$CODE_IX_WG_IP"            code_is_ipv4
+    code_require  ingress_wg_ip    "$CODE_INGRESS_WG_IP"       code_is_ipv4
     code_require  ix_wg_pubkey     "$CODE_IX_WG_PUBKEY"        code_is_key
     code_require  ingress_privkey  "$CODE_INGRESS_PRIVKEY_B64" code_is_key
     code_require  ix_endpoint_host "$CODE_IX_ENDPOINT_HOST"    code_is_host
-    code_require  wg_port          "$CODE_WG_PORT"             code_is_uint
-    code_require  wg_mtu           "$CODE_WG_MTU"              code_is_uint
-    code_optional ip_version       "$CODE_IP_VERSION"          code_is_token
+    code_require  wg_port          "$CODE_WG_PORT"             code_is_port
+    code_require  wg_mtu           "$CODE_WG_MTU"              code_is_mtu
+    code_optional ip_version       "$CODE_IP_VERSION"          code_is_ip_version
     code_optional mimic_keepalive  "$CODE_MIMIC_KEEPALIVE"     code_is_keepalive
-    code_optional wg_mesh_subnet6  "$CODE_WG_MESH_SUBNET6"     code_is_cidr
-    code_optional ix_wg_ip6        "$CODE_IX_WG_IP6"           code_is_ipany
-    code_optional ingress_wg_ip6   "$CODE_INGRESS_WG_IP6"      code_is_ipany
+    if [[ "$CODE_IP_VERSION" == "6" || "$CODE_IP_VERSION" == "dual" ]]; then
+        code_require wg_mesh_subnet6 "$CODE_WG_MESH_SUBNET6" code_is_cidr6
+        code_require ix_wg_ip6 "$CODE_IX_WG_IP6" code_is_ipv6
+        code_require ingress_wg_ip6 "$CODE_INGRESS_WG_IP6" code_is_ipv6
+    else
+        code_optional wg_mesh_subnet6 "$CODE_WG_MESH_SUBNET6" code_is_cidr6
+        code_optional ix_wg_ip6 "$CODE_IX_WG_IP6" code_is_ipv6
+        code_optional ingress_wg_ip6 "$CODE_INGRESS_WG_IP6" code_is_ipv6
+    fi
     if [[ "$CODE_KIND" == "transit" ]]; then
         code_optional forward_proto "$CODE_FORWARD_PROTO" validate_proto
         validate_rules_tsv "$CODE_RULES_TSV"
     else
-        code_require  obfs_mode  "$CODE_OBFS_MODE"  code_is_token
-        code_optional swgp_mode  "$CODE_SWGP_MODE"  code_is_token
-        code_optional swgp_psk   "$CODE_SWGP_PSK"   code_is_key
-        code_optional swgp_port  "$CODE_SWGP_PORT"  code_is_uint
-        code_optional exit_mode  "$CODE_EXIT_MODE"  code_is_token
+        code_require obfs_mode "$CODE_OBFS_MODE" code_is_obfs_mode
+        code_optional exit_mode "$CODE_EXIT_MODE" code_is_exit_mode
     fi
 }
 
 ensure_mimic() {
     command_exists mimic || die "未找到 mimic，请安装：apt install mimic mimic-dkms"
-    modprobe mimic 2>/dev/null || warn "mimic 内核模块未加载，请安装 mimic-dkms"
+    modprobe mimic 2>/dev/null || die "mimic 内核模块无法加载；请安装匹配当前内核的 mimic-dkms 或先重启"
 }
 
 mimic_module_loaded() { lsmod 2>/dev/null | awk '$1=="mimic"{f=1} END{exit !f}'; }
@@ -800,8 +1006,8 @@ WantedBy=multi-user.target
 EOF
     install -m 644 "$tmp" "$SYSTEMD_RESUME_SERVICE"
     rm -f "$tmp"
-    systemctl daemon-reload 2>/dev/null || true
-    systemctl enable wg-mimic-resume.service 2>/dev/null || true
+    systemctl daemon-reload
+    systemctl enable wg-mimic-resume.service
 }
 
 resume_after_boot() {
@@ -839,7 +1045,10 @@ offer_reboot() {
 }
 
 detect_default_iface() {
-    ip -4 route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}'
+    local iface
+    iface="$(ip -4 route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')"
+    [[ -n "$iface" ]] || iface="$(ip -6 route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')"
+    printf '%s' "$iface"
 }
 
 # First global IPv4 bound to the default interface — the inbound/bindable IP,
@@ -852,29 +1061,54 @@ detect_local_ipv4() {
         | awk '/inet /{print $2}' | cut -d/ -f1 | head -1
 }
 
+detect_local_ipv6() {
+    local iface="${1:-}"
+    [[ -n "$iface" ]] || iface="$(detect_default_iface)"
+    [[ -n "$iface" ]] || return 0
+    ip -6 addr show dev "$iface" scope global 2>/dev/null \
+        | awk '/inet6 /{print $2}' | cut -d/ -f1 | head -1
+}
+
+detect_local_ip() {
+    local iface="${1:-}" family="${2:-4}" ip=""
+    if [[ "$family" == "6" ]]; then
+        ip="$(detect_local_ipv6 "$iface")"
+    elif [[ "$family" == "dual" ]]; then
+        ip="$(detect_local_ipv4 "$iface")"
+        [[ -n "$ip" ]] || ip="$(detect_local_ipv6 "$iface")"
+    else
+        ip="$(detect_local_ipv4 "$iface")"
+    fi
+    printf '%s' "$ip"
+}
+
 # Resolve a host to an IP. Literal IPv4/IPv6 pass through unchanged; hostnames
 # are resolved (getent, then python3 fallback). Used by nft render + DDNS so
 # domain landings/endpoints work and IP changes can be detected.
 resolve_host_ip() {
-    local h="$1" ip=""
+    local h="$1" family="${2:-auto}" ip="" getter="ahosts" pyfamily="0"
     [[ -z "$h" ]] && return 0
     if [[ "$h" == *:* ]] || [[ "$h" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
         printf '%s' "$h"; return 0
     fi
-    ip="$(getent ahostsv4 "$h" 2>/dev/null | awk 'NR==1{print $1; exit}')"
-    [[ -z "$ip" ]] && ip="$(getent ahosts "$h" 2>/dev/null | awk 'NR==1{print $1; exit}')"
+    if [[ "$family" == "6" ]]; then
+        getter="ahostsv6"; pyfamily="10"
+    elif [[ "$family" == "4" ]]; then
+        getter="ahostsv4"; pyfamily="2"
+    fi
+    ip="$(getent "$getter" "$h" 2>/dev/null | awk 'NR==1{print $1; exit}')"
     if [[ -z "$ip" ]] && command_exists python3; then
         ip="$(python3 -c 'import socket,sys
-try: print(socket.getaddrinfo(sys.argv[1],None)[0][4][0])
-except Exception: pass' "$h" 2>/dev/null)"
+try: print(socket.getaddrinfo(sys.argv[1],None,int(sys.argv[2]))[0][4][0])
+except Exception: pass' "$h" "$pyfamily" 2>/dev/null)"
     fi
     printf '%s' "$ip"
 }
 
 validate_mtu() {
     local mtu="$1"
-    [[ "$mtu" =~ ^[0-9]+$ ]] || die "MTU 必须是数字"
-    (( mtu >= 1280 && mtu <= 1500 )) || die "MTU 应在 1280–1500 之间（当前 ${mtu}）"
+    [[ "$mtu" =~ ^[0-9]{4}$ ]] || die "MTU 必须是 4 位数字"
+    (( 10#$mtu >= 1280 && 10#$mtu <= 1500 )) || die "MTU 应在 1280–1500 之间（当前 ${mtu}）"
 }
 
 format_mimic_ip() {
@@ -911,22 +1145,31 @@ verify_sha256() {
 # SECURITY: 直连 GitHub 优先（受信 TLS 端点），第三方镜像仅作国内不可达时的兜底，
 # 不再默认信任镜像。download_with_mirrors 也同理（API/raw 直连优先于镜像）。
 download_with_mirrors() {
-    local relpath="$1" dest="$2" ref="${3:-main}"
+    local relpath="$1" dest="$2" ref="${3:-main}" want_sha="${4:-}"
     local repo="${WMF_REPO:-ike-sh/wg-mimic-fabric}"
-    local mirrors="" m
+    local mirrors=() m
     IFS=',' read -ra mirrors <<< "${WMF_GITHUB_MIRRORS:-$DEFAULT_GITHUB_MIRRORS}"
     if curl -fsSL -H "Accept: application/vnd.github.raw+json" \
-        -o "$dest" "https://api.github.com/repos/${repo}/contents/${relpath}?ref=${ref}" 2>/dev/null; then
+        -o "$dest" "https://api.github.com/repos/${repo}/contents/${relpath}?ref=${ref}" 2>/dev/null \
+        && [[ -s "$dest" ]]; then
+        verify_sha256 "$dest" "$want_sha" || return 1
         return 0
     fi
-    for m in "" "${mirrors[@]}" ; do
-        local url
-        if [[ -n "$m" ]]; then
-            url="$(mirror_url "$m" "https://raw.githubusercontent.com/${repo}/${ref}/${relpath}")"
-        else
-            url="https://raw.githubusercontent.com/${repo}/${ref}/${relpath}?ts=$(date +%s)"
-        fi
-        if curl -fsSL -o "$dest" "$url" 2>/dev/null; then return 0; fi
+    if curl -fsSL -o "$dest" "https://raw.githubusercontent.com/${repo}/${ref}/${relpath}?ts=$(date +%s)" 2>/dev/null \
+        && [[ -s "$dest" ]]; then
+        verify_sha256 "$dest" "$want_sha" || return 1
+        return 0
+    fi
+    [[ -n "$want_sha" ]] || {
+        [[ "${#mirrors[@]}" -gt 0 && -n "${mirrors[0]:-}" ]] \
+            && warn "直连 GitHub 失败；未提供 SHA256，拒绝从第三方镜像下载可执行脚本"
+        return 1
+    }
+    for m in "${mirrors[@]}" ; do
+        [[ -n "$m" ]] || continue
+        local url; url="$(mirror_url "$m" "https://raw.githubusercontent.com/${repo}/${ref}/${relpath}")"
+        if curl -fsSL -o "$dest" "$url" 2>/dev/null && [[ -s "$dest" ]] \
+            && verify_sha256 "$dest" "$want_sha"; then return 0; fi
     done
     return 1
 }
@@ -934,14 +1177,20 @@ download_with_mirrors() {
 # 下载任意 GitHub/api/raw 资源：直连优先，镜像兜底（国内直连不可达时）。
 # $1=完整 URL（github.com / api.github.com / *.githubusercontent.com）  $2=落地文件
 gh_curl() {
-    local url="$1" dest="$2" m u mirrors=()
+    local url="$1" dest="$2" want_sha="${3:-}" m u mirrors=()
     IFS=',' read -ra mirrors <<< "${WMF_GITHUB_MIRRORS:-$DEFAULT_GITHUB_MIRRORS}"
-    for m in "" "${mirrors[@]}" ; do
-        if [[ -n "$m" ]]; then u="$(mirror_url "$m" "$url")"; else u="$url"; fi
+    if curl -fsSL --connect-timeout 10 --max-time 300 --retry 1 -o "$dest" "$url" 2>/dev/null \
+        && [[ -s "$dest" ]]; then
+        verify_sha256 "$dest" "$want_sha" || return 1
+        return 0
+    fi
+    # API metadata and unpinned executables must never come from a third party.
+    [[ -n "$want_sha" ]] || return 1
+    for m in "${mirrors[@]}" ; do
+        [[ -n "$m" ]] || continue
+        u="$(mirror_url "$m" "$url")"
         if curl -fsSL --connect-timeout 10 --max-time 300 --retry 1 -o "$dest" "$u" 2>/dev/null \
-            && [[ -s "$dest" ]]; then
-            return 0
-        fi
+            && [[ -s "$dest" ]] && verify_sha256 "$dest" "$want_sha"; then return 0; fi
     done
     return 1
 }
@@ -953,11 +1202,9 @@ upgrade_script() {
     local tmp remote_ver
     tmp="$(mktemp)"
     info "下载 ${WMF_REPO:-ike-sh/wg-mimic-fabric} @ ${ref} ..."
-    download_with_mirrors "install.sh" "$tmp" "$ref" || die "下载 install.sh 失败"
+    download_with_mirrors "install.sh" "$tmp" "$ref" "${WMF_INSTALL_SHA256:-}" || die "下载 install.sh 失败"
     # SECURITY: 安装前完整性闸门——可选 SHA256 锁定 + 强制 bash 语法校验，
     # 拒绝被篡改/截断/损坏的脚本（避免镜像投毒或断点续传残档写入并以 root 运行）。
-    verify_sha256 "$tmp" "${WMF_INSTALL_SHA256:-}" \
-        || { rm -f "$tmp"; die "install.sh SHA256 校验失败，已中止升级"; }
     bash -n "$tmp" 2>/dev/null \
         || { rm -f "$tmp"; die "下载的 install.sh 语法校验未通过（疑似损坏/被篡改），已中止升级"; }
     grep -q '^# wg-mimic-fabric' "$tmp" \
@@ -988,7 +1235,8 @@ upgrade_script() {
     [[ -f "$WM_CLI_INSTALL_SH" ]] && cp -a "$WM_CLI_INSTALL_SH" "${BACKUP_DIR}/install.sh.bak.$(date +%Y%m%d%H%M%S)"
     install -m 755 "$tmp" "$WM_CLI_INSTALL_SH"
     rm -f "$tmp"
-    ensure_cli_aliases
+    # 由刚下载的新脚本刷新包装器和 systemd 单元，避免只替换脚本却继续运行旧单元。
+    WMF_LOCK_HELD=1 "$WM_CLI_INSTALL_SH" refresh-installation
     ok "已升级至 ${remote_ver:-unknown}"
 }
 
@@ -1014,7 +1262,8 @@ ddns_state_set() {
     chmod 600 "$f"
 }
 
-# Re-resolve ingress WG endpoints; on change update the live peer endpoint.
+# Re-resolve dialing-side WG endpoints; on change update the live peer endpoint
+# and the Mimic exact-IP filter. Landing domains follow through nft re-rendering.
 # Landing domains follow automatically because apply_nft_all re-resolves them.
 ddns_refresh() {
     require_root
@@ -1024,23 +1273,36 @@ ddns_refresh() {
         [[ -f "$p" ]] || continue
         (
             # shellcheck disable=SC1090
-            safe_load_env "$p"
+            load_profile_file "$p"
             [[ "${ENABLED:-true}" == "true" ]] || exit 0
-            [[ "${ROLE:-}" == "nat-ingress" && -n "${IX_ENDPOINT_HOST:-}" ]] || exit 0
+            case "${ROLE:-}" in nat-ingress|relay) ;; *) exit 0 ;; esac
+            [[ -n "${IX_ENDPOINT_HOST:-}" ]] || exit 0
             [[ "$IX_ENDPOINT_HOST" =~ [a-zA-Z] ]] || exit 0
             local newip key old wg_iface
-            newip="$(resolve_host_ip "$IX_ENDPOINT_HOST")"
-            [[ -n "$newip" ]] || exit 0
             key="endpoint:${PROFILE_ID}"
             old="$(ddns_state_get "$key")"
+            newip="$(resolve_host_ip "$IX_ENDPOINT_HOST" "${IP_VERSION:-4}")"
+            if [[ -z "$newip" ]]; then
+                [[ -n "$old" ]] || { printf '[ERROR] 无法解析线路端点 %s（%s），且没有可用缓存\n' "$IX_ENDPOINT_HOST" "$PROFILE_ID" >&2; exit 1; }
+                newip="$old"
+                warn "DNS 暂时不可用，${PROFILE_ID} 沿用端点缓存 ${old}"
+            fi
             if [[ "$newip" != "$old" ]]; then
                 wg_iface="$(wg_iface_for "$PROFILE_ID")"
-                wg set "$wg_iface" peer "$WG_PEER_PUBLIC_KEY" \
-                    endpoint "$(format_mimic_ip "$newip"):${WG_PORT}" 2>/dev/null || true
+                if wg show "$wg_iface" >/dev/null 2>&1; then
+                    wg set "$wg_iface" peer "$WG_PEER_PUBLIC_KEY" \
+                        endpoint "$(format_mimic_ip "$newip"):${WG_PORT}"
+                fi
+                if obfs_has_mimic && [[ -n "${WAN_IFACE:-}" ]]; then
+                    apply_mimic_conf_iface "$WAN_IFACE"
+                    if systemctl is-active --quiet "wg-mimic-mimic@${WAN_IFACE}.service" 2>/dev/null; then
+                        systemctl restart "wg-mimic-mimic@${WAN_IFACE}.service"
+                    fi
+                fi
                 ddns_state_set "$key" "$newip"
                 info "DDNS ${PROFILE_ID}: ${IX_ENDPOINT_HOST} ${old:-?} → ${newip}"
             fi
-        )
+        ) || return 1
     done
     apply_nft_all
     ok "DDNS 刷新完成"
@@ -1078,7 +1340,7 @@ EOF
 ddns_enable() {
     require_root
     install_ddns_timer
-    systemctl enable --now wg-mimic-ddns.timer 2>/dev/null || true
+    systemctl enable --now wg-mimic-ddns.timer
     ok "DDNS 定时已启用（每 3 分钟）"
 }
 
@@ -1114,7 +1376,7 @@ group_members() {
         [[ -f "$p" ]] || continue
         (
             # shellcheck disable=SC1090
-            safe_load_env "$p"
+            load_profile_file "$p"
             [[ "${LINE_GROUP:-}" == "$grp" ]] && printf '%s\n' "$PROFILE_ID"
         )
     done
@@ -1141,7 +1403,7 @@ list_groups() {
             [[ -f "$p" ]] || continue
             (
                 # shellcheck disable=SC1090
-                safe_load_env "$p"
+                load_profile_file "$p"
                 [[ -n "${LINE_GROUP:-}" ]] || exit 0
                 printf '%s\t%s\t%s\t%s\t%s\n' "$LINE_GROUP" "$PROFILE_ID" \
                     "${LINE_ROLE:-standalone}" "${LINE_PRIORITY:-100}" "${ENABLED:-true}"
@@ -1160,10 +1422,12 @@ switch_line() {
     [[ -n "$members" ]] || die "分组无成员：$grp"
     while IFS= read -r m; do [[ "$m" == "$target" ]] && found=1; done <<<"$members"
     [[ "$found" == "1" ]] || die "目标不在分组 ${grp}：${target}"
+    # 先停其它成员，再启动目标，避免共享入口端口/路由短暂并存并抢占。
     while IFS= read -r m; do
-        [[ -n "$m" ]] || continue
-        if [[ "$m" == "$target" ]]; then start_profile "$m"; else stop_profile "$m" 2>/dev/null || true; fi
+        [[ -n "$m" && "$m" != "$target" ]] || continue
+        stop_profile "$m"
     done <<<"$members"
+    start_profile "$target"
     ddns_state_set "active:${grp}" "$target"
     ok "已切换分组 ${grp} → ${target}"
 }
@@ -1197,11 +1461,8 @@ primary_backup_check() {
 
 # ── render configs ─────────────────────────────────────────────────────────
 
-# 混淆层判断（OBFS_MODE 缺省=mimic → 保持旧 nat-transit/nat-ingress 行为不变）。
-obfs_has_mimic() { [[ "${OBFS_MODE:-mimic}" == *mimic* ]]; }
-obfs_has_swgp()  { [[ "${OBFS_MODE:-mimic}" == *swgp* ]]; }
-# 线上端口（mimic filter / swgp 对端）：含 swgp 时为 SWGP_PORT，否则 WG_PORT。
-obfs_wire_port() { if obfs_has_swgp; then printf '%s' "${SWGP_PORT:-${WG_PORT}}"; else printf '%s' "${WG_PORT}"; fi; }
+# 出口支持 mimic/direct；中转配置缺省即 mimic。
+obfs_has_mimic() { [[ "${OBFS_MODE:-mimic}" == "mimic" ]]; }
 
 render_mimic_conf_for_profile() {
     local role="${ROLE:-}" port="${WG_PORT:-}"
@@ -1212,37 +1473,59 @@ render_mimic_conf_for_profile() {
         # (auto-detected from WAN_IFACE; override via MIMIC_LOCAL_IP). The 0.0.0.0/[::]
         # wildcard only works on mimic builds >= 2025-11 (mimic#32) → last-resort only.
         local lip="${MIMIC_LOCAL_IP:-}"
-        [[ -n "$lip" ]] || lip="$(detect_local_ipv4 "${WAN_IFACE:-}")"
-        [[ -n "$lip" ]] || lip="0.0.0.0"
+        [[ -n "$lip" ]] || lip="$(detect_local_ip "${WAN_IFACE:-}" "${IP_VERSION:-4}")"
+        [[ -n "$lip" ]] || { [[ "${IP_VERSION:-4}" == "6" ]] && lip="::" || lip="0.0.0.0"; }
         printf 'filter = local=%s:%s\n' "$(format_mimic_ip "$lip")" "$port"
     elif [[ "$role" == "nat-ingress" ]]; then
         # ingress = WG dialer → match the remote IX endpoint IP it connects to
-        printf 'filter = remote=%s:%s\n' "$(format_mimic_ip "${IX_ENDPOINT_HOST:-}")" "$port"
+        local rip; rip="$(resolve_host_ip "${IX_ENDPOINT_HOST:-}" "${IP_VERSION:-4}")"
+        [[ -n "$rip" ]] || rip="${IX_ENDPOINT_HOST:-}"
+        printf 'filter = remote=%s:%s\n' "$(format_mimic_ip "$rip")" "$port"
     elif [[ "$role" == "exit" ]]; then
-        # exit = WG/ swgp listener；mimic 仅在 OBFS 含 mimic 时挂，端口对准线上端口
+        # exit = WG listener；direct 模式不挂 Mimic。
         obfs_has_mimic || return 0
         local lip="${MIMIC_LOCAL_IP:-}"
-        [[ -n "$lip" ]] || lip="$(detect_local_ipv4 "${WAN_IFACE:-}")"
-        [[ -n "$lip" ]] || lip="0.0.0.0"
-        printf 'filter = local=%s:%s\n' "$(format_mimic_ip "$lip")" "$(obfs_wire_port)"
+        [[ -n "$lip" ]] || lip="$(detect_local_ip "${WAN_IFACE:-}" "${IP_VERSION:-4}")"
+        [[ -n "$lip" ]] || { [[ "${IP_VERSION:-4}" == "6" ]] && lip="::" || lip="0.0.0.0"; }
+        printf 'filter = local=%s:%s\n' "$(format_mimic_ip "$lip")" "$port"
     elif [[ "$role" == "relay" ]]; then
         # relay = 拨号端 → match 远端 B 的线上端口
         obfs_has_mimic || return 0
-        printf 'filter = remote=%s:%s\n' "$(format_mimic_ip "${IX_ENDPOINT_HOST:-}")" "$(obfs_wire_port)"
+        local rip; rip="$(resolve_host_ip "${IX_ENDPOINT_HOST:-}" "${IP_VERSION:-4}")"
+        [[ -n "$rip" ]] || rip="${IX_ENDPOINT_HOST:-}"
+        printf 'filter = remote=%s:%s\n' "$(format_mimic_ip "$rip")" "$port"
     fi
 }
 
+iface_mimic_keepalive() {
+    local iface="$1" p value
+    for p in "$PROFILES_DIR"/*.env; do
+        [[ -f "$p" ]] || continue
+        value="$(
+            # shellcheck disable=SC1090
+            load_profile_file "$p" 2>/dev/null
+            [[ "${WAN_IFACE:-}" == "$iface" ]] || exit 0
+            [[ "${ENABLED:-true}" == "true" ]] || exit 0
+            obfs_has_mimic || exit 0
+            printf '%s' "${MIMIC_KEEPALIVE:-300:::}"
+        )"
+        [[ -n "$value" ]] && { printf '%s' "$value"; return 0; }
+    done
+    printf '300:::'
+}
+
 render_mimic_conf_iface() {
-    local iface="$1" p
+    local iface="$1" p keepalive
+    keepalive="$(iface_mimic_keepalive "$iface")"
     {
         printf '# Generated by wg-mimic-fabric — iface %s\n' "$iface"
         printf 'log.verbosity = info\n'
-        printf 'keepalive = 300:::\n'
+        printf 'keepalive = %s\n' "$keepalive"
         for p in "$PROFILES_DIR"/*.env; do
             [[ -f "$p" ]] || continue
             (
                 # shellcheck disable=SC1090
-                safe_load_env "$p"
+                load_profile_file "$p"
                 [[ "${WAN_IFACE:-}" == "$iface" ]] || exit 0
                 [[ "${ENABLED:-true}" == "true" ]] || exit 0
                 render_mimic_conf_for_profile
@@ -1260,7 +1543,7 @@ iface_xdp_mode() {
         [[ -f "$p" ]] || continue
         mode="$(
             # shellcheck disable=SC1090
-            safe_load_env "$p" 2>/dev/null
+            load_profile_file "$p" 2>/dev/null
             [[ "${WAN_IFACE:-}" == "$iface" ]] || exit 0
             [[ "${ENABLED:-true}" == "true" ]] || exit 0
             printf '%s' "${MIMIC_XDP_MODE:-}"
@@ -1320,7 +1603,7 @@ AllowedIPs = ${ing_allowed}
 PersistentKeepalive = 25
 EOF
     elif [[ "${ROLE:-}" == "exit" ]]; then
-        # B 出口 = WG 监听端（对端 A relay）；swgp server 在外层解包后转发到本机 WG
+        # B 出口 = WG 监听端（对端 A relay）。
         cat <<EOF
 # Generated by wg-mimic-fabric — exit ${PROFILE_ID}
 [Interface]
@@ -1336,9 +1619,8 @@ PersistentKeepalive = 25
 EOF
     elif [[ "${ROLE:-}" == "relay" ]]; then
         # A 网关 = 拨号端 + 客户端 WG 服务端（单接口承载）。
-        # 含 swgp 时 WG 拨本机 swgp client(127.0.0.1:SWGP_PORT)，否则直拨 B。
         local relay_ep peerb_allowed addr extra c
-        if obfs_has_swgp; then relay_ep="127.0.0.1:${SWGP_PORT}"; else relay_ep="${endpoint}"; fi
+        relay_ep="${endpoint}"
         addr="${ing_addr}"
         # 客户端入口已配置 → 加客户端子网网关地址
         [[ -n "${CLIENT_SUBNET:-}" ]] && addr="${addr}"$'\n'"Address = ${CLIENT_SUBNET%.*}.1/24"
@@ -1359,7 +1641,8 @@ EOF
                 extra="${extra}PostDown = ip -6 route del ${WG_IX_IP6}/128 dev %i 2>/dev/null || true"$'\n'
             fi
             if [[ -n "${CLIENT_SUBNET:-}" ]]; then
-                local _t; _t=$(( 8000 + $(printf '%s' "$PROFILE_ID" | cksum | cut -d' ' -f1) % 1000 ))
+                local _t
+                _t="${ROUTE_TABLE:-$(( 10000 + $(printf '%s' "$PROFILE_ID" | cksum | cut -d' ' -f1) % 20000 ))}"
                 extra="${extra}PostUp = ip route replace default dev %i table ${_t}; ip rule del from ${CLIENT_SUBNET} lookup ${_t} 2>/dev/null || true; ip rule add from ${CLIENT_SUBNET} lookup ${_t}"$'\n'
                 extra="${extra}PostDown = ip rule del from ${CLIENT_SUBNET} lookup ${_t} 2>/dev/null || true; ip route flush table ${_t} 2>/dev/null || true; true"$'\n'
             fi
@@ -1411,19 +1694,11 @@ apply_profile_configs() {
     backup_file "$wg_path"
     render_wg_conf >"$wg_path"
     chmod 600 "$wg_path"
-    if obfs_has_swgp; then
-        if [[ "${ROLE:-}" == "exit" ]]; then
-            apply_swgp_conf "$PROFILE_ID" server "${SWGP_PORT}" "127.0.0.1:${WG_PORT}" \
-                "${SWGP_MODE:-zero-overhead-2026}" "${SWGP_PSK}" 1500
-        elif [[ "${ROLE:-}" == "relay" ]]; then
-            # 全局出口时给 swgp 打 fwmark，使其到 B 的流量避开 WG 默认路由(防环)
-            local _fw=0; [[ "${EXIT_MODE:-global}" == "global" ]] && _fw=$((WMF_FWMARK))
-            apply_swgp_conf "$PROFILE_ID" client "${SWGP_PORT}" \
-                "$(format_mimic_ip "${IX_ENDPOINT_HOST}"):${SWGP_PORT}" \
-                "${SWGP_MODE:-zero-overhead-2026}" "${SWGP_PSK}" 1500 "$_fw"
-        fi
+    if obfs_has_mimic; then
+        write_tunnel_dropin "$PROFILE_ID" "$WAN_IFACE" true
+    else
+        write_tunnel_dropin "$PROFILE_ID" "$WAN_IFACE" false
     fi
-    write_tunnel_mimic_dropin "$PROFILE_ID" "$WAN_IFACE"
 }
 
 # Collect DNAT entries across enabled profiles+rules as TSV:
@@ -1436,19 +1711,37 @@ collect_dnat_entries() {
         [[ -f "$p" ]] || continue
         (
             # shellcheck disable=SC1090
-            safe_load_env "$p"
+            load_profile_file "$p"
             [[ "${ENABLED:-true}" == "true" ]] || exit 0
-            local rid fam mesh_ip landing_ip
+            local rid fam mesh_ip landing_ip cache_key cached_ip
             for rid in $(list_rule_ids "$PROFILE_ID"); do
                 (
                     load_rule "$PROFILE_ID" "$rid" || exit 0
                     [[ "${RULE_ENABLED:-true}" == "true" ]] || exit 0
-                    landing_ip="$(resolve_host_ip "$LANDING_HOST")"
-                    [[ -n "$landing_ip" ]] || exit 0
-                    if [[ "$landing_ip" == *:* ]]; then fam="ip6"; mesh_ip="${WG_IX_IP6:-}"; else fam="ip"; mesh_ip="${WG_IX_IP:-}"; fi
-                    [[ -n "$mesh_ip" ]] || exit 0
                     if [[ "${ROLE:-}" == "nat-transit" ]]; then
                         [[ -n "$TRANSIT_PORT" && -n "$LANDING_HOST" && -n "$LANDING_PORT" ]] || exit 0
+                    elif [[ "${ROLE:-}" == "nat-ingress" ]]; then
+                        [[ -n "${CLIENT_PORT:-}" && -n "$TRANSIT_PORT" && -n "$LANDING_HOST" ]] || exit 0
+                    else
+                        exit 0
+                    fi
+                    cache_key="landing:${PROFILE_ID}:${rid}"
+                    landing_ip="$(resolve_host_ip "$LANDING_HOST")"
+                    if [[ -n "$landing_ip" ]]; then
+                        ddns_state_set "$cache_key" "$landing_ip"
+                    else
+                        cached_ip="$(ddns_state_get "$cache_key")"
+                        if [[ -z "$cached_ip" ]]; then
+                            printf '[ERROR] 无法解析落地地址 %s（%s/%s），且没有可用缓存；拒绝生成不完整规则\n' \
+                                "$LANDING_HOST" "$PROFILE_ID" "$rid" >&2
+                            exit 1
+                        fi
+                        landing_ip="$cached_ip"
+                        warn "DNS 暂时不可用，${PROFILE_ID}/${rid} 沿用缓存地址 ${cached_ip}"
+                    fi
+                    if [[ "$landing_ip" == *:* ]]; then fam="ip6"; mesh_ip="${WG_IX_IP6:-}"; else fam="ip"; mesh_ip="${WG_IX_IP:-}"; fi
+                    [[ -n "$mesh_ip" ]] || { printf '[ERROR] %s/%s 缺少与落地地址同族的 WireGuard 地址\n' "$PROFILE_ID" "$rid" >&2; exit 1; }
+                    if [[ "${ROLE:-}" == "nat-transit" ]]; then
                         printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
                             "$fam" "$mesh_ip" "${FORWARD_PROTO:-both}" "$TRANSIT_PORT" \
                             "$landing_ip" "$LANDING_PORT" "${PROFILE_ID}-${rid}"
@@ -1458,41 +1751,45 @@ collect_dnat_entries() {
                             "$fam" "-" "${FORWARD_PROTO:-both}" "$CLIENT_PORT" \
                             "$mesh_ip" "$TRANSIT_PORT" "${PROFILE_ID}-${rid}"
                     fi
-                )
+                ) || exit 1
             done
-        )
+        ) || return 1
     done
 }
 
-# Collect input-open ports as TSV: tag \t port
+# Collect input-open ports as TSV: tag \t port \t protocol
 collect_input_ports() {
     local p
     for p in "$PROFILES_DIR"/*.env; do
         [[ -f "$p" ]] || continue
         (
             # shellcheck disable=SC1090
-            safe_load_env "$p"
+            load_profile_file "$p"
             [[ "${ENABLED:-true}" == "true" && "${FW_OPEN_PORT:-true}" == "true" ]] || exit 0
             if [[ "${ROLE:-}" == "nat-transit" ]]; then
-                printf '%s\t%s\n' "${PROFILE_ID}-wg" "$WG_PORT"
+                printf '%s\t%s\tboth\n' "${PROFILE_ID}-wg" "$WG_PORT"
             elif [[ "${ROLE:-}" == "exit" ]]; then
-                # B 出口放行线上端口（含 swgp 时为 SWGP_PORT，否则 WG_PORT）
-                printf '%s\t%s\n' "${PROFILE_ID}-wire" "$(obfs_wire_port)"
+                if obfs_has_mimic; then
+                    printf '%s\t%s\tboth\n' "${PROFILE_ID}-wire" "$WG_PORT"
+                else
+                    printf '%s\t%s\tudp\n' "${PROFILE_ID}-wire" "$WG_PORT"
+                fi
             elif [[ "${ROLE:-}" == "relay" ]]; then
                 # A 网关放行客户端 WG 入口端口（若已配置客户端入口）
-                [[ -n "${CLIENT_WG_PORT:-}" ]] && printf '%s\t%s\n' "${PROFILE_ID}-cli" "$CLIENT_WG_PORT"
+                [[ -n "${CLIENT_WG_PORT:-}" ]] && printf '%s\t%s\tudp\n' "${PROFILE_ID}-cli" "$CLIENT_WG_PORT"
             elif [[ "${ROLE:-}" == "nat-ingress" ]]; then
                 local rid
                 for rid in $(list_rule_ids "$PROFILE_ID"); do
                     (
                         load_rule "$PROFILE_ID" "$rid" || exit 0
                         [[ "${RULE_ENABLED:-true}" == "true" && -n "${CLIENT_PORT:-}" ]] || exit 0
-                        printf '%s\t%s\n' "${PROFILE_ID}-${rid}" "$CLIENT_PORT"
+                        printf '%s\t%s\t%s\n' "${PROFILE_ID}-${rid}" "$CLIENT_PORT" "${FORWARD_PROTO:-both}"
                     )
                 done
             fi
         )
     done
+    return 0
 }
 
 nft_emit_dnat() {
@@ -1538,12 +1835,17 @@ nft_emit_masq() {
 }
 
 nft_emit_input() {
-    local inputs="$1" tag port
+    local inputs="$1" tag port proto
     [[ -n "$inputs" ]] || return 0
-    while IFS=$'\t' read -r tag port; do
+    while IFS=$'\t' read -r tag port proto; do
         [[ -n "$port" ]] || continue
-        printf '        tcp dport %s counter accept comment "wm-%s-tcp"\n' "$port" "$tag"
-        printf '        udp dport %s counter accept comment "wm-%s-udp"\n' "$port" "$tag"
+        case "$proto" in
+            tcp) printf '        tcp dport %s counter accept comment "wm-%s-tcp"\n' "$port" "$tag" ;;
+            udp) printf '        udp dport %s counter accept comment "wm-%s-udp"\n' "$port" "$tag" ;;
+            *)
+                printf '        tcp dport %s counter accept comment "wm-%s-tcp"\n' "$port" "$tag"
+                printf '        udp dport %s counter accept comment "wm-%s-udp"\n' "$port" "$tag" ;;
+        esac
     done <<<"$inputs"
 }
 
@@ -1556,7 +1858,7 @@ nft_emit_gw_masq() {
         [[ -f "$p" ]] || continue
         (
             # shellcheck disable=SC1090
-            safe_load_env "$p"
+            load_profile_file "$p"
             [[ "${ENABLED:-true}" == "true" ]] || exit 0
             if [[ "${ROLE:-}" == "relay" && -n "${CLIENT_SUBNET:-}" ]]; then
                 printf '        ip saddr %s oifname "%s" counter masquerade comment "wm-%s-cli"\n' \
@@ -1571,8 +1873,8 @@ nft_emit_gw_masq() {
 
 render_nft_all() {
     local entries inputs
-    entries="$(collect_dnat_entries)"
-    inputs="$(collect_input_ports)"
+    entries="$(collect_dnat_entries)" || return 1
+    inputs="$(collect_input_ports)" || return 1
     {
         printf 'table inet %s {\n' "$NFT_TABLE"
         printf '    chain prerouting {\n'
@@ -1587,9 +1889,9 @@ render_nft_all() {
         printf '    }\n'
         printf '    chain forward {\n'
         printf '        type filter hook forward priority filter; policy accept;\n'
-        # MSS 钳制：把进/出隧道的 TCP SYN 的 MSS 钳到该路由的 MTU（隧道侧=WG_MTU-头部），
-        # 这样两端 TCP 协商出能过隧道的段大小，不再依赖易被掐断的 PMTUD（修大包黑洞/卡顿）。
-        printf '        tcp flags syn tcp option maxseg size set rt mtu counter comment "wm-mss-clamp"\n'
+        # 只处理本工具的 WG 接口，避免改变宿主机其它转发业务。
+        printf '        iifname "wm-*" tcp flags syn tcp option maxseg size set rt mtu counter comment "wm-mss-clamp-in"\n'
+        printf '        oifname "wm-*" tcp flags syn tcp option maxseg size set rt mtu counter comment "wm-mss-clamp-out"\n'
         printf '    }\n'
         printf '    chain input {\n'
         printf '        type filter hook input priority filter; policy accept;\n'
@@ -1600,14 +1902,42 @@ render_nft_all() {
 }
 
 apply_nft_all() {
-    local tmp; tmp="$(mktemp)"
-    render_nft_all >"$tmp"
-    install -m 644 "$tmp" "$NFT_FILE"
-    if nft list table inet "$NFT_TABLE" >/dev/null 2>&1; then
-        nft delete table inet "$NFT_TABLE" 2>/dev/null || true
+    local candidate transaction previous="" had_table=0 rc=0
+    install -d -m 755 "$NFT_DIR"
+    # 与最终文件位于同一文件系统，成功加载后可原子替换持久化规则。
+    candidate="$(mktemp "${NFT_DIR}/.wg-mimic-fabric.XXXXXX")"
+    transaction="$(mktemp)"
+    if ! render_nft_all >"$candidate"; then
+        rm -f "$candidate" "$transaction"
+        die "nftables 规则生成失败；未修改现有规则"
     fi
-    nft -f "$NFT_FILE" 2>/dev/null || warn "nftables 加载失败（可能未安装/未启用）"
-    rm -f "$tmp"
+    chmod 644 "$candidate"
+    if nft list table inet "$NFT_TABLE" >/dev/null 2>&1; then
+        had_table=1
+    fi
+    {
+        (( had_table == 1 )) && printf 'delete table inet %s\n' "$NFT_TABLE"
+        cat "$candidate"
+    } >"$transaction"
+    # `nft -c` and the real load both evaluate one transaction. A parse/evaluation
+    # failure therefore leaves the currently active table untouched.
+    nft -c -f "$transaction" >/dev/null 2>&1 || rc=$?
+    if (( rc == 0 )) && [[ -f "$NFT_FILE" ]]; then
+        previous="$(mktemp "${NFT_DIR}/.wg-mimic-fabric.previous.XXXXXX")"
+        cp -a "$NFT_FILE" "$previous" || rc=$?
+    fi
+    # 先确认持久化文件可原子替换，再加载 live transaction；live 加载失败时恢复旧文件。
+    if (( rc == 0 )); then mv -f "$candidate" "$NFT_FILE" || rc=$?; fi
+    if (( rc == 0 )); then nft -f "$transaction" >/dev/null 2>&1 || rc=$?; fi
+    if (( rc != 0 )); then
+        if [[ -n "$previous" && -f "$previous" ]]; then
+            mv -f "$previous" "$NFT_FILE" 2>/dev/null || true
+        elif [[ ! -f "$candidate" ]]; then
+            rm -f "$NFT_FILE"
+        fi
+    fi
+    rm -f "$candidate" "$transaction" "$previous"
+    (( rc == 0 )) || die "nftables 规则生成/持久化/加载失败；旧规则已保留（执行 nft -c -f 排查）"
 }
 
 # ── systemd ────────────────────────────────────────────────────────────────
@@ -1655,8 +1985,9 @@ EOF
     cat >"$tmp" <<EOF
 [Unit]
 Description=wg-mimic-fabric WireGuard tunnel %i
-After=network-online.target
+After=network-online.target wg-mimic-nft.service
 Wants=network-online.target
+Requires=wg-mimic-nft.service
 
 [Service]
 Type=oneshot
@@ -1668,6 +1999,23 @@ ExecStop=${wgquick_bin} down /etc/wireguard/wm-%i.conf
 WantedBy=multi-user.target
 EOF
     install -m 644 "$tmp" "$SYSTEMD_TUNNEL_TEMPLATE"
+
+    cat >"$tmp" <<EOF
+[Unit]
+Description=wg-mimic-fabric nftables rules
+After=network-online.target
+Wants=network-online.target
+Before=wg-mimic-tunnel@.service
+
+[Service]
+Type=oneshot
+ExecStart=${WM_BIN} apply-nft-all
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    install -m 644 "$tmp" "$SYSTEMD_NFT_SERVICE"
 
     # NIC hardware-offload disable, keyed by interface (%i), bound to the NIC device
     # so it re-applies on every boot AND on NIC unplug/replug. Mimic rewrites packets
@@ -1699,24 +2047,30 @@ EOF
     systemctl daemon-reload
 }
 
-# mimic@ is keyed by WAN_IFACE (one per nic, shared by lines); tunnel@ is keyed by
-# profile id. A per-profile drop-in binds each tunnel@<id> to its real mimic@<iface>
-# so boot ordering / Requires resolve to the correct unit instance.
-write_tunnel_mimic_dropin() {
-    local profile_id="$1" iface="$2"
+# tunnel@ is keyed by profile id, while the actual WireGuard interface can be a
+# shortened hash. Every profile therefore needs a path override. Mimic profiles
+# additionally bind the tunnel to the per-NIC mimic@ instance.
+write_tunnel_dropin() {
+    local profile_id="$1" iface="$2" require_mimic="${3:-false}"
     [[ -n "$profile_id" && -n "$iface" ]] || return 0
-    local dir="/etc/systemd/system/wg-mimic-tunnel@${profile_id}.service.d"
+    local dir="${SYSTEMD_DROPIN_ROOT}/wg-mimic-tunnel@${profile_id}.service.d"
     local wgi wgq
     wgi="$(wg_iface_for "$profile_id")"
     wgq="$(resolve_bin wg-quick /usr/bin/wg-quick)"
     local tmp; tmp="$(mktemp)"
     # Also override ExecStart to the (possibly shortened) interface's conf path, so
     # a long profile id never yields an interface name > 15 chars.
-    cat >"$tmp" <<EOF
+    if [[ "$require_mimic" == "true" ]]; then
+        cat >"$tmp" <<EOF
 [Unit]
 After=wg-mimic-mimic@${iface}.service
 Requires=wg-mimic-mimic@${iface}.service
 
+EOF
+    else
+        : >"$tmp"
+    fi
+    cat >>"$tmp" <<EOF
 [Service]
 ExecStart=
 ExecStart=${wgq} up ${WG_CONF_DIR}/${wgi}.conf
@@ -1724,15 +2078,16 @@ ExecStop=
 ExecStop=${wgq} down ${WG_CONF_DIR}/${wgi}.conf
 EOF
     install -d -m 755 "$dir"
-    install -m 644 "$tmp" "${dir}/10-mimic-dep.conf"
+    install -m 644 "$tmp" "${dir}/10-profile.conf"
+    rm -f "${dir}/10-mimic-dep.conf"
     rm -f "$tmp"
-    systemctl daemon-reload 2>/dev/null || true
+    systemctl daemon-reload
 }
 
-remove_tunnel_mimic_dropin() {
+remove_tunnel_dropin() {
     local profile_id="$1"
     [[ -n "$profile_id" ]] || return 0
-    rm -rf "/etc/systemd/system/wg-mimic-tunnel@${profile_id}.service.d" 2>/dev/null || true
+    rm -rf "${SYSTEMD_DROPIN_ROOT}/wg-mimic-tunnel@${profile_id}.service.d" 2>/dev/null || true
 }
 
 # Force-detach any XDP program left on the NIC. A failed native attach (e.g. on
@@ -1791,6 +2146,18 @@ force_iface_skb() {
     apply_mimic_conf_iface "$iface"
 }
 
+iface_has_mimic_profiles() {
+    local iface="$1" p
+    for p in "$PROFILES_DIR"/*.env; do
+        [[ -f "$p" ]] || continue
+        if (
+            load_profile_file "$p"
+            [[ "${WAN_IFACE:-}" == "$iface" && "${ENABLED:-true}" == "true" ]] && obfs_has_mimic
+        ); then return 0; fi
+    done
+    return 1
+}
+
 # ── NIC hardware offload（Mimic eBPF 兼容性）────────────────────────────────
 # 按需安装 ethtool（关闭网卡 offload 用）。
 ensure_ethtool() {
@@ -1841,7 +2208,7 @@ ensure_mimic_service_up() {
     # 先清残留 XDP,virtio 直接 skb,再 restart(不在则等同 start)。
     detach_xdp "$iface"
     nic_prefers_skb "$iface" && force_iface_skb "$iface"
-    systemctl enable "wg-mimic-mimic@${iface}.service" 2>/dev/null || true
+    systemctl enable "wg-mimic-mimic@${iface}.service"
     systemctl restart "wg-mimic-mimic@${iface}.service" 2>/dev/null || true
     wait_mimic_active "$iface" 8 && return 0
     warn "mimic@${iface} 未起来，改用 XDP skb 模式重试..."
@@ -1859,30 +2226,55 @@ ensure_mimic_service_up() {
     return 1
 }
 
+set_profile_enabled_value() {
+    local path="$1" value="$2"
+    if grep -q '^ENABLED=' "$path" 2>/dev/null; then
+        sed -i "s/^ENABLED=.*/ENABLED=${value}/" "$path"
+    else
+        printf 'ENABLED=%s\n' "$value" >>"$path"
+    fi
+}
+
 start_profile() {
     require_root
     load_profile "$1"
-    local path; path="$(profile_env_path "$PROFILE_ID")"
-    grep -q '^ENABLED=' "$path" 2>/dev/null && sed -i 's/^ENABLED=.*/ENABLED=true/' "$path"
-    load_profile "$1"
-    if obfs_has_mimic; then
-        mimic_needs_reboot && offer_reboot "start ${PROFILE_ID}"
-        cloud_kernel_advisory || true
-        ensure_mimic
+    local path previous_enabled profile_id iface rc
+    path="$(profile_env_path "$PROFILE_ID")"
+    previous_enabled="${ENABLED:-true}"
+    profile_id="$PROFILE_ID"; iface="${WAN_IFACE:-}"
+    set_profile_enabled_value "$path" true
+    set +e
+    (
+        set -Eeuo pipefail
+        load_profile "$profile_id" || exit $?
+        if obfs_has_mimic; then
+            mimic_needs_reboot && offer_reboot "start ${PROFILE_ID}"
+            cloud_kernel_advisory || true
+            ensure_mimic || exit $?
+        fi
+        install_systemd_units || exit $?
+        apply_profile_configs || exit $?
+        apply_nft_all || exit $?
+        ensure_ip_forward || exit $?
+        systemctl enable wg-mimic-nft.service || exit $?
+        if obfs_has_mimic; then ensure_mimic_service_up "$WAN_IFACE" || exit $?; fi
+        # restart 显式拉起隧道；enable 仅保证开机自启。
+        systemctl enable "wg-mimic-tunnel@${PROFILE_ID}.service" || exit $?
+        systemctl restart "wg-mimic-tunnel@${PROFILE_ID}.service" || exit $?
+    )
+    rc=$?
+    set -e
+    if (( rc != 0 )); then
+        set_profile_enabled_value "$path" "$previous_enabled"
+        systemctl disable --now "wg-mimic-tunnel@${profile_id}.service" 2>/dev/null || true
+        ( set -Eeuo pipefail; apply_nft_all ) || warn "回滚线路状态时 nft 重建失败，请立即执行 wm apply-nft-all"
+        if [[ -n "$iface" ]]; then
+            ( set -Eeuo pipefail; apply_mimic_conf_iface "$iface" ) \
+                || warn "回滚线路状态时 Mimic 配置重建失败"
+        fi
+        die "线路 ${profile_id} 启动失败，ENABLED 状态已回滚为 ${previous_enabled}"
     fi
-    install_systemd_units
-    if obfs_has_swgp; then install_swgp; install_swgp_units; fi
-    apply_profile_configs
-    apply_nft_all
-    ensure_ip_forward
-    apply_net_tuning "${ROLE:-}"
-    # swgp 必须先于 WG 隧道起来（relay 的 WG 拨本机 swgp client）
-    if obfs_has_swgp; then systemctl enable --now "wg-mimic-swgp@${PROFILE_ID}.service" 2>/dev/null || true; fi
-    if obfs_has_mimic; then ensure_mimic_service_up "$WAN_IFACE"; fi
-    # 用 restart 显式拉起隧道:隧道单元 Requires=mimic,上面重启 mimic 可能级联停掉
-    # 隧道,这里 restart 保证最终一定起来(且套用最新 WG conf),enable 仅保证开机自启。
-    systemctl enable "wg-mimic-tunnel@${PROFILE_ID}.service" 2>/dev/null || true
-    systemctl restart "wg-mimic-tunnel@${PROFILE_ID}.service"
+    load_profile "$profile_id"
     ok "已启动线路：${PROFILE_ID} (${ROLE:-})"
     if [[ "${ROLE:-}" == "nat-ingress" ]]; then
         ok "客户端连接：${INGRESS_PUBLIC_HOST:-本机公网IP}:<client_port>（wm show-port-map ${PROFILE_ID}）"
@@ -1892,27 +2284,48 @@ start_profile() {
 stop_profile() {
     require_root
     load_profile "$1"
-    local path; path="$(profile_env_path "$PROFILE_ID")"
-    if grep -q '^ENABLED=' "$path" 2>/dev/null; then
-        sed -i 's/^ENABLED=.*/ENABLED=false/' "$path"
-    else
-        printf 'ENABLED=false\n' >>"$path"
-    fi
-    systemctl disable --now "wg-mimic-tunnel@${PROFILE_ID}.service" 2>/dev/null || true
-    systemctl disable --now "wg-mimic-swgp@${PROFILE_ID}.service" 2>/dev/null || true
-    apply_nft_all
-    if [[ -n "${WAN_IFACE:-}" ]]; then
-        apply_mimic_conf_iface "$WAN_IFACE"
-        systemctl try-restart "wg-mimic-mimic@${WAN_IFACE}.service" 2>/dev/null \
-            || systemctl stop "wg-mimic-mimic@${WAN_IFACE}.service" 2>/dev/null || true
-        # If mimic no longer runs on this nic (no other profile uses it), clear its
-        # XDP program and drop the offload-disable service so the NIC is left clean.
-        if ! systemctl is-active --quiet "wg-mimic-mimic@${WAN_IFACE}.service" 2>/dev/null; then
-            detach_xdp "$WAN_IFACE"
-            disable_offload_service "$WAN_IFACE"
+    local path previous_enabled profile_id iface rc
+    path="$(profile_env_path "$PROFILE_ID")"
+    previous_enabled="${ENABLED:-true}"
+    profile_id="$PROFILE_ID"; iface="${WAN_IFACE:-}"
+    set_profile_enabled_value "$path" false
+    set +e
+    (
+        set -Eeuo pipefail
+        systemctl disable --now "wg-mimic-tunnel@${profile_id}.service" 2>/dev/null || true
+        if systemctl is-active --quiet "wg-mimic-tunnel@${profile_id}.service" 2>/dev/null; then
+            die "线路服务未能停止：${profile_id}"
         fi
+        apply_nft_all || exit $?
+        if [[ -n "$iface" ]]; then
+            apply_mimic_conf_iface "$iface" || exit $?
+            if iface_has_mimic_profiles "$iface"; then
+                systemctl try-restart "wg-mimic-mimic@${iface}.service" || exit $?
+            else
+                systemctl disable --now "wg-mimic-mimic@${iface}.service" 2>/dev/null || true
+            fi
+            if ! systemctl is-active --quiet "wg-mimic-mimic@${iface}.service" 2>/dev/null; then
+                detach_xdp "$iface"
+                disable_offload_service "$iface"
+            fi
+        fi
+    )
+    rc=$?
+    set -e
+    if (( rc != 0 )); then
+        set_profile_enabled_value "$path" "$previous_enabled"
+        ( set -Eeuo pipefail; apply_nft_all ) || warn "回滚线路状态时 nft 重建失败，请立即执行 wm apply-nft-all"
+        if [[ -n "$iface" ]]; then
+            ( set -Eeuo pipefail; apply_mimic_conf_iface "$iface" ) || true
+        fi
+        if [[ "$previous_enabled" == "true" ]]; then
+            systemctl enable --now "wg-mimic-tunnel@${profile_id}.service" 2>/dev/null \
+                || warn "未能自动恢复线路服务：${profile_id}"
+        fi
+        die "线路 ${profile_id} 停止失败，ENABLED 状态已回滚为 ${previous_enabled}"
     fi
-    ok "已停止线路：${PROFILE_ID}"
+    load_profile "$profile_id"
+    ok "已停止线路：${profile_id}"
 }
 
 # 删除整条线路（保留同机其它线路）：停服务 → 删 conf/env/code/clients/drop-in → 重渲染
@@ -1928,15 +2341,19 @@ delete_profile() {
     load_profile "$id" 2>/dev/null || true
     local iface="${WAN_IFACE:-}" wgi; wgi="$(wg_iface_for "$id")"
     systemctl disable --now "wg-mimic-tunnel@${id}.service" 2>/dev/null || true
-    systemctl disable --now "wg-mimic-swgp@${id}.service" 2>/dev/null || true
     rm -f "$(profile_env_path "$id")" "${WG_CONF_DIR}/${wgi}.conf" \
-        "${CODES_DIR}/${id}.code" "${SWGP_CONF_DIR}/${id}.json"
-    rm -rf "${PROFILES_DIR:?}/${id:?}" "/etc/systemd/system/wg-mimic-tunnel@${id}.service.d"
-    systemctl daemon-reload 2>/dev/null || true
+        "${CODES_DIR}/${id}.code"
+    rm -rf "${PROFILES_DIR:?}/${id:?}"
+    remove_tunnel_dropin "$id"
+    systemctl daemon-reload
     apply_nft_all
     if [[ -n "$iface" ]]; then
         apply_mimic_conf_iface "$iface"
-        systemctl try-restart "wg-mimic-mimic@${iface}.service" 2>/dev/null || true
+        if iface_has_mimic_profiles "$iface"; then
+            systemctl try-restart "wg-mimic-mimic@${iface}.service" 2>/dev/null || true
+        else
+            systemctl disable --now "wg-mimic-mimic@${iface}.service" 2>/dev/null || true
+        fi
         if ! systemctl is-active --quiet "wg-mimic-mimic@${iface}.service" 2>/dev/null; then
             detach_xdp "$iface"
             disable_offload_service "$iface"
@@ -1968,7 +2385,7 @@ create_exit_interactive() {
     command_exists wg || die "需要 wireguard-tools，请 apt install wireguard-tools"
 
     local profile_id endpoint_host wg_port wg_mtu wan_iface
-    local subnet ix_ip ingress_ip obfs_mode swgp_mode swgp_port swgp_psk
+    local subnet ix_ip ingress_ip obfs_mode ip_version
     printf '\n── 创建国外出口 B（模式二 · 混淆全局出口）──\n'
     printf '在国外服务器 B 上生成 WireGuard 出口与「出口接入码」；随后到国内网关 A 执行「导入出口接入码」即可打通。\n\n'
     prompt profile_id "出口线路名称（国外 B 节点，便于区分多条线路）" "exit"
@@ -1977,36 +2394,46 @@ create_exit_interactive() {
     info "下面填「国内网关 A 能访问到的本机 B 地址」——中转/NAT 机请填中转入口 IP，不要填出网 IP"
     prompt endpoint_host "B 的公网地址（IP 或域名，A 用它连接 B）" ""
     [[ -n "$endpoint_host" ]] || die "B 可达地址不能为空"
-    prompt_port wg_port "WireGuard 监听端口（B 本机内部端口，swgp 模式下保持默认即可）" "51820"
+    prompt_port wg_port "WireGuard 监听端口（B 对外端口）" "51820"
+    ! public_udp_port_in_use "$wg_port" "$profile_id" \
+        || die "本机公网 UDP 端口 ${wg_port} 已被其它线路监听/转发规则占用"
     local _obfs_sel=""
-    printf '  混淆方式：\n    1) swgp+mimic  双层最强（推荐）\n    2) mimic       仅伪 TCP\n    3) swgp        仅加密\n    4) direct      不混淆\n' >&2
-    prompt _obfs_sel "选择 1-4（也可直接输入名称）" "1"
+    printf '  传输方式：\n    1) mimic   WireGuard UDP 伪装为 TCP（推荐）\n    2) direct  原生 WireGuard UDP\n' >&2
+    prompt _obfs_sel "选择 1-2（也可直接输入名称）" "1"
     case "$_obfs_sel" in
-        1|swgp+mimic) obfs_mode="swgp+mimic" ;;
-        2|mimic)      obfs_mode="mimic" ;;
-        3|swgp)       obfs_mode="swgp" ;;
-        4|direct)     obfs_mode="direct" ;;
-        *) die "无效选择：${_obfs_sel}（应为 1-4）" ;;
+        1|mimic)  obfs_mode="mimic" ;;
+        2|direct) obfs_mode="direct" ;;
+        *) die "无效选择：${_obfs_sel}（应为 1-2）" ;;
     esac
-    swgp_port=0; swgp_mode=""; swgp_psk=""
-    if [[ "$obfs_mode" == *swgp* ]]; then
-        info "swgp 对外端口 = A 经公网真正连接的端口；NAT/中转机请填「服务商转发给你的端口段内的空闲端口」，否则 A 连不上 B"
-        prompt_port swgp_port "swgp 对外端口（A 连接此端口）" "$((wg_port + 1))"
-        [[ "$swgp_port" != "$wg_port" ]] || die "swgp 端口不能与 WG 端口相同"
-        prompt swgp_mode "swgp 混淆强度（zero-overhead-2026=低开销 / paranoid-2026=更隐蔽）" "zero-overhead-2026"
-        install_swgp
-        swgp_psk="$(swgp_genpsk)"
-    fi
-    local mtu_def=1400; [[ "$obfs_mode" == *paranoid* ]] && mtu_def=1360; [[ "$obfs_mode" == direct ]] && mtu_def=1420
-    prompt wg_mtu "WG 隧道 MTU（已按混淆方式自动给出建议值，回车即可）" "$mtu_def"
+    prompt ip_version "IP 版本 4 / 6 / dual" "4"
+    case "$ip_version" in 4|6|dual) ;; *) die "IP_VERSION 只能是 4/6/dual" ;; esac
+    local mtu_def=1420; [[ "$ip_version" == "6" || "$ip_version" == "dual" ]] && mtu_def=1408
+    prompt wg_mtu "WG 隧道 MTU（已按 IP 版本给出建议值，回车即可）" "$mtu_def"
     validate_mtu "$wg_mtu"
     wan_iface="$(detect_default_iface)"
     prompt wan_iface "出网网卡（Mimic 绑定 + 出口 NAT 出网用）" "${wan_iface:-eth0}"
-    prompt subnet "内部组网网段（A↔B 私有网段，已自动避让已用段）" "$(next_free_mesh_subnet)"
+    local subnet_default
+    subnet_default="$(next_free_mesh_subnet)" || die "本机可用 IPv4 私有网段已耗尽"
+    prompt subnet "内部组网网段（A↔B 私有网段，已自动避让已用段）" "$subnet_default"
+    code_is_cidr4 "$subnet" && [[ "${subnet#*/}" == "24" ]] || die "IPv4 组网网段必须是合法 /24"
+    network_conflicts_existing "$subnet" && die "组网网段与本机现有线路重叠：${subnet}"
     prompt ix_ip "B 隧道内 IP" "$(mesh_host_ip "$subnet" 2)"
     prompt ingress_ip "A 隧道内 IP" "$(mesh_host_ip "$subnet" 1)"
     validate_ipv4 "$ix_ip" || die "B 虚拟 IP 非法"
     validate_ipv4 "$ingress_ip" || die "A 虚拟 IP 非法"
+
+    local subnet6="" ix_ip6="" ingress_ip6=""
+    if [[ "$ip_version" == "6" || "$ip_version" == "dual" ]]; then
+        local subnet6_default
+        subnet6_default="$(next_free_mesh_subnet6)" || die "无法分配 IPv6 ULA 网段"
+        prompt subnet6 "IPv6 组网网段" "$subnet6_default"
+        code_is_cidr6 "$subnet6" && [[ "${subnet6#*/}" == "64" ]] || die "IPv6 组网网段必须是合法 /64"
+        network_conflicts_existing "$subnet6" && die "IPv6 组网网段与本机现有线路重叠：${subnet6}"
+        prompt ix_ip6 "B 隧道内 IPv6" "$(mesh_host_ip6 "$subnet6" 2)"
+        prompt ingress_ip6 "A 隧道内 IPv6" "$(mesh_host_ip6 "$subnet6" 1)"
+        code_is_ipv6 "$ix_ip6" || die "B 虚拟 IPv6 非法"
+        code_is_ipv6 "$ingress_ip6" || die "A 虚拟 IPv6 非法"
+    fi
 
     local b_priv b_pub a_priv a_pub a_priv_b64
     b_priv="$(wg_genkey)"; b_pub="$(wg_pubkey_of "$b_priv")"
@@ -2014,13 +2441,14 @@ create_exit_interactive() {
     a_priv_b64="$(printf '%s' "$a_priv" | base64url_encode)"
 
     write_profile_kv "$(profile_env_path "$profile_id")" \
-        "PROFILE_ID=${profile_id}" "PROFILE_NAME=${profile_id}" "ROLE=exit" "ENABLED=true" \
+        "PROFILE_ID=${profile_id}" "PROFILE_NAME=${profile_id}" "ROLE=exit" "ENABLED=false" \
         "WAN_IFACE=${wan_iface}" "WG_MESH_SUBNET=${subnet}" "WG_IX_IP=${ix_ip}" \
-        "WG_INGRESS_IP=${ingress_ip}" "IP_VERSION=4" "WG_PORT=${wg_port}" "WG_MTU=${wg_mtu}" \
+        "WG_INGRESS_IP=${ingress_ip}" "IP_VERSION=${ip_version}" \
+        "WG_MESH_SUBNET6=${subnet6}" "WG_IX_IP6=${ix_ip6}" "WG_INGRESS_IP6=${ingress_ip6}" \
+        "WG_PORT=${wg_port}" "WG_MTU=${wg_mtu}" \
         "IX_ENDPOINT_HOST=${endpoint_host}" "WG_PRIVATE_KEY=${b_priv}" "WG_PUBLIC_KEY=${b_pub}" \
         "WG_PEER_PUBLIC_KEY=${a_pub}" "INGRESS_PRIVKEY_B64=${a_priv_b64}" "MIMIC_KEEPALIVE=300:::" \
-        "MIMIC_XDP_MODE=" "OBFS_MODE=${obfs_mode}" "SWGP_MODE=${swgp_mode}" \
-        "SWGP_PSK=${swgp_psk}" "SWGP_PORT=${swgp_port}" "EXIT_MODE=global" "FW_OPEN_PORT=true"
+        "MIMIC_XDP_MODE=" "OBFS_MODE=${obfs_mode}" "EXIT_MODE=global" "FW_OPEN_PORT=true"
 
     load_profile "$profile_id"
     apply_nft_all
@@ -2046,52 +2474,83 @@ import_exit_code() {
     parse_code "$code"
     [[ "${CODE_KIND:-}" == "exit" ]] || die "这不是出口接入码（需 nat-exit-code）；普通中转码请用 wm import-code"
     relay_id="${CODE_PROFILE_ID}-relay"
-    local prev_ahost="" prev_cport="" prev_mtu=""
+    network_conflicts_existing "$CODE_WG_MESH_SUBNET" "$relay_id" \
+        && die "接入码组网网段与本机其它线路重叠：${CODE_WG_MESH_SUBNET}；请在出口端重建线路后重新导入"
+    if [[ -n "${CODE_WG_MESH_SUBNET6:-}" ]]; then
+        network_conflicts_existing "$CODE_WG_MESH_SUBNET6" "$relay_id" \
+            && die "接入码 IPv6 网段与本机其它线路重叠：${CODE_WG_MESH_SUBNET6}；请在出口端重建线路后重新导入"
+    fi
+    local prev_ahost="" prev_cport="" prev_mtu="" prev_client_subnet="" prev_client_dns="" prev_client_mtu="" prev_route_table="" updating=0
     if [[ -f "$(profile_env_path "$relay_id")" ]]; then
         local _u="Y"; prompt _u "网关线路 ${relay_id} 已存在，用此码更新它吗？[Y/n]" "Y"
         case "$_u" in [Nn]*) die "已取消" ;; esac
-        local _pv _rest; _pv="$(load_profile "$relay_id" 2>/dev/null; printf '%s\t%s\t%s' "${A_PUBLIC_HOST:-}" "${CLIENT_WG_PORT:-}" "${WG_MTU:-}")" || _pv=""
-        prev_ahost="${_pv%%$'\t'*}"; _rest="${_pv#*$'\t'}"; prev_cport="${_rest%%$'\t'*}"; prev_mtu="${_rest#*$'\t'}"
+        local _pv
+        _pv="$(load_profile "$relay_id" 2>/dev/null; printf '%s|%s|%s|%s|%s|%s|%s' \
+            "${A_PUBLIC_HOST:-}" "${CLIENT_WG_PORT:-}" "${WG_MTU:-}" \
+            "${CLIENT_SUBNET:-}" "${CLIENT_DNS:-}" "${CLIENT_MTU:-}" "${ROUTE_TABLE:-}")" || _pv=""
+        IFS='|' read -r prev_ahost prev_cport prev_mtu prev_client_subnet prev_client_dns prev_client_mtu prev_route_table <<<"$_pv"
         [[ -n "$prev_mtu" && "$prev_mtu" != "${CODE_WG_MTU}" ]] && info "保留本机已设隧道 MTU ${prev_mtu}（接入码内为 ${CODE_WG_MTU}；如需改用码内值: wm set-mtu ${relay_id} ${CODE_WG_MTU}）"
-        stop_profile "$relay_id" >/dev/null 2>&1 || true
+        updating=1
     fi
     a_priv="$(printf '%s' "$CODE_INGRESS_PRIVKEY_B64" | base64url_decode)"
     a_pub="$(wg_pubkey_of "$a_priv")"
-    [[ "$CODE_OBFS_MODE" == *swgp* ]] && install_swgp
     wan_iface="$(detect_default_iface)"
     prompt wan_iface "出网网卡（Mimic 绑定）" "${wan_iface:-eth0}"
     xdp="native"; nic_prefers_skb "$wan_iface" && xdp="skb"
 
-    printf '\n── 出口接入码摘要 ──\n  B 端点: %s:%s\n  混淆: %s  swgp端口: %s\n  组网: A %s ⇄ B %s\n\n' \
-        "$CODE_IX_ENDPOINT_HOST" "$CODE_WG_PORT" "$CODE_OBFS_MODE" "${CODE_SWGP_PORT}" \
+    printf '\n── 出口接入码摘要 ──\n  B 端点: %s:%s\n  传输: %s\n  组网: A %s ⇄ B %s\n\n' \
+        "$CODE_IX_ENDPOINT_HOST" "$CODE_WG_PORT" "$CODE_OBFS_MODE" \
         "$CODE_INGRESS_WG_IP" "$CODE_IX_WG_IP"
 
     # 客户端入口（A 当客户端 WG 服务端；这些不进接入码，按本机配置）
-    local a_public client_port egress_ip local_ip
-    egress_ip="$(detect_public_ipv4)"; local_ip="$(detect_local_ipv4)"
-    [[ -n "$egress_ip" ]] && info "出网 IPv4：${egress_ip}"
-    [[ -n "$local_ip" ]] && info "本机网卡 IPv4：${local_ip}（NAT 机此为内网IP）"
+    local a_public client_port egress_ip local_ip public_family="${CODE_IP_VERSION:-4}"
+    [[ "$public_family" == "dual" ]] && public_family="4"
+    if [[ "$public_family" == "6" ]]; then
+        egress_ip="$(detect_public_ipv6)"; local_ip="$(detect_local_ipv6)"
+    else
+        egress_ip="$(detect_public_ipv4)"; local_ip="$(detect_local_ipv4)"
+    fi
+    [[ -n "$egress_ip" ]] && info "出网 IP：${egress_ip}"
+    [[ -n "$local_ip" ]] && info "本机网卡 IP：${local_ip}（NAT 机此为内网IP）"
     prompt a_public "A 的公网地址（手机/设备连接本网关用的 IP/域名）" "${prev_ahost:-${egress_ip:-$local_ip}}"
     prompt_port client_port "客户端 WireGuard 接入端口（设备连 A 用）" "${prev_cport:-51820}"
+    ! public_udp_port_in_use "$client_port" "$relay_id" \
+        || die "本机公网 UDP 端口 ${client_port} 已被其它线路监听/转发规则占用"
     # NAT 机提示：客户端走 WireGuard=UDP，NAT/中转商家常只转 TCP，需显式提醒转发 UDP（否则永远握手不上）
     if [[ -n "$egress_ip" && -n "$local_ip" && "$egress_ip" != "$local_ip" ]]; then
         warn "本机疑似 NAT 机：客户端走 WireGuard=UDP，需商家把 ${a_public}:${client_port} 的【UDP】转发到内网 ${local_ip}；只转 TCP 客户端永远握手不上"
     fi
     # 客户端 MTU 从隧道 MTU 派生（再减客户端↔A 那层 WG 的 ~80B 头部）；更新时跟随本机已设隧道 MTU
     local eff_wg_mtu="${prev_mtu:-${CODE_WG_MTU:-1400}}"
-    local client_mtu=$(( eff_wg_mtu - 80 )); (( client_mtu < 1280 )) && client_mtu=1280
+    local client_mtu="${prev_client_mtu:-$(( eff_wg_mtu - 80 ))}"
+    (( client_mtu < 1280 )) && client_mtu=1280
 
+    local client_subnet route_table
+    if [[ -n "$prev_client_subnet" ]]; then
+        client_subnet="$prev_client_subnet"
+        network_conflicts_existing "$client_subnet" "$relay_id" \
+            && die "原客户端网段与本机其它线路重叠：${client_subnet}"
+    else
+        client_subnet="$(next_free_mesh_subnet "$relay_id" "$CODE_WG_MESH_SUBNET" "${CODE_WG_MESH_SUBNET6:-}")" \
+            || die "无法为客户端分配不冲突的私有网段"
+    fi
+    route_table="${prev_route_table:-}"
+    [[ -n "$route_table" ]] || route_table="$(next_free_route_table "$relay_id")" \
+        || die "无法为线路分配独立策略路由表"
+    [[ "$updating" == "1" ]] && stop_profile "$relay_id"
     write_profile_kv "$(profile_env_path "$relay_id")" \
-        "PROFILE_ID=${relay_id}" "PROFILE_NAME=${relay_id}" "ROLE=relay" "ENABLED=true" \
+        "PROFILE_ID=${relay_id}" "PROFILE_NAME=${relay_id}" "ROLE=relay" "ENABLED=false" \
         "WAN_IFACE=${wan_iface}" "WG_MESH_SUBNET=${CODE_WG_MESH_SUBNET}" "WG_IX_IP=${CODE_IX_WG_IP}" \
         "WG_INGRESS_IP=${CODE_INGRESS_WG_IP}" "IP_VERSION=${CODE_IP_VERSION:-4}" \
+        "WG_MESH_SUBNET6=${CODE_WG_MESH_SUBNET6}" "WG_IX_IP6=${CODE_IX_WG_IP6}" \
+        "WG_INGRESS_IP6=${CODE_INGRESS_WG_IP6}" \
         "WG_PORT=${CODE_WG_PORT}" "WG_MTU=${eff_wg_mtu}" "IX_ENDPOINT_HOST=${CODE_IX_ENDPOINT_HOST}" \
         "WG_PRIVATE_KEY=${a_priv}" "WG_PUBLIC_KEY=${a_pub}" "WG_PEER_PUBLIC_KEY=${CODE_IX_WG_PUBKEY}" \
         "MIMIC_KEEPALIVE=${CODE_MIMIC_KEEPALIVE:-300:::}" "MIMIC_XDP_MODE=${xdp}" \
-        "OBFS_MODE=${CODE_OBFS_MODE}" "SWGP_MODE=${CODE_SWGP_MODE}" "SWGP_PSK=${CODE_SWGP_PSK}" \
-        "SWGP_PORT=${CODE_SWGP_PORT}" "EXIT_MODE=${CODE_EXIT_MODE:-global}" \
+        "OBFS_MODE=${CODE_OBFS_MODE}" "EXIT_MODE=${CODE_EXIT_MODE:-global}" \
         "A_PUBLIC_HOST=${a_public}" "CLIENT_WG_PORT=${client_port}" \
-        "CLIENT_SUBNET=${CLIENT_SUBNET_DEFAULT}" "CLIENT_DNS=1.1.1.1" "CLIENT_MTU=${client_mtu}" \
+        "CLIENT_SUBNET=${client_subnet}" "CLIENT_DNS=${prev_client_dns:-1.1.1.1}" "CLIENT_MTU=${client_mtu}" \
+        "ROUTE_TABLE=${route_table}" \
         "FW_OPEN_PORT=true"
 
     load_profile "$relay_id"
@@ -2276,24 +2735,35 @@ create_transit_interactive() {
     prompt endpoint_host "公网入口可达的 IX 公网地址（域名或IP）" ""
     [[ -n "$endpoint_host" ]] || die "IX 可达地址不能为空"
     prompt_port wg_port "WireGuard 监听端口（Mimic 伪 TCP 绑定）" "51820"
-    prompt wg_mtu "WG 隧道 MTU（mimic 伪 TCP 建议 1420；IPv6/dual 建议 1408）" "1420"
+    prompt ip_version "IP 版本 4 / 6 / dual" "4"
+    case "$ip_version" in 4|6|dual) ;; *) die "IP_VERSION 只能是 4/6/dual" ;; esac
+    local mtu_def=1420; [[ "$ip_version" == "6" || "$ip_version" == "dual" ]] && mtu_def=1408
+    prompt wg_mtu "WG 隧道 MTU（已按 IP 版本给出建议值，回车即可）" "$mtu_def"
     validate_mtu "$wg_mtu"
     wan_iface="$(detect_default_iface)"
     prompt wan_iface "Mimic 绑定网卡" "${wan_iface:-eth0}"
 
-    prompt subnet "组网网段" "$(next_free_mesh_subnet)"
+    local subnet_default
+    subnet_default="$(next_free_mesh_subnet)" || die "本机可用 IPv4 私有网段已耗尽"
+    prompt subnet "组网网段" "$subnet_default"
+    code_is_cidr4 "$subnet" && [[ "${subnet#*/}" == "24" ]] || die "IPv4 组网网段必须是合法 /24"
+    network_conflicts_existing "$subnet" && die "组网网段与本机现有线路重叠：${subnet}"
     prompt ix_ip "IX 虚拟 IP" "$(mesh_host_ip "$subnet" 2)"
     prompt ingress_ip "公网入口虚拟 IP" "$(mesh_host_ip "$subnet" 1)"
     validate_ipv4 "$ix_ip" || die "IX 虚拟 IP 非法"
     validate_ipv4 "$ingress_ip" || die "入口虚拟 IP 非法"
 
-    prompt ip_version "IP 版本 4 / 6 / dual" "4"
-    case "$ip_version" in 4|6|dual) ;; *) die "IP_VERSION 只能是 4/6/dual" ;; esac
     local subnet6="" ix_ip6="" ingress_ip6=""
     if [[ "$ip_version" == "6" || "$ip_version" == "dual" ]]; then
-        prompt subnet6 "IPv6 组网网段" "fd88:6d6d::/64"
-        prompt ix_ip6 "IX 虚拟 IPv6" "fd88:6d6d::2"
-        prompt ingress_ip6 "公网入口虚拟 IPv6" "fd88:6d6d::1"
+        local subnet6_default
+        subnet6_default="$(next_free_mesh_subnet6)" || die "无法分配 IPv6 ULA 网段"
+        prompt subnet6 "IPv6 组网网段" "$subnet6_default"
+        code_is_cidr6 "$subnet6" && [[ "${subnet6#*/}" == "64" ]] || die "IPv6 组网网段必须是合法 /64"
+        network_conflicts_existing "$subnet6" && die "IPv6 组网网段与本机现有线路重叠：${subnet6}"
+        prompt ix_ip6 "IX 虚拟 IPv6" "$(mesh_host_ip6 "$subnet6" 2)"
+        prompt ingress_ip6 "公网入口虚拟 IPv6" "$(mesh_host_ip6 "$subnet6" 1)"
+        code_is_ipv6 "$ix_ip6" || die "IX 虚拟 IPv6 非法"
+        code_is_ipv6 "$ingress_ip6" || die "入口虚拟 IPv6 非法"
     fi
 
     prompt transit_pool "中转端口池（如 18300-18399；商家给的可用端口段；留空=手动指定）" ""
@@ -2307,6 +2777,8 @@ create_transit_interactive() {
         fi
         tp_default="$(pool_alloc_port "$profile_id" "$transit_pool" "$wg_port")" || die "端口池已无空闲端口"
     fi
+    ! public_udp_port_in_use "$wg_port" "$profile_id" \
+        || die "本机公网 UDP 端口 ${wg_port} 已被其它线路监听/转发规则占用"
 
     info "首条转发规则（落地可填 IPv6）："
     prompt_port transit_port "中转端口（IX 虚拟IP 上的端口）" "$tp_default"
@@ -2329,7 +2801,7 @@ create_transit_interactive() {
         "PROFILE_ID=${profile_id}" \
         "PROFILE_NAME=${profile_id}" \
         "ROLE=nat-transit" \
-        "ENABLED=true" \
+        "ENABLED=false" \
         "WAN_IFACE=${wan_iface}" \
         "WG_MESH_SUBNET=${subnet}" \
         "WG_IX_IP=${ix_ip}" \
@@ -2387,9 +2859,6 @@ import_code_interactive() {
     ensure_dirs
     command_exists nft || die "需要 nftables"
     command_exists wg || die "需要 wireguard-tools"
-    install_mimic_packages || die "公网入口需要 mimic（UDP 伪装 TCP）"
-    ensure_mimic_kmod_loaded || warn "mimic 内核模块未加载，请 reboot 或安装 linux-headers-\$(uname -r)"
-
     local code ingress_id wan_iface public_ip ing_priv ing_pub
     local updating=0 prev_host="" prev_iface="" prev_mtu=""
     printf '\n── 导入接入码（模式一 · 公网入口接入）──\n' >&2
@@ -2402,6 +2871,12 @@ import_code_interactive() {
         || die "这是出口接入码（nat-exit-code），请用 wm import-exit-code 导入"
 
     ingress_id="${CODE_PROFILE_ID}-ingress"
+    network_conflicts_existing "$CODE_WG_MESH_SUBNET" "$ingress_id" \
+        && die "接入码组网网段与本机其它线路重叠：${CODE_WG_MESH_SUBNET}；请在中转端重建线路后重新导入"
+    if [[ -n "${CODE_WG_MESH_SUBNET6:-}" ]]; then
+        network_conflicts_existing "$CODE_WG_MESH_SUBNET6" "$ingress_id" \
+            && die "接入码 IPv6 网段与本机其它线路重叠：${CODE_WG_MESH_SUBNET6}；请在中转端重建线路后重新导入"
+    fi
     if [[ -f "$(profile_env_path "$ingress_id")" ]]; then
         # 入口线路已存在（IX 改/增规则后重导接入码）→ 更新而非报错
         local _upd="Y"
@@ -2419,8 +2894,8 @@ import_code_interactive() {
         prev_mtu="${_rest#*$'\t'}"
         [[ -n "$prev_mtu" && "$prev_mtu" != "${CODE_WG_MTU}" ]] && info "保留本机已设隧道 MTU ${prev_mtu}（接入码内为 ${CODE_WG_MTU}；如需改用码内值: wm set-mtu ${ingress_id} ${CODE_WG_MTU}）"
         info "更新模式：停止旧线路 → 同步新接入码的规则集（保留各规则已选客户端入口端口）"
-        stop_profile "$ingress_id" >/dev/null 2>&1 || true
     fi
+    install_mimic_packages || die "公网入口需要 mimic（UDP 伪装 TCP）"
 
     ing_priv="$(printf '%s' "$CODE_INGRESS_PRIVKEY_B64" | base64url_decode)"
     ing_pub="$(wg_pubkey_of "$ing_priv")"
@@ -2441,11 +2916,12 @@ import_code_interactive() {
     printf '  IX 端点: %s:%s\n' "$CODE_IX_ENDPOINT_HOST" "$CODE_WG_PORT"
     printf '  组网: 入口 %s ⇄ IX %s\n\n' "$CODE_INGRESS_WG_IP" "$CODE_IX_WG_IP"
 
+    [[ "$updating" == "1" ]] && stop_profile "$ingress_id"
     write_profile_kv "$(profile_env_path "$ingress_id")" \
         "PROFILE_ID=${ingress_id}" \
         "PROFILE_NAME=${ingress_id}" \
         "ROLE=nat-ingress" \
-        "ENABLED=true" \
+        "ENABLED=false" \
         "WAN_IFACE=${wan_iface}" \
         "INGRESS_PUBLIC_HOST=${public_ip}" \
         "WG_MESH_SUBNET=${CODE_WG_MESH_SUBNET}" \
@@ -2493,6 +2969,8 @@ import_code_interactive() {
             # 默认与落地端口一致（客户端用同一端口号），回车即可；可手动改
             prompt_port client_port "规则 ${rid}（${note:-}）客户端入口端口" "${lport:-$client_port}"
         fi
+        ! client_port_in_use "$ingress_id" "$client_port" "$rid" "${rproto:-both}" \
+            || die "客户端入口端口 ${client_port} 已被其它规则占用"
         write_rule "$ingress_id" "$rid" \
             "RULE_ID=${rid}" \
             "RULE_NOTE=${note}" \
@@ -2610,6 +3088,8 @@ add_rule() {
         "LANDING_PORT=${landing_port}" "FORWARD_PROTO=${proto}" )
     if [[ "${ROLE:-}" == "nat-ingress" ]]; then
         prompt_port client_port "客户端入口端口" "30001"
+        ! client_port_in_use "$PROFILE_ID" "$client_port" "" "$proto" \
+            || die "客户端入口端口 ${client_port} 已被其它规则占用"
         kv+=( "CLIENT_PORT=${client_port}" )
     fi
     write_rule "$PROFILE_ID" "$rid" "${kv[@]}"
@@ -2642,6 +3122,8 @@ edit_rule() {
         "LANDING_PORT=${landing_port}" "FORWARD_PROTO=${proto}" )
     if [[ "${ROLE:-}" == "nat-ingress" ]]; then
         prompt_port client_port "客户端入口端口" "${CLIENT_PORT:-30000}"
+        ! client_port_in_use "$PROFILE_ID" "$client_port" "$rid" "$proto" \
+            || die "客户端入口端口 ${client_port} 已被其它规则占用"
         kv+=( "CLIENT_PORT=${client_port}" )
     fi
     write_rule "$PROFILE_ID" "$rid" "${kv[@]}"
@@ -2704,9 +3186,15 @@ health_profile() {
         "${WG_INGRESS_IP:-?}" "${WG_IX_IP:-?}" "${WG_PORT:-?}" "${WG_MTU:-?}"
     [[ "${ROLE:-}" == "nat-ingress" && -n "${INGRESS_PUBLIC_HOST:-}" ]] && \
         printf '客户端入口: %s\n' "$INGRESS_PUBLIC_HOST"
-    [[ "${ENABLED:-true}" == "true" ]] && printf '线路: enabled\n' || { printf '线路: disabled\n'; status="degraded"; }
+    if [[ "${ENABLED:-true}" == "true" ]]; then
+        printf '线路: enabled\n'
+    else
+        printf '线路: disabled\n'; status="degraded"
+    fi
 
-    if command_exists mimic; then
+    if ! obfs_has_mimic; then
+        printf 'Mimic: disabled (direct mode)\n'
+    elif command_exists mimic; then
         if systemctl is-active --quiet "wg-mimic-mimic@${WAN_IFACE}.service" 2>/dev/null; then
             printf 'Mimic: active (%s, UDP→TCP)\n' "$WAN_IFACE"
         else
@@ -2727,7 +3215,25 @@ health_profile() {
         printf 'WireGuard: inactive\n'; status="degraded"
     fi
 
-    [[ "$(sysctl -n net.ipv4.ip_forward 2>/dev/null)" == "1" ]] && printf 'IP forward: on\n' || { printf 'IP forward: off\n'; status="degraded"; }
+    if [[ "${IP_VERSION:-4}" == "4" || "${IP_VERSION:-4}" == "dual" ]]; then
+        if [[ "$(sysctl -n net.ipv4.ip_forward 2>/dev/null)" == "1" ]]; then
+            printf 'IPv4 forward: on\n'
+        else
+            printf 'IPv4 forward: off\n'; status="degraded"
+        fi
+    fi
+    if [[ "${IP_VERSION:-4}" == "6" || "${IP_VERSION:-4}" == "dual" ]]; then
+        if [[ "$(sysctl -n net.ipv6.conf.all.forwarding 2>/dev/null)" == "1" ]]; then
+            printf 'IPv6 forward: on\n'
+        else
+            printf 'IPv6 forward: off\n'; status="degraded"
+        fi
+    fi
+    if nft list table inet "$NFT_TABLE" >/dev/null 2>&1; then
+        printf 'nftables: loaded (%s)\n' "$NFT_TABLE"
+    else
+        printf 'nftables: table missing\n'; status="degraded"
+    fi
     printf '规则数: %s\n' "$(list_rule_ids "$PROFILE_ID" | grep -c . || true)"
     printf 'HEALTH_STATUS=%s\n' "$status"
 }
@@ -2738,14 +3244,29 @@ diagnose_profile() {
     printf '=== OS compatibility ===\n'
     compat_os_report | while IFS= read -r line; do printf '  %s\n' "$line"; done
     printf '=== preflight ===\n'
-    command_exists nft && ok "nftables" || warn "缺少 nftables"
-    command_exists wg && ok "wireguard-tools" || warn "缺少 wireguard-tools"
-    command_exists mimic && ok "mimic CLI" || warn "缺少 mimic"
-    mimic_module_loaded && ok "mimic kernel module" || warn "mimic 内核模块未加载"
+    if command_exists nft; then ok "nftables"; else warn "缺少 nftables"; fi
+    if command_exists wg; then ok "wireguard-tools"; else warn "缺少 wireguard-tools"; fi
+    if obfs_has_mimic; then
+        if command_exists mimic; then ok "mimic CLI"; else warn "缺少 mimic"; fi
+        if mimic_module_loaded; then ok "mimic kernel module"; else warn "mimic 内核模块未加载"; fi
+    else
+        ok "direct 模式无需 Mimic"
+    fi
     if kernel_ge_61; then ok "kernel >= 6.1 ($(uname -r))"; else warn "kernel < 6.1 ($(uname -r))"; fi
     if kernel_is_cloud; then warn "cloud 精简内核 ($(uname -r))：XDP/eBPF 易崩（隧道单通/假死），建议换标准内核 linux-image-amd64 后 reboot"; else ok "非 cloud 内核 ($(uname -r))"; fi
-    [[ -f /sys/kernel/btf/vmlinux ]] && ok "BTF vmlinux" || warn "无 BTF（精简内核可能需 kprobe 编 mimic）"
-    [[ "$(sysctl -n net.ipv4.ip_forward 2>/dev/null)" == "1" ]] && ok "ip_forward" || warn "ip_forward 未开启"
+    if [[ -f /sys/kernel/btf/vmlinux ]]; then ok "BTF vmlinux"; else warn "无 BTF（精简内核可能需 kprobe 编 mimic）"; fi
+    if [[ "${IP_VERSION:-4}" == "4" || "${IP_VERSION:-4}" == "dual" ]]; then
+        if [[ "$(sysctl -n net.ipv4.ip_forward 2>/dev/null)" == "1" ]]; then ok "IPv4 forwarding"; else warn "IPv4 forwarding 未开启"; fi
+    fi
+    if [[ "${IP_VERSION:-4}" == "6" || "${IP_VERSION:-4}" == "dual" ]]; then
+        if [[ "$(sysctl -n net.ipv6.conf.all.forwarding 2>/dev/null)" == "1" ]]; then ok "IPv6 forwarding"; else warn "IPv6 forwarding 未开启"; fi
+    fi
+    if command_exists ufw && ufw status 2>/dev/null | grep -q '^Status: active'; then
+        warn "检测到 UFW active：wm 只维护自有 nft 表，请另行放行线路端口并确认 FORWARD 策略"
+    fi
+    if command_exists firewall-cmd && firewall-cmd --state 2>/dev/null | grep -q '^running$'; then
+        warn "检测到 firewalld active：wm 只维护自有 nft 表，请另行放行线路端口并启用转发"
+    fi
     [[ -n "${WAN_IFACE:-}" ]] && printf '  Mimic 绑定网卡: %s（驱动 %s，XDP %s）\n' \
         "$WAN_IFACE" "$(nic_driver "$WAN_IFACE")" "${MIMIC_XDP_MODE:-auto}"
     if [[ -n "${WAN_IFACE:-}" && -f "${MIMIC_CONF_DIR}/${WAN_IFACE}.conf" ]]; then
@@ -2761,6 +3282,7 @@ diagnose_profile() {
 
 install_deps() {
     require_root
+    ensure_supported_platform
     local id; id="$(detect_os_id)"
     info "检测到 OS: $id  内核: $(uname -r)"
     compat_os_report | sed 's/^/  /'
@@ -2793,15 +3315,6 @@ EOF
   # git clone https://github.com/hack3ric/mimic && cd mimic && make && make install
 EOF
             ;;
-        alpine)
-            warn "Alpine 为实验性支持，无 mimic-dkms"
-            cat <<'EOF'
-  apk add wireguard-tools python3 nftables iptables linux-headers \
-      build-base clang llvm bpftool libbpf-dev bison flex
-  # 从源码编译 mimic（musl 环境需自行验证）:
-  # git clone https://github.com/hack3ric/mimic && cd mimic && make CHECKSUM_HACK=kprobe
-EOF
-            ;;
         *)
             warn "未识别发行版，通用依赖：wireguard-tools python3 mimic mimic-dkms nftables"
             ;;
@@ -2814,35 +3327,49 @@ EOF
 show_code() {
     local id; id="$(resolve_profile_id "${1:-}")"
     load_profile "$id"
-    [[ "${ROLE:-}" == "nat-transit" ]] || die "仅 IX(nat-transit) 线路可 show-code"
+    case "${ROLE:-}" in nat-transit|exit) ;; *) die "仅 nat-transit/exit 线路可 show-code" ;; esac
     if [[ -f "${CODES_DIR}/${PROFILE_ID}.code" ]]; then
         cat "${CODES_DIR}/${PROFILE_ID}.code"
     else
-        generate_code | tee "${CODES_DIR}/${PROFILE_ID}.code"
+        if [[ "$ROLE" == "exit" ]]; then generate_exit_code; else generate_code; fi \
+            | tee "${CODES_DIR}/${PROFILE_ID}.code"
         chmod 600 "${CODES_DIR}/${PROFILE_ID}.code"
+    fi
+}
+
+show_config() {
+    local id; id="$(resolve_profile_id "${1:-}")"
+    load_profile "$id"
+    local path; path="$(profile_env_path "$PROFILE_ID")"
+    if [[ "${WMF_SHOW_SECRETS:-0}" == "1" ]]; then
+        cat "$path"
+    else
+        sed -E 's/^(WG_PRIVATE_KEY|INGRESS_PRIVKEY_B64)=.*/\1=<redacted>/' "$path"
+        warn "私钥已隐藏；仅在受控终端临时设置 WMF_SHOW_SECRETS=1 才会显示"
     fi
 }
 
 # 按当前规则重新生成接入码 —— 不轮换密钥、不重启隧道（密钥不变两端不会断流）。
 # 改/增/删规则后用它把新规则集打进接入码即可（add-rule/edit-rule/delete-rule 已自动
-# 调过一次，这里供手动按需再生）。要轮换密钥见 rotate_keys（那才会重启 IX）。
+# 调过一次，这里供手动按需再生）。要轮换密钥见 rotate_keys（那才会重启线路）。
 refresh_code() {
     local id; id="$(resolve_profile_id "${1:-}")"
     require_root
     load_profile "$id"
-    [[ "${ROLE:-}" == "nat-transit" ]] || die "仅 IX(nat-transit) 线路可 refresh-code"
+    case "${ROLE:-}" in nat-transit|exit) ;; *) die "仅 nat-transit/exit 线路可 refresh-code" ;; esac
     apply_nft_all
-    generate_code | tee "${CODES_DIR}/${PROFILE_ID}.code"
+    if [[ "$ROLE" == "exit" ]]; then generate_exit_code; else generate_code; fi \
+        | tee "${CODES_DIR}/${PROFILE_ID}.code"
     chmod 600 "${CODES_DIR}/${PROFILE_ID}.code"
-    ok "已按当前规则刷新接入码（密钥不变，公网入口重新 import-code 即可，不会断流）"
+    ok "已刷新接入码（密钥不变，对端重新导入即可）"
 }
 
-# 轮换入口 WG 密钥对 + 刷新接入码（仅用于密钥泄露等场景，会短暂中断两端）。
+# 轮换拨号端 WG 密钥对 + 刷新接入码（密钥泄露时使用，会短暂中断两端）。
 rotate_keys() {
     local id; id="$(resolve_profile_id "${1:-}")"
     require_root
     load_profile "$id"
-    [[ "${ROLE:-}" == "nat-transit" ]] || die "仅 IX(nat-transit) 线路可 rotate-keys"
+    case "${ROLE:-}" in nat-transit|exit) ;; *) die "仅 nat-transit/exit 线路可 rotate-keys" ;; esac
     local ing_priv ing_pub ing_priv_b64 path
     ing_priv="$(wg_genkey)"; ing_pub="$(wg_pubkey_of "$ing_priv")"
     ing_priv_b64="$(printf '%s' "$ing_priv" | base64url_encode)"
@@ -2859,12 +3386,17 @@ rotate_keys() {
     # 对端公钥，若不重启，IX 内核里仍是旧 ingress 公钥 —— 公网入口用新私钥重导后两端
     # 公钥对不上、WG 永远不握手 → 该隧道上的全部规则一起中断。隧道在跑就重启使其生效。
     if systemctl is-active --quiet "wg-mimic-tunnel@${PROFILE_ID}.service" 2>/dev/null; then
-        info "重启 IX 隧道以加载新的对端公钥..."
+        info "重启线路以加载新的对端公钥..."
         restart_profile "$PROFILE_ID"
     fi
-    generate_code | tee "${CODES_DIR}/${PROFILE_ID}.code"
+    if [[ "$ROLE" == "exit" ]]; then generate_exit_code; else generate_code; fi \
+        | tee "${CODES_DIR}/${PROFILE_ID}.code"
     chmod 600 "${CODES_DIR}/${PROFILE_ID}.code"
-    warn "已轮换入口密钥：公网入口必须用新接入码重新 import-code（两端会短暂中断）"
+    if [[ "$ROLE" == "exit" ]]; then
+        warn "已轮换 relay 密钥：A 网关必须用新出口接入码重新 import-exit-code"
+    else
+        warn "已轮换入口密钥：公网入口必须用新接入码重新 import-code"
+    fi
 }
 
 # ── tunnel quality test / endpoint switch / auto-switch ─────────────────────
@@ -2917,20 +3449,27 @@ set_endpoint() {
     local id host; id="$(resolve_profile_id "${1:-}")"; host="${2:-}"
     require_root
     [[ -n "$host" ]] || die "用法: wm set-endpoint <线路> <新IX公网地址/中转IP>"
+    code_is_host "$host" || die "端点必须是合法 IP 或域名"
     load_profile "$id"
     set_or_append_kv "$(profile_env_path "$PROFILE_ID")" IX_ENDPOINT_HOST "$host"
     load_profile "$id"
-    if [[ "${ROLE:-}" == "nat-ingress" ]]; then
+    if [[ "${ROLE:-}" == "nat-ingress" || "${ROLE:-}" == "relay" ]]; then
         apply_profile_configs
         if systemctl is-active --quiet "wg-mimic-tunnel@${PROFILE_ID}.service" 2>/dev/null; then
             restart_profile "$PROFILE_ID"
         fi
-        ok "入口 ${PROFILE_ID} 已切到 IX 端点 ${host}:${WG_PORT}"
+        ok "拨号端 ${PROFILE_ID} 已切到端点 ${host}:${WG_PORT}"
         sleep 3
         info "切换后隧道丢包：$(measure_tunnel_loss "$(peer_mesh_ip)" 20)%（wm test ${PROFILE_ID} 看详情）"
-    else
+    elif [[ "${ROLE:-}" == "nat-transit" ]]; then
         regenerate_code_if_transit
         ok "IX ${PROFILE_ID} 端点已设为 ${host}：公网入口需重新 import-code"
+    elif [[ "${ROLE:-}" == "exit" ]]; then
+        local code; code="$(generate_exit_code)"
+        printf '%s\n' "$code" >"${CODES_DIR}/${PROFILE_ID}.code"; chmod 600 "${CODES_DIR}/${PROFILE_ID}.code"
+        ok "出口 ${PROFILE_ID} 端点已设为 ${host}：A 网关需重新 import-exit-code"
+    else
+        die "该角色不支持 set-endpoint：${ROLE:-unknown}"
     fi
 }
 
@@ -2939,6 +3478,12 @@ set_endpoints() {
     local id csv; id="$(resolve_profile_id "${1:-}")"; csv="${2:-}"
     require_root
     load_profile "$id"
+    [[ "${ROLE:-}" == "nat-ingress" ]] || die "候选自动切换仅支持 nat-ingress"
+    local _ep _arr
+    IFS=',' read -ra _arr <<<"$csv"
+    for _ep in "${_arr[@]}"; do
+        _ep="$(trim "$_ep")"; [[ -z "$_ep" ]] || code_is_host "$_ep" || die "非法候选端点：$_ep"
+    done
     set_or_append_kv "$(profile_env_path "$PROFILE_ID")" ENDPOINT_CANDIDATES "$csv"
     ok "候选中转(${PROFILE_ID})已设：${csv:-（已清空）}"
 }
@@ -2948,6 +3493,10 @@ set_endpoints() {
 autoswitch_once() {
     local id threshold; id="$(resolve_profile_id "${1:-}")"; threshold="${2:-10}"
     require_root
+    if [[ ! "$threshold" =~ ^[0-9]+$ ]] || (( 10#$threshold < 0 || 10#$threshold > 100 )); then
+        die "丢包阈值必须是 0-100"
+    fi
+    threshold="$((10#$threshold))"
     load_profile "$id"
     [[ "${ROLE:-}" == "nat-ingress" ]] || die "autoswitch 仅用于公网入口(nat-ingress)线路"
     [[ -n "${ENDPOINT_CANDIDATES:-}" ]] || die "请先设候选中转：wm set-endpoints ${PROFILE_ID} ip1,ip2,..."
@@ -3011,7 +3560,7 @@ autoswitch_enable() {
     load_profile "$id"
     [[ -n "${ENDPOINT_CANDIDATES:-}" ]] || die "请先 wm set-endpoints ${PROFILE_ID} ip1,ip2,..."
     install_autoswitch_units
-    systemctl enable --now "wg-mimic-autoswitch@${PROFILE_ID}.timer" 2>/dev/null || true
+    systemctl enable --now "wg-mimic-autoswitch@${PROFILE_ID}.timer"
     ok "已启用自动切换(${PROFILE_ID})：每 5 分钟测丢包，超阈值自动切候选中转"
 }
 
@@ -3152,7 +3701,7 @@ restart_profile() {
 stop_all_profiles() {
     local id
     for id in $(list_profile_ids 2>/dev/null || true); do
-        stop_profile "$id" 2>/dev/null || true
+        stop_profile "$id"
     done
 }
 
@@ -3164,55 +3713,71 @@ stop_mimic_services() {
     done
 }
 
-stop_swgp_services() {
-    local u
-    for u in $(systemctl list-units --all --no-legend 'wg-mimic-swgp@*' 2>/dev/null | awk '{print $1}'); do
-        systemctl stop "$u" 2>/dev/null || true
-        systemctl disable "$u" 2>/dev/null || true
+install_runtime_packages() {
+    ensure_supported_platform
+    local cmd ready=true
+    for cmd in bash python3 wg wg-quick nft ip curl flock systemctl modprobe ethtool; do
+        command_exists "$cmd" || ready=false
     done
+    [[ "$ready" == "true" ]] && return 0
+    local id; id="$(detect_os_id)"
+    info "安装运行依赖（WireGuard / nftables / Python / iproute2）..."
+    case "$id" in
+        debian|ubuntu)
+            apt-get update -qq
+            DEBIAN_FRONTEND=noninteractive apt-get install -y \
+                bash wireguard-tools python3 nftables curl ca-certificates \
+                iproute2 util-linux systemd kmod ethtool
+            ;;
+        arch)
+            pacman -Sy --noconfirm --needed bash wireguard-tools python nftables curl \
+                iproute2 util-linux systemd kmod ethtool
+            ;;
+        fedora|rhel|centos|rocky|almalinux|ol)
+            local dnf_curl=()
+            command_exists curl || dnf_curl=(curl)
+            dnf install -y --allowerasing wireguard-tools python3 nftables iproute util-linux systemd kmod ethtool "${dnf_curl[@]}"
+            ;;
+        opensuse-leap|opensuse-tumbleweed|opensuse|sles)
+            zypper -n install wireguard-tools python3 nftables curl iproute2 util-linux systemd kmod ethtool
+            ;;
+        *)
+            die "未识别的发行版，无法自动安装运行依赖"
+            ;;
+    esac
+    local missing=()
+    for cmd in bash python3 wg wg-quick nft ip curl flock systemctl modprobe ethtool; do
+        command_exists "$cmd" || missing+=("$cmd")
+    done
+    (( ${#missing[@]} == 0 )) || die "运行依赖安装不完整：${missing[*]}"
 }
 
 install_base_packages() {
     local id; id="$(detect_os_id)"
-    info "安装基础依赖（wireguard-tools 等）..."
+    install_runtime_packages
+    info "安装 Mimic 源码构建依赖..."
     case "$id" in
         debian|ubuntu)
             ensure_debian_kernel_headers || true
             DEBIAN_FRONTEND=noninteractive apt-get install -y \
-                wireguard-tools python3 nftables curl git ca-certificates \
-                build-essential pkg-config libbpf-dev libffi-dev \
-                clang llvm bpftool pahole \
-                2>/dev/null || DEBIAN_FRONTEND=noninteractive apt-get install -y \
-                wireguard-tools python3 nftables curl git ca-certificates
+                git build-essential pkg-config libbpf-dev libffi-dev \
+                clang llvm bpftool pahole
             ;;
         arch)
-            pacman -Sy --noconfirm --needed wireguard-tools python3 nftables curl git \
-                base-devel clang llvm bpftool libbpf libffi linux-headers 2>/dev/null \
-                || pacman -Sy --noconfirm wireguard-tools python3 nftables
+            pacman -Sy --noconfirm --needed git base-devel clang llvm bpftool libbpf libffi linux-headers
             ;;
         fedora)
-            dnf install -y wireguard-tools python3 nftables curl git \
-                gcc make clang llvm bpftool libbpf-devel libffi-devel \
-                kernel-devel kernel-headers 2>/dev/null \
-                || dnf install -y wireguard-tools python3 curl git
-            ;;
-        alpine)
-            apk add --no-cache wireguard-tools python3 nftables curl git \
-                build-base clang llvm bpftool-dev libbpf-dev libffi-dev linux-headers
+            dnf install -y git gcc make clang llvm bpftool libbpf-devel libffi-devel kernel-devel kernel-headers
             ;;
         rhel|centos|rocky|almalinux|ol)
             dnf install -y epel-release 2>/dev/null || true
-            dnf install -y wireguard-tools python3 curl git gcc make \
-                clang llvm libbpf-devel libffi-devel kernel-devel 2>/dev/null \
-                || dnf install -y wireguard-tools python3 curl git
+            dnf install -y git gcc make clang llvm bpftool libbpf-devel libffi-devel kernel-devel kernel-headers
             ;;
         opensuse-leap|opensuse-tumbleweed|opensuse|sles)
-            zypper -n install wireguard-tools python3 nftables curl git \
-                gcc make clang llvm bpftool libbpf-devel libffi-devel kernel-devel 2>/dev/null \
-                || zypper -n install wireguard-tools python3 curl git
+            zypper -n install git gcc make clang llvm bpftool libbpf-devel libffi-devel kernel-devel
             ;;
         *)
-            warn "未识别 OS，跳过基础包批量安装"
+            die "当前发行版不支持自动编译 Mimic"
             ;;
     esac
 }
@@ -3295,11 +3860,8 @@ PY
         [[ "$kind" == "DKMS" ]] && dkms_deb="$u"
     done
     [[ -n "$mimic_deb" && -n "$dkms_deb" ]] || { rm -rf "$tmpd"; return 1; }
-    gh_curl "$mimic_deb" "$tmpd/mimic.deb" || { rm -rf "$tmpd"; return 1; }
-    gh_curl "$dkms_deb" "$tmpd/mimic-dkms.deb" || { rm -rf "$tmpd"; return 1; }
-    # 可选完整性校验（WMF_MIMIC_SHA256 / WMF_MIMIC_DKMS_SHA256）：拒绝被篡改的 .deb
-    verify_sha256 "$tmpd/mimic.deb" "${WMF_MIMIC_SHA256:-}" || { rm -rf "$tmpd"; return 1; }
-    verify_sha256 "$tmpd/mimic-dkms.deb" "${WMF_MIMIC_DKMS_SHA256:-}" || { rm -rf "$tmpd"; return 1; }
+    gh_curl "$mimic_deb" "$tmpd/mimic.deb" "${WMF_MIMIC_SHA256:-}" || { rm -rf "$tmpd"; return 1; }
+    gh_curl "$dkms_deb" "$tmpd/mimic-dkms.deb" "${WMF_MIMIC_DKMS_SHA256:-}" || { rm -rf "$tmpd"; return 1; }
     DEBIAN_FRONTEND=noninteractive apt-get install -y "$tmpd/mimic.deb" "$tmpd/mimic-dkms.deb" \
         || { rm -rf "$tmpd"; return 1; }
     rm -rf "$tmpd"
@@ -3310,15 +3872,14 @@ PY
 install_mimic_from_source() {
     local hack="${1:-kfunc}"
     local dir tag="${MIMIC_UPSTREAM_TAG}"
-    [[ "$(detect_os_id)" == "alpine" ]] && hack="kprobe"
     kernel_ge_61 || warn "内核 < 6.1，源码编译的 mimic 可能无法运行"
-    install_base_packages || true
+    install_base_packages
     dir="$(mktemp -d /tmp/mimic-src.XXXXXX)"
     info "源码编译 mimic (${tag}, CHECKSUM_HACK=${hack})..."
-    if command_exists git \
+    if [[ -z "${WMF_MIMIC_SHA256:-}" ]] && command_exists git \
         && git clone --depth 1 --branch "$tag" https://github.com/hack3ric/mimic.git "$dir" 2>/dev/null; then
         :
-    elif gh_curl "https://github.com/hack3ric/mimic/archive/refs/tags/${tag}.tar.gz" "$dir/src.tgz"; then
+    elif gh_curl "https://github.com/hack3ric/mimic/archive/refs/tags/${tag}.tar.gz" "$dir/src.tgz" "${WMF_MIMIC_SHA256:-}"; then
         tar xzf "$dir/src.tgz" -C "$dir" --strip-components=1 2>/dev/null
     fi
     [[ -f "$dir/Makefile" ]] || { rm -rf "$dir"; return 1; }
@@ -3327,11 +3888,17 @@ install_mimic_from_source() {
         || { rm -rf "$dir"; return 1; }
     [[ -x "$dir/out/mimic" ]] || { rm -rf "$dir"; return 1; }
     install -m 755 "$dir/out/mimic" /usr/local/bin/mimic
-    if [[ -f "$dir/kmod/mimic.ko" ]]; then
-        install -D -m 644 "$dir/kmod/mimic.ko" "/lib/modules/$(uname -r)/extra/mimic.ko" 2>/dev/null \
-            || insmod "$dir/kmod/mimic.ko" 2>/dev/null || true
-        depmod -a 2>/dev/null || true
-    fi
+    [[ -f "$dir/kmod/mimic.ko" ]] || { rm -rf "$dir"; return 1; }
+    install -D -m 644 "$dir/kmod/mimic.ko" "/lib/modules/$(uname -r)/extra/mimic.ko" \
+        || { rm -rf "$dir"; return 1; }
+    depmod -a || { rm -rf "$dir"; return 1; }
+    install -d -m 755 "$(dirname "$MIMIC_SOURCE_MANIFEST")"
+    {
+        printf '/usr/local/bin/mimic\n'
+        [[ -f "/lib/modules/$(uname -r)/extra/mimic.ko" ]] \
+            && printf '/lib/modules/%s/extra/mimic.ko\n' "$(uname -r)"
+    } >"$MIMIC_SOURCE_MANIFEST"
+    chmod 600 "$MIMIC_SOURCE_MANIFEST"
     rm -rf "$dir"
     ok "mimic 已从源码安装到 /usr/local/bin/mimic"
     return 0
@@ -3353,10 +3920,12 @@ install_mimic_arch() {
 
 install_mimic_packages() {
     require_root
+    ensure_supported_platform
+    install_runtime_packages
     local id; id="$(detect_os_id)"
     if command_exists mimic; then
+        ensure_mimic_kmod_loaded || die "mimic CLI 已安装，但内核模块无法加载"
         ok "mimic 已安装：$(mimic --version 2>/dev/null || command -v mimic)"
-        ensure_mimic_kmod_loaded || true
         return 0
     fi
     if ! kernel_ge_61; then
@@ -3368,25 +3937,31 @@ install_mimic_packages() {
             ensure_debian_kernel_headers || warn "内核头文件未就绪，mimic-dkms 可能无法编译"
             apt-get update -qq || true
             if apt-cache show mimic &>/dev/null 2>&1; then
-                DEBIAN_FRONTEND=noninteractive apt-get install -y \
-                    wireguard-tools python3 nftables mimic mimic-dkms \
-                    && { ensure_mimic_kmod_loaded || true; ok "apt 安装 mimic 完成"; return 0; }
+                if DEBIAN_FRONTEND=noninteractive apt-get install -y \
+                    wireguard-tools python3 nftables mimic mimic-dkms; then
+                    ensure_mimic_kmod_loaded || die "mimic 包已安装，但内核模块无法加载"
+                    ok "apt 安装 mimic 完成"
+                    return 0
+                fi
             fi
-            install_mimic_github_deb && { ensure_mimic_kmod_loaded || true; return 0; }
+            if install_mimic_github_deb; then
+                ensure_mimic_kmod_loaded || die "mimic .deb 已安装，但内核模块无法加载"
+                return 0
+            fi
             warn "apt/GitHub .deb 失败，尝试源码编译..."
             install_mimic_from_source kfunc || die "mimic 安装失败"
             ;;
         arch)
-            install_base_packages || true
-            install_mimic_arch && { modprobe mimic 2>/dev/null || true; ok "Arch 包安装完成"; return 0; }
+            if install_mimic_arch; then
+                ensure_mimic_kmod_loaded || die "Arch mimic 包已安装，但内核模块无法加载"
+                ok "Arch 包安装完成"
+                return 0
+            fi
             warn "AUR 不可用，尝试源码编译..."
             install_mimic_from_source kfunc || die "mimic 安装失败"
             ;;
         fedora)
             install_mimic_from_source kfunc || die "mimic 源码安装失败"
-            ;;
-        alpine)
-            install_mimic_from_source kprobe || die "mimic 源码安装失败（Alpine 用 kprobe）"
             ;;
         rhel|centos|rocky|almalinux|ol)
             install_mimic_from_source kfunc || die "mimic 源码安装失败"
@@ -3395,16 +3970,13 @@ install_mimic_packages() {
             install_mimic_from_source kfunc || die "mimic 源码安装失败"
             ;;
         *)
-            install_base_packages || true
             install_mimic_from_source kfunc || {
                 install_deps
                 die "自动安装 mimic 失败，请按 install-deps 指引手动处理"
             }
             ;;
     esac
-    modprobe mimic 2>/dev/null || insmod /lib/modules/"$(uname -r)"/extra/mimic.ko 2>/dev/null \
-        || warn "modprobe mimic 失败，请检查内核模块"
-    command_exists wg || warn "wireguard-tools 未就绪"
+    ensure_mimic_kmod_loaded || die "mimic 安装完成，但内核模块无法加载"
     ok "mimic 安装流程完成"
 }
 
@@ -3413,6 +3985,8 @@ install_mimic_packages() {
 # 升级后卸载/重载内核模块并重启之前启用的线路，让新版本生效。
 update_mimic() {
     require_root
+    ensure_supported_platform
+    install_runtime_packages
     local want="${1:-}"
     [[ -n "$want" ]] && { [[ "$want" == v* ]] || want="v${want}"; export MIMIC_UPSTREAM_TAG="$want"; }
     kernel_ge_61 || die "内核 $(uname -r) < 6.1，Mimic 无法运行"
@@ -3425,7 +3999,7 @@ update_mimic() {
         for p in "$PROFILES_DIR"/*.env; do
             [[ -f "$p" ]] || continue
             # shellcheck disable=SC1090
-            ( safe_load_env "$p"; [[ "${ENABLED:-true}" == "true" ]] && printf '%s\n' "$PROFILE_ID" )
+            ( load_profile_file "$p"; [[ "${ENABLED:-true}" == "true" ]] && printf '%s\n' "$PROFILE_ID" )
         done)
     case "$id" in
         debian|ubuntu)
@@ -3440,204 +4014,24 @@ update_mimic() {
             fi
             ;;
         arch)   install_mimic_arch || install_mimic_from_source kfunc || die "mimic 升级失败" ;;
-        alpine) install_mimic_from_source kprobe || die "mimic 升级失败" ;;
         *)      install_mimic_from_source kfunc || die "mimic 升级失败" ;;
     esac
     # 停服务 → 卸旧模块 → 载新模块（XDP 占用时必须先停服务才能 modprobe -r）
     stop_mimic_services
     modprobe -r mimic 2>/dev/null || true
-    ensure_mimic_kmod_loaded || warn "新模块未能加载，可能需 reboot 后 wm start <线路>"
+    ensure_mimic_kmod_loaded || die "新 mimic 内核模块无法加载；升级未完成"
     # 重启之前启用的线路，让新 CLI/模块生效
-    for pid in "${lines[@]}"; do start_profile "$pid" >/dev/null 2>&1 || true; done
+    for pid in "${lines[@]}"; do start_profile "$pid"; done
     local after; after="$(mimic --version 2>/dev/null || echo 未知)"
     ok "mimic 升级完成：${before} → ${after}"
 }
 
-# ── swgp-go（WireGuard 流量混淆，抗 DPI/过墙；可与 mimic 叠加）────────────────
-# 链路: WG → swgp-go → mimic。swgp-go 是用户态 Go 代理，把 WG 的 UDP 混淆/加密成
-# 另一种 UDP；mimic 再在外层把它伪装成 TCP。本节负责装它、渲染配置、跑 systemd。
-
-# swgp-go 的 PSK 与 WireGuard PSK 同格式（base64 32B）。
-swgp_genpsk() { wg genpsk; }
-
-# 判断文件是否为 ELF 可执行（魔数 7f 45 4c 46）——用于识别「误把压缩包当二进制」的损坏安装。
-# 用 od 读前 4 字节（busybox 与 coreutils 通用），不依赖 head -c（busybox 可能不支持）。
-is_elf_bin() {
-    [[ -s "$1" ]] || return 1
-    local magic
-    magic="$(LC_ALL=C od -An -tx1 -N4 "$1" 2>/dev/null)"
-    magic="${magic//[[:space:]]/}"
-    [[ "$magic" == "7f454c46" ]]
-}
-
-# 确保 zstd 可用（解压 .tar.zst 需要；GNU tar --zstd 也依赖 zstd 程序）。
-ensure_zstd() {
-    command_exists zstd && return 0
-    command_exists apt-get && DEBIAN_FRONTEND=noninteractive apt-get install -y zstd >/dev/null 2>&1
-    command_exists zstd
-}
-
-# 解压 .tar.zst：优先 GNU tar 的 --zstd，回退 `zstd -d | tar`。
-extract_tar_zst() {
-    local pkg="$1" out="$2"
-    tar --zstd -xf "$pkg" -C "$out" 2>/dev/null && return 0
-    zstd -dqc "$pkg" 2>/dev/null | tar -xf - -C "$out" 2>/dev/null
-}
-
-# 从 GitHub release 动态匹配 linux+arch 资产并安装 swgp-go 二进制（在线运行时调用）。
-download_swgp_release() {
-    local dest="$1" tmpd url
-    command_exists python3 || return 1
-    tmpd="$(mktemp -d)"
-    gh_curl "https://api.github.com/repos/${SWGP_REPO}/releases/latest" "$tmpd/rel.json" \
-        || { rm -rf "$tmpd"; return 1; }
-    url="$(python3 - "$tmpd/rel.json" <<'PY' 2>/dev/null
-import json, sys, platform
-try:
-    d = json.load(open(sys.argv[1]))
-except Exception:
-    sys.exit(0)
-m = platform.machine().lower()
-if m in ("x86_64", "amd64"):
-    arch = ["x86-64-v3", "x86-64-v2", "x86-64", "amd64", "x86_64"]
-elif m in ("aarch64", "arm64"):
-    arch = ["arm64", "aarch64"]
-else:
-    arch = [m]
-def asset_score(n):
-    # 仅接受可解压的归档；校验和/签名/包等排除
-    if n.endswith((".sha256", ".asc", ".sig", ".sbom", ".pem", ".json", ".txt", ".deb", ".rpm")):
-        return -1
-    if not n.endswith((".tar.zst", ".tzst", ".tar.gz", ".tgz", ".tar", ".zip")):
-        return -1
-    s = 100
-    if "glibc" not in n:                       # 静态构建更可移植，优先
-        s += 20
-    if "x86-64-v2" in n or "x86_64-v2" in n:   # 微架构 v2 兼容性最广，优先于 v3（避免无 AVX2 机器跑 v3）
-        s += 10
-    elif "x86-64-v3" in n or "x86_64-v3" in n:
-        s += 5
-    return s
-best = None; best_score = 0
-for a in d.get("assets", []):
-    n = a["name"].lower()
-    if "linux" not in n or not any(t in n for t in arch):
-        continue
-    sc = asset_score(n)
-    if sc > best_score:
-        best, best_score = a["browser_download_url"], sc
-print(best or "")
-PY
-)"
-    [[ -n "$url" ]] || { rm -rf "$tmpd"; return 1; }
-    gh_curl "$url" "$tmpd/pkg" || { rm -rf "$tmpd"; return 1; }
-    # 可选完整性校验（WMF_SWGP_SHA256）：拒绝被篡改的下载资产
-    verify_sha256 "$tmpd/pkg" "${WMF_SWGP_SHA256:-}" || { rm -rf "$tmpd"; return 1; }
-    case "$url" in
-        *.zip)              command_exists unzip && unzip -o "$tmpd/pkg" -d "$tmpd" >/dev/null 2>&1 ;;
-        *.tar.gz|*.tgz)     tar -xzf "$tmpd/pkg" -C "$tmpd" 2>/dev/null ;;
-        *.tar.zst|*.tzst)   ensure_zstd && extract_tar_zst "$tmpd/pkg" "$tmpd" ;;
-        *.tar)              tar -xf "$tmpd/pkg" -C "$tmpd" 2>/dev/null ;;
-        *.zst)              ensure_zstd && zstd -dqf "$tmpd/pkg" -o "$tmpd/swgp-go" 2>/dev/null ;;
-        *)                  cp "$tmpd/pkg" "$tmpd/swgp-go" ;;
-    esac
-    local bin; bin="$(find "$tmpd" -type f -name 'swgp-go' 2>/dev/null | head -1)"
-    [[ -n "$bin" ]] || { warn "swgp-go release 解压后未找到二进制（资产：$url）"; rm -rf "$tmpd"; return 1; }
-    # 关键：确认产物是真正的 ELF，杜绝把未解压的归档当二进制安装（Exec format error 的根因）。
-    is_elf_bin "$bin" || { warn "swgp-go 下载产物非有效 ELF（疑似未解压归档），放弃安装"; rm -rf "$tmpd"; return 1; }
-    install -m 755 "$bin" "$dest"
-    rm -rf "$tmpd"
-}
-
-# 仅当 swgp-go 是真正可执行的 ELF 才算「已装」——避免把误装的 .tar.zst 归档（带 +x）
-# 当成已安装而拒绝重装（beta.13 及之前 Exec format error 反复出现的根因之一）。
-swgp_installed_ok() {
-    if [[ -e "$SWGP_BIN" ]]; then
-        is_elf_bin "$SWGP_BIN" && return 0
-        warn "检测到损坏的 swgp-go（非 ELF 可执行文件），删除后将重新下载"
-        rm -f "$SWGP_BIN"
-        return 1
-    fi
-    command_exists swgp-go
-}
-
-install_swgp() {
-    require_root
-    if swgp_installed_ok; then
-        ok "swgp-go 已安装"; return 0
-    fi
-    info "安装 swgp-go（WireGuard 混淆）..."
-    if download_swgp_release "$SWGP_BIN"; then
-        ok "已通过 GitHub release 安装 swgp-go"
-    elif command_exists go; then
-        info "release 不可用，改用 go install..."
-        GOBIN=/usr/local/bin go install "github.com/${SWGP_REPO}/cmd/swgp-go@latest" \
-            || die "swgp-go 安装失败（go install）"
-        ok "已通过 go install 安装 swgp-go"
-    else
-        die "swgp-go 安装失败：无可用 release 资产且未装 go（可 apt install golang 后重试）"
-    fi
-}
-
-# 渲染 swgp-go 配置 JSON：
-#   render_swgp_conf server <proxy_listen_port> <wg_endpoint> <mode> <psk> [mtu] [fwmark]
-#   render_swgp_conf client <wg_listen_port>   <proxy_endpoint> <mode> <psk> [mtu] [fwmark]
-render_swgp_conf() {
-    local kind="$1" p2="$2" p3="$3" mode="$4" psk="$5" mtu="${6:-1500}" fwmark="${7:-0}"
-    python3 - "$kind" "$p2" "$p3" "$mode" "$psk" "$mtu" "$fwmark" <<'PY'
-import json, sys
-kind, p2, p3, mode, psk, mtu, fwmark = sys.argv[1:8]
-mtu = int(mtu); fwmark = int(fwmark)
-if kind == "server":
-    obj = {"servers": [{
-        "name": "wm", "proxyListen": f":{p2}", "proxyMode": mode, "proxyPSK": psk,
-        "proxyFwmark": fwmark, "wgEndpoint": p3, "wgFwmark": 0, "mtu": mtu}]}
-else:
-    obj = {"clients": [{
-        "name": "wm", "wgListen": f":{p2}", "wgFwmark": 0, "proxyEndpoint": p3,
-        "proxyMode": mode, "proxyPSK": psk, "proxyFwmark": fwmark, "mtu": mtu}]}
-print(json.dumps(obj, indent=2))
-PY
-}
-
-# 写 swgp-go 配置到 /etc/wg-mimic-fabric/swgp/<id>.json（由 profile 字段渲染）。
-apply_swgp_conf() {
-    local id="$1"; shift
-    install -d -m 700 "$SWGP_CONF_DIR"
-    local tmp; tmp="$(mktemp)"
-    render_swgp_conf "$@" >"$tmp"
-    install -m 600 "$tmp" "${SWGP_CONF_DIR}/${id}.json"
-    rm -f "$tmp"
-}
-
-install_swgp_units() {
-    local swgp_bin; swgp_bin="$(resolve_bin swgp-go "$SWGP_BIN")"
-    local tmp; tmp="$(mktemp)"
-    cat >"$tmp" <<EOF
-[Unit]
-Description=wg-mimic-fabric swgp-go %i
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-ExecStart=${swgp_bin} -confPath ${SWGP_CONF_DIR}/%i.json
-Restart=on-failure
-RestartSec=3
-
-[Install]
-WantedBy=multi-user.target
-EOF
-    install -m 644 "$tmp" "$SYSTEMD_SWGP_TEMPLATE"
-    rm -f "$tmp"
-    systemctl daemon-reload 2>/dev/null || true
-}
-
 install_all() {
     require_root
-    install_wm_cli
+    ensure_supported_platform
+    WMF_AUTO_MIMIC=0 install_wm_cli
     if [[ "${WMF_SKIP_MIMIC:-}" != "1" ]]; then
-        install_mimic_packages || warn "mimic 自动安装未成功，可稍后 wm install-mimic"
+        install_mimic_packages
     else
         info "已跳过 mimic 安装（WMF_SKIP_MIMIC=1）"
     fi
@@ -3663,11 +4057,6 @@ uninstall_mimic_packages() {
                     || warn "pacman 未找到 mimic 包（可能未安装）"
             fi
             ;;
-        alpine)
-            if command_exists apk; then
-                apk del mimic mimic-dkms 2>/dev/null || warn "apk 未找到 mimic 包"
-            fi
-            ;;
         fedora|centos|rhel|rocky|almalinux|ol)
             warn "RHEL 系通常无 mimic 包，请手动删除源码安装文件"
             ;;
@@ -3675,6 +4064,19 @@ uninstall_mimic_packages() {
             warn "未识别 OS，请手动卸载 mimic"
             ;;
     esac
+    if [[ -f "$MIMIC_SOURCE_MANIFEST" ]]; then
+        local source_path
+        while IFS= read -r source_path; do
+            case "$source_path" in
+                /usr/local/bin/mimic|/lib/modules/*/extra/mimic.ko)
+                    rm -f -- "$source_path"
+                    ;;
+            esac
+        done <"$MIMIC_SOURCE_MANIFEST"
+        rm -f "$MIMIC_SOURCE_MANIFEST"
+        rmdir "$(dirname "$MIMIC_SOURCE_MANIFEST")" 2>/dev/null || true
+        depmod -a 2>/dev/null || true
+    fi
     # 清理可能残留的 mimic 配置（purge 时全部删除）
     if [[ -d "$MIMIC_CONF_DIR" ]]; then
         find "$MIMIC_CONF_DIR" -maxdepth 1 -name '*.conf' -type f -delete 2>/dev/null || true
@@ -3693,7 +4095,6 @@ purge_installation() {
   - wm 管理脚本 (/usr/local/bin/wm, libexec)
   - WireGuard / Mimic 生成的配置
   - nft 防火墙规则
-  - swgp-go 二进制 (/usr/local/bin/swgp-go) 与其 systemd 单元
   - mimic 与 mimic-dkms 系统包（apt/pacman）
 
 EOF
@@ -3721,13 +4122,12 @@ uninstall_wm_core() {
     local ids=() ifaces=() id iface wg_iface
     while IFS= read -r id; do [[ -n "$id" ]] && ids+=("$id"); done < <(list_profile_ids 2>/dev/null || true)
     stop_mimic_services
-    stop_swgp_services
-    stop_all_profiles 2>/dev/null || true
+    stop_all_profiles
+    systemctl disable --now wg-mimic-nft.service 2>/dev/null || true
     for id in "${ids[@]}"; do
         wg_iface="$(wg_iface_for "$id")"
         systemctl disable "wg-mimic-tunnel@${id}.service" 2>/dev/null || true
-        systemctl disable "wg-mimic-swgp@${id}.service" 2>/dev/null || true
-        remove_tunnel_mimic_dropin "$id"
+        remove_tunnel_dropin "$id"
         load_profile "$id" 2>/dev/null && ifaces+=("$WAN_IFACE") || true
         if [[ "$remove_configs" == "true" ]]; then
             rm -f "${WG_CONF_DIR}/${wg_iface}.conf"
@@ -3745,7 +4145,7 @@ uninstall_wm_core() {
         if nft list table inet "$NFT_TABLE" >/dev/null 2>&1; then
             nft delete table inet "$NFT_TABLE" 2>/dev/null || true
         fi
-        rm -f "$NFT_FILE" "$SYSCTL_FILE" "$SYSCTL_QOS_FILE" "$SWGP_BIN"
+        rm -f "$NFT_FILE" "$SYSCTL_FILE"
         # 清理本工具写入 /etc/mimic 的 .conf / .xdp（否则随后 dpkg purge mimic 会报「目录非空未删」）
         rm -f "${MIMIC_CONF_DIR}"/*.conf "${MIMIC_CONF_DIR}"/*.xdp 2>/dev/null || true
         rm -rf "$CONFIG_DIR" "$LIBEXEC_DIR"
@@ -3756,7 +4156,7 @@ uninstall_wm_core() {
     for _asw in $(systemctl list-units --all --no-legend 'wg-mimic-autoswitch@*.timer' 2>/dev/null | awk '{print $1}'); do
         systemctl disable --now "$_asw" 2>/dev/null || true
     done
-    rm -f "$WM_BIN" "$SYSTEMD_MIMIC_TEMPLATE" "$SYSTEMD_TUNNEL_TEMPLATE" "$SYSTEMD_OFFLOAD_TEMPLATE" "$SYSTEMD_SWGP_TEMPLATE" "$SYSTEMD_DDNS_SERVICE" "$SYSTEMD_DDNS_TIMER" "$SYSTEMD_AUTOSWITCH_SERVICE" "$SYSTEMD_AUTOSWITCH_TIMER" "$SYSTEMD_RESUME_SERVICE"
+    rm -f "$WM_BIN" "$SYSTEMD_MIMIC_TEMPLATE" "$SYSTEMD_TUNNEL_TEMPLATE" "$SYSTEMD_OFFLOAD_TEMPLATE" "$SYSTEMD_NFT_SERVICE" "$SYSTEMD_DDNS_SERVICE" "$SYSTEMD_DDNS_TIMER" "$SYSTEMD_AUTOSWITCH_SERVICE" "$SYSTEMD_AUTOSWITCH_TIMER" "$SYSTEMD_RESUME_SERVICE"
     # 大写别名（若存在）
     rm -f "$WM_ALIAS" "/usr/local/bin/WG" 2>/dev/null || true
     if [[ "$remove_configs" == "true" ]]; then
@@ -3787,7 +4187,7 @@ uninstall_from_menu() {
 卸载 wg-mimic-fabric
 
   1) 卸载服务（保留 /etc/wg-mimic-fabric 配置）
-  2) 完全清理 purge（配置+本地脚本+mimic/swgp）
+  2) 完全清理 purge（配置+本地脚本+mimic）
   0) 取消
 EOF
     local mode; read -r -p "请选择: " mode </dev/tty
@@ -3808,11 +4208,12 @@ ensure_cli_aliases() {
     ln -sf "$WM_BIN" "$WM_ALIAS" 2>/dev/null || true
 }
 
-install_wm_cli() {
+refresh_installation() {
     require_root
+    ensure_supported_platform
+    install_runtime_packages
     ensure_dirs
     install -d -m 755 "$LIBEXEC_DIR"
-    install -m 755 "$0" "$WM_CLI_INSTALL_SH"
     cat >"$WM_BIN" <<'WRAP'
 #!/usr/bin/env bash
 exec /usr/local/libexec/wg-mimic-fabric/install.sh "$@"
@@ -3820,6 +4221,19 @@ WRAP
     chmod 755 "$WM_BIN"
     ensure_cli_aliases
     install_systemd_units
+    systemctl enable wg-mimic-nft.service
+}
+
+install_wm_cli() {
+    require_root
+    ensure_supported_platform
+    install_runtime_packages
+    ensure_dirs
+    install -d -m 755 "$LIBEXEC_DIR"
+    if [[ "$(readlink -f "$0")" != "$(readlink -f "$WM_CLI_INSTALL_SH" 2>/dev/null || printf '%s' "$WM_CLI_INSTALL_SH")" ]]; then
+        install -m 755 "$0" "$WM_CLI_INSTALL_SH"
+    fi
+    refresh_installation
     ok "已安装 wm 命令：$WM_BIN（含大写别名 WM）"
     if [[ "${WMF_AUTO_MIMIC:-1}" == "1" && "${WMF_SKIP_MIMIC:-}" != "1" ]]; then
         install_mimic_packages 2>/dev/null || warn "mimic 未自动装上，请运行：wm install-mimic"
@@ -3835,17 +4249,17 @@ wg-mimic-fabric ${SCRIPT_VERSION} — 公网入口 ⇄ IX WireGuard 组网 + Mim
   wm --version
   wm create-transit               IX 机：创建组网线路+首条规则并生成接入码
   wm import-code                  公网入口：粘贴接入码，自动组网与转发
-  wm create-exit                  B(国外出口)：建混淆组网(WG+swgp-go+mimic)并生成出口接入码
+  wm create-exit                  B(国外出口)：建 WG+Mimic 出口并生成出口接入码
   wm import-exit-code             A(国内网关)：粘贴出口接入码，建到 B 的混淆隧道
   wm add-client <网关> <名>        A：生成客户端 WG 配置+二维码（官方App/小火箭/mihomo/sing-box）
   wm list-clients [网关] / wm del-client <网关> <名>
-  wm start|stop|restart [ID]      启停线路（两端均需 WG+Mimic）
+  wm start|stop|restart [ID]      启停线路（mimic 模式需 Mimic；direct 仅需 WG）
   wm delete-line <ID>             删除整条线路（保留同机其它线路；WMF_DELETE_YES=1 跳过确认）
   wm list-profiles
-  wm show-config [ID]
-  wm show-code [ID]               显示 IX 接入码
-  wm refresh-code [ID]            按当前规则刷新接入码（不换密钥、不断流）
-  wm rotate-keys [ID]             轮换入口密钥并刷新接入码（会重启IX，公网入口需重导）
+  wm show-config [ID]             显示线路配置（默认隐藏私钥）
+  wm show-code [ID]               显示中转/出口接入码
+  wm refresh-code [ID]            刷新中转/出口接入码（不换密钥、不断流）
+  wm rotate-keys [ID]             轮换拨号端密钥并刷新接入码（会重启线路，对端需重导）
   wm show-port-map [ID]           端口地图
   wm list-rules [ID]
   wm add-rule [ID]
@@ -3867,13 +4281,12 @@ wg-mimic-fabric ${SCRIPT_VERSION} — 公网入口 ⇄ IX WireGuard 组网 + Mim
   wm automtu <ID>                 自动探测隧道可用 MTU 并设置（换中转线路后跑一下即自适应；两端各跑）
   wm install-all|install-mimic|install-deps|compat
   wm update-mimic [版本]           升级 mimic 到 apt 最新或指定版本（重载模块+重启线路）
-  wm install-swgp                  安装 swgp-go（WireGuard 混淆，过墙用）
   wm upgrade-script / wm uninstall / wm purge
 
 架构: 客户端 → 公网入口:client_port → WG(Mimic 伪TCP) → IX 虚拟IP:transit_port → 落地
 
 环境变量:
-  WMF_TAG=v1.0.0                  安装/升级时指定版本
+  WMF_TAG=v1.4.10                 安装/升级时指定版本
   WMF_REPO=ike-sh/wg-mimic-fabric GitHub 仓库
   WMF_UPGRADE_YES=1               升级跳过确认
   WMF_PURGE_YES=1                 purge 跳过确认
@@ -3881,7 +4294,11 @@ wg-mimic-fabric ${SCRIPT_VERSION} — 公网入口 ⇄ IX WireGuard 组网 + Mim
   WMF_SKIP_MIMIC=1                跳过 mimic 自动安装
   WMF_AUTO_MIMIC=0                install-wm-cli 时不自动装 mimic
   WMF_PURGE_NO_MIMIC=1            purge 时保留 mimic 系统包
-  WMF_GITHUB_MIRRORS=url,...      GitHub 下载镜像
+  WMF_INSTALL_SHA256=<sha256>      install.sh 期望哈希
+  WMF_MIMIC_SHA256=<sha256>        Mimic 包/源码资产期望哈希
+  WMF_MIMIC_DKMS_SHA256=<sha256>   Mimic DKMS 包期望哈希
+  WMF_GITHUB_MIRRORS=url,...       GitHub 镜像（必须同时提供对应 SHA256）
+  WMF_SHOW_SECRETS=1               show-config 显示私钥（默认隐藏）
 EOF
 }
 
@@ -3892,7 +4309,7 @@ clear_screen() {
 
 # 单个菜单动作的执行体。由 show_menu 放入隔离子 shell 调用——分支内部任何
 # die / exit / 命令失败都只会终止那个子 shell（随后自动回到菜单），绝不再杀掉
-# 整个交互会话。需要替换/退出主进程的特例（18 升级后 exec、19 卸载后退出）这里
+# 整个交互会话。需要替换/退出主进程的特例（17 升级后 exec、18 卸载后退出）这里
 # 只做“工作”本身，由 show_menu 在子 shell 结束后于主进程内收尾。
 menu_dispatch() {
     local choice="$1" id rid
@@ -3968,20 +4385,9 @@ menu_dispatch() {
             prompt _mv "Mimic 目标版本（留空=apt 仓库最新）" ""
             update_mimic "$_mv"
             ;;
-        16)
-            local _sf="N"
-            if swgp_installed_ok 2>/dev/null; then
-                prompt _sf "swgp-go 已安装，强制重装为最新 release？[y/N]" "N"
-            fi
-            case "$_sf" in
-                [Yy]*) rm -f "$SWGP_BIN"; install_swgp \
-                    && info "新二进制已就位；请重启使用 swgp 的线路使其生效（菜单 7 停止 → 6 启动，或 wm restart <线路>）" ;;
-                *) install_swgp ;;
-            esac
-            ;;
-        17) if id="$(menu_pick_profile)"; then delete_profile "$id"; fi ;;
-        18) upgrade_script ;;
-        19) uninstall_from_menu ;;
+        16) if id="$(menu_pick_profile)"; then delete_profile "$id"; fi ;;
+        17) upgrade_script ;;
+        18) uninstall_from_menu ;;
         *) warn "无效选择：$choice" ;;
     esac
 }
@@ -3994,7 +4400,7 @@ show_menu() {
         clear_screen
         printf '  wg-mimic-fabric  v%s\n' "$SCRIPT_VERSION"
         cat <<'MENU'
-  WireGuard 组网 · Mimic 伪 TCP · swgp 流量混淆
+  WireGuard 组网 · Mimic 伪 TCP
   ──────────────────────────────────────────────────
 
   【模式一】IX 中转组网 · 端口转发 / 中转加速
@@ -4011,11 +4417,11 @@ show_menu() {
      10   接入码    11   刷新码    12   端口地图   13   规则管理
      14   MTU 调整（自动探测 / 手动设置）
 
-  【组件维护】内核模块 / 混淆代理
-     15   更新 Mimic 模块     16   安装 / 修复 swgp-go
+  【组件维护】
+     15   更新 Mimic 模块
 
   【系统维护】
-     17   删除线路    18   升级脚本    19   卸载 / 清理     0   退出
+     16   删除线路    17   升级脚本    18   卸载 / 清理     0   退出
   ──────────────────────────────────────────────────
 MENU
         read -r -p "  请输入序号 › " choice </dev/tty
@@ -4030,13 +4436,13 @@ MENU
         # 失败都只终止该子 shell → 捕获返回码 → 恢复父 errexit → 回到菜单。从此单个
         # 操作报错不再杀掉整个交互会话。
         set +e
-        ( set -Eeuo pipefail; menu_dispatch "$choice" )
+        ( set -Eeuo pipefail; with_state_lock menu_dispatch "$choice" )
         _rc=$?
         set -e
         # 需要替换 / 退出主进程的两个特例，在子 shell 成功结束后于主进程内收尾
         case "$choice" in
-            18) if (( _rc == 0 )); then ok "重新加载菜单以应用新版本..."; exec "$WM_BIN"; fi ;;
-            19) if [[ ! -e "$WM_BIN" ]]; then printf '\n[OK] wm 已移除，退出菜单。\n'; exit 0; fi ;;
+            17) if (( _rc == 0 )); then ok "重新加载菜单以应用新版本..."; exec "$WM_BIN"; fi ;;
+            18) if [[ ! -e "$WM_BIN" ]]; then printf '\n[OK] wm 已移除，退出菜单。\n'; exit 0; fi ;;
         esac
         printf '\n'
         read -r -p "  ── 回车返回菜单 ── " _ </dev/tty || true
@@ -4045,13 +4451,25 @@ MENU
 
 main() {
     local cmd="${1:-}"
+    if [[ "${WMF_LOCK_HELD:-}" != "1" ]]; then
+        case "$cmd" in
+            install-wm-cli|refresh-installation|install-mimic|update-mimic|install-all|resume|create-transit|import-code|create-exit|import-exit-code|\
+            add-client|del-client|start|stop|restart|delete-line|remove|show-code|refresh-code|rotate-keys|add-rule|edit-rule|delete-rule|\
+            enable-rule|disable-rule|apply-rules|ddns-refresh|ddns-enable|ddns-disable|set-group|switch-line|set-endpoint|\
+            set-endpoints|autoswitch|autoswitch-enable|autoswitch-disable|set-pool|set-mtu|automtu|set-xdp-mode|apply-nft-all|\
+            upgrade-script|uninstall|purge)
+                with_state_lock main "$@"
+                return
+                ;;
+        esac
+    fi
     case "$cmd" in
         --version|-V) printf 'wg-mimic-fabric %s\n' "$SCRIPT_VERSION"; exit 0 ;;
         --help|-h|help) usage; exit 0 ;;
         install-wm-cli) install_wm_cli ;;
+        refresh-installation) refresh_installation ;;
         install-mimic) install_mimic_packages ;;
         update-mimic) update_mimic "${2:-}" ;;
-        install-swgp) install_swgp ;;
         install-all) install_all ;;
         install-deps) install_deps ;;
         compat) compat_os_report ;;
@@ -4069,7 +4487,7 @@ main() {
         restart) restart_profile "${2:-}" ;;
         delete-line|remove) delete_profile "${2:-}" ;;
         list-profiles) list_profile_ids ;;
-        show-config) load_profile "$(resolve_profile_id "${2:-}")"; cat "$(profile_env_path "$PROFILE_ID")" ;;
+        show-config) show_config "${2:-}" ;;
         show-code) show_code "${2:-}" ;;
         refresh-code) refresh_code "${2:-}" ;;
         rotate-keys) rotate_keys "${2:-}" ;;
@@ -4106,7 +4524,7 @@ main() {
         purge) purge_installation ;;
         health) health_profile "${2:-}" ;;
         diagnose) diagnose_profile "${2:-}" ;;
-        "") [[ -t 0 ]] && show_menu || { usage; exit 1; } ;;
+        "") if [[ -t 0 ]]; then show_menu; else usage; exit 1; fi ;;
         *) usage; die "未知命令：$cmd" ;;
     esac
 }

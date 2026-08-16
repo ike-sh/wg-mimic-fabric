@@ -1,10 +1,10 @@
 # wg-mimic-fabric
 
-> 基于 WireGuard 的组网与全局出口编排工具，集成 Mimic 伪 TCP 伪装与 swgp-go 流量混淆，通过单一命令 `wm` 完成搭建与全生命周期运维。
+> 基于 WireGuard 的组网与全局出口编排工具，集成 Mimic 伪 TCP 伪装，通过单一命令 `wm` 完成搭建与全生命周期运维。
 
 | | |
 |------|------|
-| **版本** | `v1.4.9` |
+| **版本** | `v1.4.10` |
 | **仓库** | https://github.com/ike-sh/wg-mimic-fabric |
 | **许可** | MIT |
 
@@ -24,14 +24,14 @@ curl -fsSL https://raw.githubusercontent.com/ike-sh/wg-mimic-fabric/main/scripts
 
 ## 概述
 
-wg-mimic-fabric 以 **WireGuard** 为底层组网，使用 **Mimic** 将 WireGuard 的 **UDP 流量伪装为 TCP**，以穿透针对 UDP 的封锁与 QoS 限速；并可按需叠加 **swgp-go** 提供第二层流量混淆。全部能力收敛为一个全局命令 `wm`（交互式菜单与 CLI 子命令完全等价），覆盖以下两类典型场景：
+wg-mimic-fabric 以 **WireGuard** 为底层组网，使用 **Mimic** 将 WireGuard 的 **UDP 流量伪装为 TCP**，以穿透针对 UDP 的封锁与 QoS 限速。全部能力收敛为一个全局命令 `wm`（交互式菜单与 CLI 子命令完全等价），覆盖以下两类典型场景：
 
 1. **IX 中转组网**：公网入口 ⇄ IX / 落地节点。IX 侧基于 **nftables** 将流量转发至落地服务，适用于端口转发与中转加速。
-2. **混淆全局出口**：国内网关 A ⇄ 国外出口 B。本地设备接入 A 后，全部流量经隧道由 B 出网（全局代理），支持 `swgp+mimic` 双层混淆与移动端扫码接入。
+2. **Mimic 全局出口**：国内网关 A ⇄ 国外出口 B。本地设备接入 A 后，全部流量经 Mimic 隧道由 B 出网，支持移动端扫码接入。
 
 ```text
 场景一 · 中转组网：客户端 ──[Mimic 伪 TCP 承载的 WireGuard]──► 公网入口 ⇄ IX ──[nft]──► 落地:端口
-场景二 · 全局出口：手机 / 设备 ──[WG]──► 国内网关 A ──[swgp+mimic 隧道]──► 国外出口 B ──► 互联网
+场景二 · 全局出口：手机 / 设备 ──[WG]──► 国内网关 A ──[Mimic 伪 TCP 承载的 WG]──► 国外出口 B ──► 互联网
 ```
 
 ---
@@ -41,12 +41,11 @@ wg-mimic-fabric 以 **WireGuard** 为底层组网，使用 **Mimic** 将 WireGua
 - [快速开始](#快速开始)
 - [核心组件](#核心组件)
   - [Mimic](#mimic)
-  - [swgp-go](#swgp-go)
 - [系统要求](#系统要求)
 - [功能概览](#功能概览)
 - [安装](#安装)
 - [场景一：IX 中转组网](#场景一ix-中转组网)
-- [场景二：混淆全局出口](#场景二混淆全局出口)
+- [场景二：Mimic 全局出口](#场景二mimic-全局出口)
 - [多转发规则与端口池](#多转发规则与端口池)
 - [线路质量与中转切换](#线路质量与中转切换)
 - [IPv6 / 双栈](#ipv6--双栈)
@@ -81,18 +80,6 @@ wg-mimic-fabric 以 **WireGuard** 为底层组网，使用 **Mimic** 将 WireGua
 
 > 链路层呈现为 TCP，但连接发起行为仍属 UDP：netfilter 在入站方向识别为 TCP、出站方向识别为 UDP。因此**云安全组需对 WireGuard 端口同时放行 TCP 与 UDP**。
 
-### swgp-go
-
-[swgp-go](https://github.com/database64128/swgp-go) 是用户态的 **WireGuard 流量混淆代理**。它在 WireGuard 之外叠加一层基于 PSK（预共享密钥）的 **UDP 加密 / 混淆**，将 WireGuard 的 UDP 流量转换为无显著特征的 UDP，进一步增强对特征型 DPI 的抵抗能力。
-
-完整链路为 **WG → swgp-go → Mimic**：swgp-go 先将 WireGuard 流量混淆为另一种 UDP，Mimic 再在最外层将其伪装为 TCP。双层叠加（`swgp+mimic`）为抗封锁能力最强的模式，用于「混淆全局出口」场景。
-
-- **按需自动安装**：无需手动部署。工具从 GitHub Release 选取**静态 `linux-x86-64-v2`** 构建（兼容性最广、无 glibc 依赖、不要求 AVX2），下载后执行 **ELF 强制校验**，文件损坏时**自动重新安装**。
-- **混淆方式**：`direct`（不混淆）/ `mimic`（仅伪 TCP）/ `swgp`（仅 swgp 混淆）/ `swgp+mimic`（双层，默认推荐）。
-- **swgp 模式**：`zero-overhead-2026`（默认，零额外开销）/ `paranoid-2026`（更强混淆）。
-
-> **NAT VPS 注意事项**：`swgp+mimic` 模式下，网关 A 经公网连接的是出口 B 的 **swgp 对外端口**（而非 WireGuard 端口）。若 B 为 NAT 机器，该端口**必须落在服务商转发的端口段内**，否则 A 的报文无法抵达 B。可使用 `wm install-swgp` 单独安装或修复 swgp-go。
-
 ---
 
 ## 系统要求
@@ -109,9 +96,9 @@ wg-mimic-fabric 以 **WireGuard** 为底层组网，使用 **Mimic** 将 WireGua
 
 ### wg-mimic-fabric 本体
 
-- `bash`、`python3`、`wireguard-tools`（`wg` / `wg-quick`）、`nftables`、`curl`、`iproute2`
-- `systemd`（线路、Mimic、swgp、DDNS、自动切换均以 systemd 单元运行）
-- 全局出口场景额外依赖 `swgp-go`、`qrencode`（生成客户端二维码）、`zstd`（解压 swgp Release），均自动安装
+- `bash`、`python3`、`wireguard-tools`（`wg` / `wg-quick`）、`nftables`、`curl`、`iproute2`、`util-linux`、`kmod`、`ethtool`
+- `systemd`（线路、Mimic、DDNS、自动切换均以 systemd 单元运行）
+- 全局出口场景可选安装 `qrencode`（生成客户端二维码）
 - **root** 权限
 
 ### 发行版兼容评级（执行 `wm compat` 查看本机评级）
@@ -121,7 +108,7 @@ wg-mimic-fabric 以 **WireGuard** 为底层组网，使用 **Mimic** 将 WireGua
 | 推荐 | **Debian 13 / Ubuntu 24.04** | 官方 mimic `.deb` 与 apt，内核 ≥ 6.1 |
 | 良好 | Arch | AUR：`mimic-bpf` |
 | 有条件 | Fedora / RHEL 系 | 默认内核常 < 6.1，需 elrepo kernel-ml 或改用 Debian / Ubuntu，mimic 需源码编译 |
-| 实验 | Alpine / OpenWrt | 无 DKMS，需源码编译（Alpine 使用 `kprobe`），不建议用于生产 |
+| 不支持 | Alpine / OpenWrt | `wm` 依赖 systemd；Alpine/OpenRC 与 OpenWrt 当前均拒绝安装 |
 
 > 安装脚本会自动安装 mimic（apt → GitHub `.deb` → 源码编译，三级回退），并按当前内核经 DKMS 编译模块。
 
@@ -129,11 +116,11 @@ wg-mimic-fabric 以 **WireGuard** 为底层组网，使用 **Mimic** 将 WireGua
 
 ## 功能概览
 
-本工具将「WireGuard 组网 + Mimic 伪装（+ swgp 混淆）+ nft 转发」的搭建与运维完全自动化，统一为一个 `wm` 命令：
+本工具将「WireGuard 组网 + Mimic 伪装 + nft 转发」的搭建与运维完全自动化，统一为一个 `wm` 命令：
 
 - **一端创建线路并生成「接入码」，另一端粘贴接入码即自动完成组网**：中转场景使用 `create-transit` / `import-code`，出口场景使用 `create-exit` / `import-exit-code`。
-- 自动处理 NAT / 端口转发机器的 Mimic 绑定、网卡 XDP 模式（`virtio` 自动回退 `skb`）、systemd 单元、防火墙放行与空闲 mesh 网段分配。
-- 全局出口场景额外自动安装 swgp-go 与 qrencode，自动为 relay 网关配置策略路由及对端 mesh 路由，并一键生成客户端 `.conf` 与二维码。
+- 自动处理 NAT / 端口转发机器的 Mimic 绑定、网卡 XDP 模式（`virtio` 自动回退 `skb`）、systemd 单元、自有 nft 表与空闲 mesh 网段分配；宿主机已有的 UFW/firewalld/云安全组仍需单独放行。
+- 全局出口场景自动为 relay 网关配置策略路由及对端 mesh 路由，并可安装 qrencode 一键生成客户端 `.conf` 与二维码。
 - 内置 **IPv4 / IPv6 双栈**、落地**域名 DDNS**、线路**主备**、**隧道丢包自检（`wm test`）**、**中转线路切换 / 自动切换**与**自动 MTU 探测（`wm automtu`）**。
 
 ### 角色
@@ -142,10 +129,10 @@ wg-mimic-fabric 以 **WireGuard** 为底层组网，使用 **Mimic** 将 WireGua
 |------|----------|------|
 | `nat-transit` | IX / 落地侧 | WireGuard 监听 + Mimic + nft 转发至落地 + 生成接入码 |
 | `nat-ingress` | 公网入口 | 导入接入码 + WireGuard 接入 + Mimic + 对客户端开放入口端口 |
-| `exit` | 国外出口 B | WireGuard 监听 + swgp-go / Mimic 混淆 + 出网 NAT + 生成出口接入码 |
+| `exit` | 国外出口 B | WireGuard 监听 + Mimic 伪装 + 出网 NAT + 生成出口接入码 |
 | `relay` | 国内网关 A | 导入出口接入码 + 连接 B + 全局策略路由 + 客户端接入（生成二维码） |
 
-**接入码**（`WMGF1:` 前缀，`code_schema=6`）封装 WireGuard 组网密钥、虚拟 IP、端口、混淆参数（swgp 模式 / PSK / 端口）及落地与规则信息，由一端单向生成、另一端导入。
+**接入码**使用 `WMGF1:` 前缀：中转码为 schema 5，出口码为 schema 6，封装 WireGuard 组网密钥、虚拟 IP、端点、Mimic/direct 模式及规则信息。接入码由一端生成、另一端导入，应按私钥保护。
 
 ---
 
@@ -199,13 +186,13 @@ wm import-code
 
 ---
 
-## 场景二：混淆全局出口
+## 场景二：Mimic 全局出口
 
-适用于「国内网关 A → 国外出口 B 全局代理」：本地设备接入 A，全部流量经 `swgp+mimic` 混淆隧道由 B 出网。
+适用于「国内网关 A → 国外出口 B 全局代理」：本地设备接入 A，全部流量经 Mimic 伪装隧道由 B 出网；也可选择 `direct` 使用原生 WireGuard。
 
 ```text
 手机 / 电脑 ──[WG]──► 国内网关 A(relay)
-                        │  WG → swgp-go → Mimic（双层混淆，经公网连接 B 的 swgp 端口）
+                        │  WireGuard → Mimic（伪 TCP；可选 direct）
                         ▼
                      国外出口 B(exit) ──[出网 NAT]──► 互联网
 ```
@@ -215,10 +202,9 @@ wm import-code
 ```bash
 wm create-exit
 #   B 的公网 / 中转地址：B 的公网 IP 或域名（NAT 机器填中转入口 IP）
-#   WireGuard 监听端口：默认 51820（swgp 模式下为 B 本机内部端口，通常回车）
-#   混淆方式：swgp+mimic（推荐）
-#   swgp 对外端口（A 连接此端口）：NAT 机器须填写「转发段内的空闲端口」，请勿沿用默认 51821
-#   swgp 模式：zero-overhead-2026（默认）
+#   WireGuard 监听端口：默认 51820；NAT 机器须选择已转发的端口
+#   传输方式：mimic（推荐）或 direct
+#   IP 版本：4 / 6 / dual；脚本会据此给出 MTU 默认值
 #   其余回车 → 复制输出的 WMGF1: 出口接入码
 ```
 
@@ -232,7 +218,7 @@ wm import-exit-code
 wm test exit-relay        # 验证 A↔B：应为 0% 丢包、真实跨境 RTT 延迟
 ```
 
-> `wm test` 经隧道**实际 ping 对端 B**。若出现 100% 丢包，通常是 swgp 对外端口不在 B 的 NAT 转发段内——请更换一个**确认已转发**的空闲端口，在 B 上重新执行 `create-exit`，并在 A 上重新执行 `import-exit-code`。
+> `wm test` 经隧道**实际 ping 对端 B**。若出现 100% 丢包，先确认 B 的 WG 端口已被 NAT 转发并在云安全组放行；`mimic` 模式同时放行 TCP 与 UDP，`direct` 模式放行 UDP。修改后在 B 重新执行 `create-exit`，再在 A 重新导入。
 
 ### 3. 客户端（生成二维码）
 
@@ -304,6 +290,7 @@ wm autoswitch-disable <入口线路>
 - **落地 IPv6**：规则落地填写 IPv6 地址（如 `2606:4700::1111`），nft 自动采用 `ip6` DNAT / masquerade。
 - **落地域名**：填写域名即可，nft 渲染时自动解析（A / AAAA），并随 DDNS 刷新。
 - 规则协议族由落地地址族决定；MTU 建议 IPv6 / dual 使用 **1408**。
+- 全局出口的 `4 / 6 / dual` 指 A↔B 组网与公网端点偏好；当前客户端出网 NAT 为 IPv4。客户端配置仍接管 `::/0` 并在隧道内失败关闭，避免 IPv6 绕过出口泄漏真实地址。
 
 ---
 
@@ -348,11 +335,11 @@ wm health-all
 | `wm create-exit` / `import-exit-code` | 全局出口：B 创建混淆出口并生成接入码 / A 导入并建立隧道 |
 | `wm add-client <网关> <名>` | A：生成客户端 WireGuard 配置与二维码 |
 | `wm list-clients [网关]` / `del-client <网关> <名>` | 客户端列出 / 删除 |
-| `wm start\|stop\|restart [ID]` | 启停线路（两端均需 WG + Mimic） |
+| `wm start\|stop\|restart [ID]` | 启停线路（`mimic` 模式需 Mimic；`direct` 仅需 WG） |
 | `wm delete-line <ID>` | 删除整条线路（保留同机其余线路；`WMF_DELETE_YES=1` 跳过确认） |
-| `wm list-profiles` / `show-config [ID]` / `show-port-map [ID]` | 线路列表 / 配置 / 端口地图 |
-| `wm show-code [ID]` / `refresh-code [ID]` | 显示 / 按当前规则刷新接入码（不更换密钥，IX） |
-| `wm rotate-keys [ID]` | 轮换入口密钥并刷新接入码（密钥泄露时使用，将重启 IX） |
+| `wm list-profiles` / `show-config [ID]` / `show-port-map [ID]` | 线路列表 / 脱敏配置 / 端口地图 |
+| `wm show-code [ID]` / `refresh-code [ID]` | 显示 / 刷新中转或出口接入码（不更换密钥） |
+| `wm rotate-keys [ID]` | 轮换中转入口或出口 relay 密钥并刷新接入码（会重启线路） |
 | `wm list-rules\|add-rule\|edit-rule\|delete-rule\|enable-rule\|disable-rule\|apply-rules` | 规则管理 |
 | `wm set-pool <ID> [端口池]` | IX 中转端口池（如 18300-18399；留空以清除） |
 | `wm test [ID] [包数]` | 实测隧道丢包 / 延迟（判断中转质量） |
@@ -362,7 +349,7 @@ wm health-all
 | `wm set-group\|list-groups\|switch-line\|primary-backup-check\|health-all` | 主备 |
 | `wm health [ID]` / `diagnose [ID]` | 健康检查 / 诊断 |
 | `wm set-mtu <ID> <MTU>` / `automtu <ID>` / `set-xdp-mode <ID> [skb\|native]` | 调参 / 自动探测 MTU / XDP 模式 |
-| `wm install-all\|install-mimic\|install-swgp\|install-deps\|compat` | 安装 / 兼容性 |
+| `wm install-all\|install-mimic\|install-deps\|compat` | 安装 / 兼容性 |
 | `wm update-mimic [版本]` | 升级 mimic 至 apt 最新或指定版本（重载模块并重启线路） |
 | `wm upgrade-script` / `uninstall` / `purge` | 维护（`upgrade-script` 仅更新 wm 脚本，不改动 mimic） |
 
@@ -379,10 +366,10 @@ wm health-all
 
 | 现象 | 排查方向 |
 |------|----------|
-| WG 不握手（`wg show` 无 handshake） | 确认对端可达 `端点:WG端口`；**云安全组对 WG 端口需同时放行 TCP 与 UDP**；确认两端 Mimic 均为 active |
+| WG 不握手（`wg show` 无 handshake） | 确认对端可达 `端点:WG端口`；`mimic` 模式需同时放行 TCP 与 UDP，并确认两端 Mimic active；`direct` 模式只需 UDP |
 | **可连接但卡顿 / 客户端不显示延迟** | 多为**中转线路丢包**：执行 `wm test <ID>` 查看真实丢包；> 10% 时使用 `wm set-endpoint` 更换中转或启用 `autoswitch` |
-| 全局出口 `wm test` 100% 丢包 | swgp 对外端口不在 B 的 NAT 转发段内（A 报文无法抵达 B）→ 更换确认已转发的空闲端口重建 `create-exit`；执行 `ss -ulnp \| grep <端口>` 确认 B 是否正在监听 |
-| swgp `Exec format error` / 端口未监听 | 执行 `wm install-swgp`（v1.1.0 起自动校验 ELF 并自愈损坏二进制）；通过 `journalctl -u wg-mimic-swgp@<ID>` 查看启动日志 |
+| 全局出口 `wm test` 100% 丢包 | 确认 B 的 WG 端口位于 NAT 转发段并已放行；执行 `ss -ulnp \| grep <端口>` 确认监听，再检查两端 `mimic show <网卡>` |
+| 旧版出口接入码提示已移除组件 | 在 B 用当前版本重新执行 `wm create-exit`，然后在 A 重新执行 `wm import-exit-code`；旧码不会被静默降级 |
 | 隧道握手成功但 ping 不通（全局出口） | relay 全局出口需配置到对端 mesh IP 的隧道路由（v1.1.0 起自动添加）；`ip route get <对端mesh IP>` 应指向 `dev wm-<ID>` 而非物理网卡 |
 | 客户端已连接但不出网 | 确认 A 已启用 `ip_forward` 且 relay 出网 NAT 生效；通过 `curl ifconfig.me` 确认是否变更为 B 的 IP |
 | 新增客户端不显示二维码 | v1.1.0 起自动安装 `qrencode`；非 apt 环境直接复制 `.conf` 文本导入 App |
@@ -390,13 +377,14 @@ wm health-all
 | mimic 模块缺失 | 执行 `wm install-mimic`；Secure Boot 需入册 MOK；内核与头文件不匹配需 `reboot` |
 | MTU 异常 / 大包不通 | nft `forward` 链已自动对 MSS 进行钳制（跟随隧道 MTU）；仍异常时执行 `wm set-mtu <ID> 1380`（两端）或 `wm automtu <ID>` |
 
-诊断命令：`wm diagnose <ID>`（OS / 内核 / BTF / mimic / ip_forward 预检与 health）、`wm test <ID>`（隧道丢包）、`wg show`、`mimic show <网卡>`、`journalctl -u wg-mimic-swgp@<ID>`。
+诊断命令：`wm diagnose <ID>`（OS / 内核 / BTF / mimic / ip_forward 预检与 health）、`wm test <ID>`（隧道丢包）、`wg show`、`mimic show <网卡>`、`journalctl -u wg-mimic-mimic@<网卡>`。
 
 ---
 
 ## 安全
 
-- 接入码包含 WireGuard 组网私钥、混淆 PSK 与落地信息，**应按密钥同等对待、切勿公开**；泄露后使用 `wm rotate-keys` 轮换密钥并重新导入。
+- 接入码包含 WireGuard 组网私钥与落地信息，**应按密钥同等对待、切勿公开**；泄露后使用 `wm rotate-keys` 轮换密钥并重新导入。
+- `wm show-config` 默认隐藏私钥；仅在受控终端临时设置 `WMF_SHOW_SECRETS=1` 才显示完整内容。
 - 运行时密钥 / 配置 / 接入码存储于 `/etc/wg-mimic-fabric/`（不在仓库内）；本仓库不包含任何真实密钥或 IP。
 - 主备 / 中转切换为脚本管理的线路级操作，不接管全局防火墙；`wm` 仅维护自有的 nft 表 `wg_mimic_fabric`。
 - `wm purge` 将删除全部配置 / 密钥 / 接入码 / 服务（含 mimic 系统包，可通过 `WMF_PURGE_NO_MIMIC=1` 保留）。
@@ -407,15 +395,18 @@ wm health-all
 
 | 变量 | 说明 |
 |------|------|
-| `WMF_TAG=v1.3.5` | 安装 / 升级时指定版本 |
+| `WMF_TAG=v1.4.10` | 安装 / 升级时指定版本 |
 | `WMF_REPO` | GitHub 仓库（默认 `ike-sh/wg-mimic-fabric`） |
 | `WMF_SKIP_MIMIC=1` | 跳过 mimic 自动安装 |
 | `WMF_AUTO_MIMIC=0` | 执行 `install-wm-cli` 时不自动安装 mimic |
 | `WMF_UPGRADE_YES=1` / `WMF_PURGE_YES=1` / `WMF_UNINSTALL_YES=1` / `WMF_DELETE_YES=1` | 跳过相应确认 |
 | `WMF_PURGE_NO_MIMIC=1` | purge 时保留 mimic 系统包 |
-| `WMF_GITHUB_MIRRORS=url,...` | GitHub 下载镜像（适用于国内网络） |
+| `WMF_INSTALL_SHA256` | `install.sh` 的预期 SHA-256 |
+| `WMF_MIMIC_SHA256` / `WMF_MIMIC_DKMS_SHA256` | Mimic 资产的预期 SHA-256 |
+| `WMF_GITHUB_MIRRORS=url,...` | 自定义 GitHub 镜像；为防供应链降级，必须同时提供对应 SHA-256 |
+| `WMF_SHOW_SECRETS=1` | 允许 `show-config` 显示私钥（默认隐藏） |
 | `MIMIC_UPSTREAM_TAG` | 源码编译 mimic 的版本（默认 `v0.7.0`） |
-| `MIMIC_LOCAL_IP` | 覆盖 IX / 出口侧 Mimic 绑定的本机 IP |
+| `MIMIC_LOCAL_IP` | 覆盖 IX / 出口侧 Mimic 绑定的本机 IPv4 或 IPv6 |
 | `WMF_NO_OFFLOAD_DISABLE=1` | 跳过自动关闭网卡硬件 offload（默认会关闭以兼容 Mimic） |
 
 ---
