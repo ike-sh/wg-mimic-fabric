@@ -4,7 +4,7 @@
 
 | | |
 |------|------|
-| **版本** | `v1.4.10` |
+| **版本** | `v1.4.11` |
 | **仓库** | https://github.com/ike-sh/wg-mimic-fabric |
 | **许可** | MIT |
 
@@ -375,9 +375,32 @@ wm health-all
 | 新增客户端不显示二维码 | v1.1.0 起自动安装 `qrencode`；非 apt 环境直接复制 `.conf` 文本导入 App |
 | IX 侧 mimic 不匹配（`mimic show <网卡>` 无连接） | NAT 机器的 `filter = local=` 须使用网卡真实内网 IP（脚本自动处理）；可通过 `MIMIC_LOCAL_IP` 覆盖 |
 | mimic 模块缺失 | 执行 `wm install-mimic`；Secure Boot 需入册 MOK；内核与头文件不匹配需 `reboot` |
+| nft 启动等待 30 秒，隧道报 `dependency` | 升级至 v1.4.11，按下面的步骤恢复 failed 单元；修复说明与验证见 [nft 锁回归验证](docs/testing-nft-locks.md) |
 | MTU 异常 / 大包不通 | nft `forward` 链已自动对 MSS 进行钳制（跟随隧道 MTU）；仍异常时执行 `wm set-mtu <ID> 1380`（两端）或 `wm automtu <ID>` |
 
 诊断命令：`wm diagnose <ID>`（OS / 内核 / BTF / mimic / ip_forward 预检与 health）、`wm test <ID>`（隧道丢包）、`wg show`、`mimic show <网卡>`、`journalctl -u wg-mimic-mimic@<网卡>`。
+
+### 升级与 failed 状态恢复
+
+v1.4.11 修复 [Issue #1](https://github.com/ike-sh/wg-mimic-fabric/issues/1)：普通修改命令按「全局 state 锁 → nft 事务锁」执行；nft 服务仅用 root 内部入口获取 nft 锁。nft 锁在渲染、预检、持久化、加载及失败回滚全部结束后释放，随后才等待 systemd。隧道仍然强制依赖 nft 服务成功启动。
+
+以下命令在修复合入 `main` 后运行；发布 `v1.4.11` 标签后也可设置 `WMF_TAG=v1.4.11` 升级到该版本。旧版为 1.4.10，版本不同不会被「同版本跳过」挡住。
+
+```bash
+sudo env WMF_UPGRADE_YES=1 wm upgrade-script
+wm --version
+systemctl cat wg-mimic-nft.service  # ExecStart 应为 wm apply-nft-all --internal
+
+ID=你的线路ID
+sudo systemctl reset-failed wg-mimic-nft.service "wg-mimic-tunnel@${ID}.service"
+sudo systemctl start wg-mimic-nft.service
+sudo wm start "$ID"
+systemctl is-active wg-mimic-nft.service "wg-mimic-tunnel@${ID}.service"
+```
+
+升级会备份旧脚本，使用新脚本重新生成单元并执行 `daemon-reload`；保留线路、私钥、规则、接入码与 Mimic 组件。多线路逐个执行 `wm start <ID>`。若 nft 预检失败，先修复所报规则或 DNS 问题再重试；隧道不会跳过失败的依赖。启动失败才显示最近 20 条经过脱敏的 nft/tunnel 服务日志，并保留 systemctl 退出码和 ENABLED 回滚。
+
+回滚脚本时，从 `/var/backups/wg-mimic-fabric/install.sh.bak.*` 选择升级前备份，恢复到 `/usr/local/libexec/wg-mimic-fabric/install.sh` 后执行 `sudo wm refresh-installation`，使脚本与单元保持配套。回到 v1.4.10 会重新引入本问题；该版本需要先在外层 `wm` 之外执行 `sudo systemctl start wg-mimic-nft.service`，成功后再启动线路。回滚无需删除用户配置。
 
 ---
 
@@ -395,7 +418,7 @@ wm health-all
 
 | 变量 | 说明 |
 |------|------|
-| `WMF_TAG=v1.4.10` | 安装 / 升级时指定版本 |
+| `WMF_TAG=v1.4.11` | 安装 / 升级时指定版本 |
 | `WMF_REPO` | GitHub 仓库（默认 `ike-sh/wg-mimic-fabric`） |
 | `WMF_SKIP_MIMIC=1` | 跳过 mimic 自动安装 |
 | `WMF_AUTO_MIMIC=0` | 执行 `install-wm-cli` 时不自动安装 mimic |
@@ -405,6 +428,7 @@ wm health-all
 | `WMF_MIMIC_SHA256` / `WMF_MIMIC_DKMS_SHA256` | Mimic 资产的预期 SHA-256 |
 | `WMF_GITHUB_MIRRORS=url,...` | 自定义 GitHub 镜像；为防供应链降级，必须同时提供对应 SHA-256 |
 | `WMF_SHOW_SECRETS=1` | 允许 `show-config` 显示私钥（默认隐藏） |
+| `WMF_LOCK_TIMEOUT=30` / `WMF_NFT_LOCK_TIMEOUT=30` | 全局 state 锁 / nft 事务锁的等待秒数 |
 | `MIMIC_UPSTREAM_TAG` | 源码编译 mimic 的版本（默认 `v0.7.0`） |
 | `MIMIC_LOCAL_IP` | 覆盖 IX / 出口侧 Mimic 绑定的本机 IPv4 或 IPv6 |
 | `WMF_NO_OFFLOAD_DISABLE=1` | 跳过自动关闭网卡硬件 offload（默认会关闭以兼容 Mimic） |

@@ -2,6 +2,22 @@
 
 ## [Unreleased]
 
+## [1.4.11] - 2026-11-12
+
+### Fixed
+
+- 修复 [#1](https://github.com/ike-sh/wg-mimic-fabric/issues/1)：`wm start/restart/resume` 持有全局 state 锁等待 systemd 时，nft 服务通过严格匹配、仅限 root 的 `apply-nft-all --internal` 入口更新规则，消除依赖服务重入 state 锁造成的循环等待；保留 tunnel 的 `Requires` 与启动顺序。
+- 新增独立 nft 锁，覆盖完整的渲染、候选文件、table 判断、`nft -c`、持久化、`nft -f`、失败回滚及清理；普通 CLI 继续获取 state 和 nft 两把锁。配置写入/删除与渲染互斥，DDNS 缓存更新采用相同锁顺序。
+- 线路、规则和缓存文件原子替换；WireGuard、Mimic、systemd 单元与脚本更新也通过同目录 rename 发布，避免并发读取半写入文件。升级重新生成 nft 单元并执行 `daemon-reload`，保留用户数据。
+- 隧道启动失败时附加脱敏服务日志，保留原始退出码与 ENABLED 回滚；nft 事务在可捕获信号或文件操作失败后恢复持久化规则并清理临时文件。
+- 主备成员枚举显式返回成功，避免最后一条线路不属于该组时被严格模式误判为操作失败。
+
+### Tests
+
+- 新增真实跨进程 state/nft 锁、完整事务串行、配置快照、预检/加载/持久化失败与信号回滚测试，以及首次启动、failed 重试、restart、resume、多线路、DDNS、autoswitch、主备和 v1.4.10 升级回归。
+- 现有发行版 CI（含 Ubuntu 24.04、Debian 13）增加安装后的 smoke 回归与内部入口校验；真实 systemd/重启验证步骤见 `docs/testing-nft-locks.md`。
+- 新增隔离的 root 集成脚本和 Ubuntu 24.04 CI：真实 systemd、真实内核 nft/网络命名空间验证启动依赖、failed 重试、resume、并发与事务回滚；WireGuard 启动使用 stub，真实重启及端到端步骤另列。
+
 ## [1.4.10] - 2026-08-16
 
 ### Changed

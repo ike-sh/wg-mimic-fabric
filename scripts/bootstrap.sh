@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # One-line installer: curl -fsSL .../bootstrap.sh | sudo bash
-# Optional: WMF_TAG=v1.4.10 to pin a release
+# Optional: WMF_TAG=v1.4.11 to pin a release
 # Optional: WMF_SKIP_MIMIC=1 to skip mimic apt install
 set -euo pipefail
 

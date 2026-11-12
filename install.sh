@@ -2,7 +2,7 @@
 # wg-mimic-fabric — WireGuard + Mimic tunnel orchestrator (MVP)
 set -Eeuo pipefail
 
-SCRIPT_VERSION="1.4.10"
+SCRIPT_VERSION="1.4.11"
 MIMIC_UPSTREAM_TAG="${MIMIC_UPSTREAM_TAG:-v0.7.0}"
 
 CONFIG_DIR="/etc/wg-mimic-fabric"
@@ -34,6 +34,7 @@ CLIENT_SUBNET_DEFAULT="10.89.0.0/24"   # relay 客户端 WG 子网（A=.1，客�
 SYSTEMD_RESUME_SERVICE="/etc/systemd/system/wg-mimic-resume.service"
 RESUME_MARKER="${STATE_DIR}/resume.cmd"
 STATE_LOCK_FILE="/run/lock/wg-mimic-fabric.lock"
+NFT_LOCK_FILE="/run/lock/wg-mimic-fabric-nft.lock"
 MIMIC_SOURCE_MANIFEST="/var/lib/wg-mimic-fabric/mimic-source-files"
 
 # ── OS / kernel compatibility ──────────────────────────────────────────────
@@ -167,6 +168,22 @@ with_state_lock() {
     return "$_rc"
 }
 
+# Lock order: state -> nft. The systemd-only nft entry point takes just nft.
+# Also serialize short profile/rule/cache writes with rendering, so every pass
+# through the profiles sees the same complete files. Never wait for systemd here.
+# A subshell scopes the descriptor (including on exit/signals) and strict mode;
+# call it as a command, not a conditional, to retain Bash's errexit semantics.
+with_nft_lock() (
+    set -Eeuo pipefail
+    command_exists flock || die "缺少 flock（util-linux），无法安全更新 nftables"
+    local _nft_lock_fd
+    install -d -m 755 "$(dirname "$NFT_LOCK_FILE")" || exit $?
+    exec {_nft_lock_fd}>"$NFT_LOCK_FILE" || exit $?
+    flock -w "${WMF_NFT_LOCK_TIMEOUT:-30}" "$_nft_lock_fd" \
+        || die "另一个 nftables 事务正在运行，请稍后重试"
+    "$@"
+)
+
 trim() { local s="$1"; s="${s#"${s%%[![:space:]]*}"}"; s="${s%"${s##*[![:space:]]}"}"; printf '%s' "$s"; }
 
 sanitize_id() {
@@ -202,16 +219,29 @@ backup_file() {
     cp -a "$f" "${f}.bak.$(date +%Y%m%d%H%M%S)"
 }
 
+# Publish complete generated files on the destination filesystem. systemd can
+# read WG/Mimic configs or execute wm independently of the command state lock.
+write_generated_config() (
+    local output="$1" mode="$2"; shift 2
+    local staged; staged="$(mktemp "$(dirname "$output")/.wmf-config.XXXXXX")" || exit $?
+    trap 'rm -f "$staged" || true' EXIT
+    "$@" >"$staged" || exit $?
+    chmod "$mode" "$staged" || exit $?
+    mv -f "$staged" "$output" || exit $?
+)
+
 # ── profile env I/O ────────────────────────────────────────────────────────
 
 profile_env_path() { printf '%s/%s.env' "$PROFILES_DIR" "$(sanitize_id "$1")"; }
 
 write_profile_kv() {
+    with_nft_lock write_profile_kv_unlocked "$@"
+}
+
+# Same-directory rename keeps readers from observing a truncated env file.
+write_profile_kv_unlocked() {
     local path="$1"; shift
-    local tmp; tmp="$(mktemp)"
-    printf '%s\n' "$@" >"$tmp"
-    install -m 600 "$tmp" "$path"
-    rm -f "$tmp"
+    write_generated_config "$path" 600 printf '%s\n' "$@"
 }
 
 # Safely load KEY=VALUE pairs from a generated env file WITHOUT executing it.
@@ -644,10 +674,7 @@ write_rule() {
     local pid="$1" rid="$2"; shift 2
     local d; d="$(rules_dir_for "$pid")"
     install -d -m 700 "$d"
-    local tmp; tmp="$(mktemp)"
-    printf '%s\n' "$@" >"$tmp"
-    install -m 600 "$tmp" "$(rule_env_path "$pid" "$rid")"
-    rm -f "$tmp"
+    write_profile_kv "$(rule_env_path "$pid" "$rid")" "$@"
 }
 
 generate_unique_rule_id() {
@@ -1004,7 +1031,7 @@ ExecStart=${WM_BIN} resume
 [Install]
 WantedBy=multi-user.target
 EOF
-    install -m 644 "$tmp" "$SYSTEMD_RESUME_SERVICE"
+    write_generated_config "$SYSTEMD_RESUME_SERVICE" 644 cat "$tmp"
     rm -f "$tmp"
     systemctl daemon-reload
     systemctl enable wg-mimic-resume.service
@@ -1233,7 +1260,7 @@ upgrade_script() {
     fi
     install -d -m 755 "$BACKUP_DIR"
     [[ -f "$WM_CLI_INSTALL_SH" ]] && cp -a "$WM_CLI_INSTALL_SH" "${BACKUP_DIR}/install.sh.bak.$(date +%Y%m%d%H%M%S)"
-    install -m 755 "$tmp" "$WM_CLI_INSTALL_SH"
+    write_generated_config "$WM_CLI_INSTALL_SH" 755 cat "$tmp"
     rm -f "$tmp"
     # 由刚下载的新脚本刷新包装器和 systemd 单元，避免只替换脚本却继续运行旧单元。
     WMF_LOCK_HELD=1 "$WM_CLI_INSTALL_SH" refresh-installation
@@ -1251,15 +1278,14 @@ ddns_state_get() {
 }
 
 ddns_state_set() {
+    with_nft_lock ddns_state_set_unlocked "$@"
+}
+
+# Rendering already owns the nft lock; never recursively acquire it.
+ddns_state_set_unlocked() {
     local k="$1" v="$2" f; f="$(ddns_state_file)"
     install -d -m 700 "$STATE_DIR"
-    [[ -f "$f" ]] || : >"$f"
-    if grep -q "^${k}=" "$f" 2>/dev/null; then
-        sed -i "s|^${k}=.*|${k}=${v}|" "$f"
-    else
-        printf '%s=%s\n' "$k" "$v" >>"$f"
-    fi
-    chmod 600 "$f"
+    set_or_append_kv_unlocked "$f" "$k" "$v"
 }
 
 # Re-resolve dialing-side WG endpoints; on change update the live peer endpoint
@@ -1320,7 +1346,7 @@ Wants=network-online.target
 Type=oneshot
 ExecStart=${WM_BIN} ddns-refresh
 EOF
-    install -m 644 "$tmp" "$SYSTEMD_DDNS_SERVICE"
+    write_generated_config "$SYSTEMD_DDNS_SERVICE" 644 cat "$tmp"
     cat >"$tmp" <<'EOF'
 [Unit]
 Description=wg-mimic-fabric DDNS timer
@@ -1332,7 +1358,7 @@ OnUnitActiveSec=3min
 [Install]
 WantedBy=timers.target
 EOF
-    install -m 644 "$tmp" "$SYSTEMD_DDNS_TIMER"
+    write_generated_config "$SYSTEMD_DDNS_TIMER" 644 cat "$tmp"
     rm -f "$tmp"
     systemctl daemon-reload 2>/dev/null || true
 }
@@ -1362,13 +1388,21 @@ ddns_status() {
 # ── 主备（手动切换，对标 ix-transit「不自动切换」安全边界）─────────────────────
 
 set_or_append_kv() {
-    local f="$1" k="$2" v="$3"
-    if grep -q "^${k}=" "$f" 2>/dev/null; then
-        sed -i "s|^${k}=.*|${k}=${v}|" "$f"
-    else
-        printf '%s=%s\n' "$k" "$v" >>"$f"
-    fi
+    with_nft_lock set_or_append_kv_unlocked "$@"
 }
+
+set_or_append_kv_unlocked() (
+    local f="$1" k="$2" v="$3"
+    local tmp; tmp="$(mktemp "$(dirname "$f")/.wmf-env.XXXXXX")" || exit $?
+    trap 'rm -f "$tmp"' EXIT
+    if [[ -f "$f" ]]; then
+        # Literal matching also handles DDNS keys containing ':' or '.'.
+        awk -v key="$k" 'index($0, key "=") != 1' "$f" >"$tmp" || exit $?
+    fi
+    printf '%s=%s\n' "$k" "$v" >>"$tmp" || exit $?
+    chmod 600 "$tmp" || exit $?
+    mv -f "$tmp" "$f" || exit $?
+)
 
 group_members() {
     local grp="$1" p
@@ -1380,6 +1414,7 @@ group_members() {
             [[ "${LINE_GROUP:-}" == "$grp" ]] && printf '%s\n' "$PROFILE_ID"
         )
     done
+    return 0
 }
 
 set_line_group() {
@@ -1562,8 +1597,7 @@ write_mimic_xdp_env() {
     local envf="${MIMIC_CONF_DIR}/${iface}.xdp" mode
     mode="$(iface_xdp_mode "$iface")"
     if [[ "$mode" == "skb" || "$mode" == "native" ]]; then
-        printf 'MIMIC_XDP_ARGS=-x %s\n' "$mode" >"$envf"
-        chmod 644 "$envf" 2>/dev/null || true
+        write_generated_config "$envf" 644 printf 'MIMIC_XDP_ARGS=-x %s\n' "$mode"
     else
         rm -f "$envf"
     fi
@@ -1574,8 +1608,7 @@ apply_mimic_conf_iface() {
     [[ -n "$iface" ]] || die "WAN_IFACE 不能为空"
     local path="${MIMIC_CONF_DIR}/${iface}.conf"
     backup_file "$path"
-    render_mimic_conf_iface "$iface" >"$path"
-    chmod 644 "$path"
+    write_generated_config "$path" 644 render_mimic_conf_iface "$iface"
     write_mimic_xdp_env "$iface"
 }
 
@@ -1692,8 +1725,7 @@ apply_profile_configs() {
     local wg_iface; wg_iface="$(wg_iface_for "$PROFILE_ID")"
     local wg_path="${WG_CONF_DIR}/${wg_iface}.conf"
     backup_file "$wg_path"
-    render_wg_conf >"$wg_path"
-    chmod 600 "$wg_path"
+    write_generated_config "$wg_path" 600 render_wg_conf
     if obfs_has_mimic; then
         write_tunnel_dropin "$PROFILE_ID" "$WAN_IFACE" true
     else
@@ -1728,7 +1760,7 @@ collect_dnat_entries() {
                     cache_key="landing:${PROFILE_ID}:${rid}"
                     landing_ip="$(resolve_host_ip "$LANDING_HOST")"
                     if [[ -n "$landing_ip" ]]; then
-                        ddns_state_set "$cache_key" "$landing_ip"
+                        ddns_state_set_unlocked "$cache_key" "$landing_ip"
                     else
                         cached_ip="$(ddns_state_get "$cache_key")"
                         if [[ -z "$cached_ip" ]]; then
@@ -1902,42 +1934,70 @@ render_nft_all() {
 }
 
 apply_nft_all() {
-    local candidate transaction previous="" had_table=0 rc=0
-    install -d -m 755 "$NFT_DIR"
+    with_nft_lock apply_nft_all_unlocked
+}
+
+apply_nft_all_unlocked() (
+    # shellcheck disable=SC2034 # read by the EXIT trap
+    local candidate="" transaction="" previous="" had_table=0 publishing=0 committed=0
+    # Roll back disk state and clean up *before* the enclosing nft lock is closed,
+    # including early filesystem failures, errexit, and catchable signals.
+    trap '
+        rc=$?
+        trap - EXIT
+        if (( publishing == 1 && committed == 0 )); then
+            if [[ -n "$previous" ]]; then
+                mv -f "$previous" "$NFT_FILE" || warn "恢复 nft 持久化文件失败；旧文件保留于 ${previous}"
+            else
+                rm -f "$NFT_FILE" || warn "移除未提交的 nft 持久化文件失败"
+            fi
+        fi
+        rm -f "$candidate" "$transaction" || warn "清理 nft 临时文件失败"
+        if (( committed == 1 || publishing == 0 )); then
+            rm -f "$previous" || warn "清理 nft 回滚文件失败"
+        fi
+        if (( rc != 0 )); then warn "nftables 事务失败（退出码 ${rc}）；未提交新规则"; fi
+        exit "$rc"
+    ' EXIT
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    install -d -m 755 "$NFT_DIR" || exit $?
     # 与最终文件位于同一文件系统，成功加载后可原子替换持久化规则。
-    candidate="$(mktemp "${NFT_DIR}/.wg-mimic-fabric.XXXXXX")"
-    transaction="$(mktemp)"
+    candidate="$(mktemp "${NFT_DIR}/.wg-mimic-fabric.XXXXXX")" || exit $?
+    transaction="$(mktemp)" || exit $?
     if ! render_nft_all >"$candidate"; then
-        rm -f "$candidate" "$transaction"
         die "nftables 规则生成失败；未修改现有规则"
     fi
-    chmod 644 "$candidate"
+    chmod 644 "$candidate" || exit $?
     if nft list table inet "$NFT_TABLE" >/dev/null 2>&1; then
         had_table=1
     fi
     {
         (( had_table == 1 )) && printf 'delete table inet %s\n' "$NFT_TABLE"
         cat "$candidate"
-    } >"$transaction"
+    } >"$transaction" || exit $?
     # `nft -c` and the real load both evaluate one transaction. A parse/evaluation
     # failure therefore leaves the currently active table untouched.
-    nft -c -f "$transaction" >/dev/null 2>&1 || rc=$?
-    if (( rc == 0 )) && [[ -f "$NFT_FILE" ]]; then
-        previous="$(mktemp "${NFT_DIR}/.wg-mimic-fabric.previous.XXXXXX")"
-        cp -a "$NFT_FILE" "$previous" || rc=$?
+    nft -c -f "$transaction" >/dev/null 2>&1 || exit $?
+    if [[ -f "$NFT_FILE" ]]; then
+        previous="$(mktemp "${NFT_DIR}/.wg-mimic-fabric.previous.XXXXXX")" || exit $?
+        cp -a "$NFT_FILE" "$previous" || exit $?
     fi
     # 先确认持久化文件可原子替换，再加载 live transaction；live 加载失败时恢复旧文件。
-    if (( rc == 0 )); then mv -f "$candidate" "$NFT_FILE" || rc=$?; fi
-    if (( rc == 0 )); then nft -f "$transaction" >/dev/null 2>&1 || rc=$?; fi
-    if (( rc != 0 )); then
-        if [[ -n "$previous" && -f "$previous" ]]; then
-            mv -f "$previous" "$NFT_FILE" 2>/dev/null || true
-        elif [[ ! -f "$candidate" ]]; then
-            rm -f "$NFT_FILE"
-        fi
+    # shellcheck disable=SC2034
+    publishing=1
+    mv -f "$candidate" "$NFT_FILE" || exit $?
+    nft -f "$transaction" >/dev/null 2>&1 || exit $?
+    # shellcheck disable=SC2034
+    committed=1
+)
+
+remove_nft_state() {
+    if nft list table inet "$NFT_TABLE" >/dev/null 2>&1; then
+        nft delete table inet "$NFT_TABLE" 2>/dev/null || true
     fi
-    rm -f "$candidate" "$transaction" "$previous"
-    (( rc == 0 )) || die "nftables 规则生成/持久化/加载失败；旧规则已保留（执行 nft -c -f 排查）"
+    rm -f "$NFT_FILE"
 }
 
 # ── systemd ────────────────────────────────────────────────────────────────
@@ -1980,7 +2040,7 @@ RestartSec=3
 [Install]
 WantedBy=multi-user.target
 EOF
-    install -m 644 "$tmp" "$SYSTEMD_MIMIC_TEMPLATE"
+    write_generated_config "$SYSTEMD_MIMIC_TEMPLATE" 644 cat "$tmp"
 
     cat >"$tmp" <<EOF
 [Unit]
@@ -1998,7 +2058,7 @@ ExecStop=${wgquick_bin} down /etc/wireguard/wm-%i.conf
 [Install]
 WantedBy=multi-user.target
 EOF
-    install -m 644 "$tmp" "$SYSTEMD_TUNNEL_TEMPLATE"
+    write_generated_config "$SYSTEMD_TUNNEL_TEMPLATE" 644 cat "$tmp"
 
     cat >"$tmp" <<EOF
 [Unit]
@@ -2009,13 +2069,13 @@ Before=wg-mimic-tunnel@.service
 
 [Service]
 Type=oneshot
-ExecStart=${WM_BIN} apply-nft-all
+ExecStart=${WM_BIN} apply-nft-all --internal
 RemainAfterExit=yes
 
 [Install]
 WantedBy=multi-user.target
 EOF
-    install -m 644 "$tmp" "$SYSTEMD_NFT_SERVICE"
+    write_generated_config "$SYSTEMD_NFT_SERVICE" 644 cat "$tmp"
 
     # NIC hardware-offload disable, keyed by interface (%i), bound to the NIC device
     # so it re-applies on every boot AND on NIC unplug/replug. Mimic rewrites packets
@@ -2042,7 +2102,7 @@ ExecStart=-${ethtool_bin} -K %i rx off
 [Install]
 WantedBy=sys-subsystem-net-devices-%i.device
 EOF
-    install -m 644 "$tmp" "$SYSTEMD_OFFLOAD_TEMPLATE"
+    write_generated_config "$SYSTEMD_OFFLOAD_TEMPLATE" 644 cat "$tmp"
     rm -f "$tmp"
     systemctl daemon-reload
 }
@@ -2078,7 +2138,7 @@ ExecStop=
 ExecStop=${wgq} down ${WG_CONF_DIR}/${wgi}.conf
 EOF
     install -d -m 755 "$dir"
-    install -m 644 "$tmp" "${dir}/10-profile.conf"
+    write_generated_config "${dir}/10-profile.conf" 644 cat "$tmp"
     rm -f "${dir}/10-mimic-dep.conf"
     rm -f "$tmp"
     systemctl daemon-reload
@@ -2228,11 +2288,17 @@ ensure_mimic_service_up() {
 
 set_profile_enabled_value() {
     local path="$1" value="$2"
-    if grep -q '^ENABLED=' "$path" 2>/dev/null; then
-        sed -i "s/^ENABLED=.*/ENABLED=${value}/" "$path"
-    else
-        printf 'ENABLED=%s\n' "$value" >>"$path"
-    fi
+    set_or_append_kv "$path" ENABLED "$value"
+}
+
+show_tunnel_failure_logs() {
+    local profile_id="$1"
+    warn "隧道或 nft 依赖启动失败；最近的服务日志（敏感字段已隐藏）："
+    journalctl -u wg-mimic-nft.service -u "wg-mimic-tunnel@${profile_id}.service" \
+        -n 20 --no-pager -o cat 2>/dev/null \
+        | sed -E '/(private[_ -]?key|privkey|preshared[_ -]?key|接入码)/Is/.*/<redacted sensitive journal entry>/;
+                  s/WMGF1:[A-Za-z0-9_=-]+/WMGF1:<redacted>/g;
+                  s/[A-Za-z0-9+\/_-]{43,}={0,2}/<redacted-key>/g' >&2 || true
 }
 
 start_profile() {
@@ -2260,7 +2326,11 @@ start_profile() {
         if obfs_has_mimic; then ensure_mimic_service_up "$WAN_IFACE" || exit $?; fi
         # restart 显式拉起隧道；enable 仅保证开机自启。
         systemctl enable "wg-mimic-tunnel@${PROFILE_ID}.service" || exit $?
-        systemctl restart "wg-mimic-tunnel@${PROFILE_ID}.service" || exit $?
+        systemctl restart "wg-mimic-tunnel@${PROFILE_ID}.service" || {
+            rc=$?
+            show_tunnel_failure_logs "$PROFILE_ID"
+            exit "$rc"
+        }
     )
     rc=$?
     set -e
@@ -2272,7 +2342,9 @@ start_profile() {
             ( set -Eeuo pipefail; apply_mimic_conf_iface "$iface" ) \
                 || warn "回滚线路状态时 Mimic 配置重建失败"
         fi
-        die "线路 ${profile_id} 启动失败，ENABLED 状态已回滚为 ${previous_enabled}"
+        printf '[ERROR] 线路 %s 启动失败（退出码 %s），ENABLED 状态已回滚为 %s\n' \
+            "$profile_id" "$rc" "$previous_enabled" >&2
+        return "$rc"
     fi
     load_profile "$profile_id"
     ok "已启动线路：${PROFILE_ID} (${ROLE:-})"
@@ -2341,9 +2413,9 @@ delete_profile() {
     load_profile "$id" 2>/dev/null || true
     local iface="${WAN_IFACE:-}" wgi; wgi="$(wg_iface_for "$id")"
     systemctl disable --now "wg-mimic-tunnel@${id}.service" 2>/dev/null || true
-    rm -f "$(profile_env_path "$id")" "${WG_CONF_DIR}/${wgi}.conf" \
+    with_nft_lock rm -f "$(profile_env_path "$id")" "${WG_CONF_DIR}/${wgi}.conf" \
         "${CODES_DIR}/${id}.code"
-    rm -rf "${PROFILES_DIR:?}/${id:?}"
+    with_nft_lock rm -rf "${PROFILES_DIR:?}/${id:?}"
     remove_tunnel_dropin "$id"
     systemctl daemon-reload
     apply_nft_all
@@ -2949,7 +3021,7 @@ import_code_interactive() {
         for _old_rid in $(list_rule_ids "$ingress_id"); do
             case " $_new_ids " in
                 *" $_old_rid "*) : ;;
-                *) rm -f "$(rule_env_path "$ingress_id" "$_old_rid")"; info "移除 IX 已删规则：${_old_rid}" ;;
+                *) with_nft_lock rm -f "$(rule_env_path "$ingress_id" "$_old_rid")"; info "移除 IX 已删规则：${_old_rid}" ;;
             esac
         done
     fi
@@ -3139,7 +3211,7 @@ delete_rule() {
     load_profile "$id"
     local p; p="$(rule_env_path "$PROFILE_ID" "$rid")"
     [[ -f "$p" ]] || die "规则不存在：$rid"
-    rm -f "$p"
+    with_nft_lock rm -f "$p"
     apply_nft_all
     regenerate_code_if_transit
     ok "已删除规则 ${rid}"
@@ -3152,11 +3224,7 @@ set_rule_enabled() {
     load_profile "$id"
     local p; p="$(rule_env_path "$PROFILE_ID" "$rid")"
     [[ -f "$p" ]] || die "规则不存在：$rid"
-    if grep -q '^RULE_ENABLED=' "$p"; then
-        sed -i "s/^RULE_ENABLED=.*/RULE_ENABLED=${val}/" "$p"
-    else
-        printf 'RULE_ENABLED=%s\n' "$val" >>"$p"
-    fi
+    set_or_append_kv "$p" RULE_ENABLED "$val"
     apply_nft_all
     regenerate_code_if_transit
     ok "规则 ${rid} enabled=${val}"
@@ -3374,12 +3442,8 @@ rotate_keys() {
     ing_priv="$(wg_genkey)"; ing_pub="$(wg_pubkey_of "$ing_priv")"
     ing_priv_b64="$(printf '%s' "$ing_priv" | base64url_encode)"
     path="$(profile_env_path "$PROFILE_ID")"
-    sed -i "s|^WG_PEER_PUBLIC_KEY=.*|WG_PEER_PUBLIC_KEY=${ing_pub}|" "$path"
-    if grep -q '^INGRESS_PRIVKEY_B64=' "$path"; then
-        sed -i "s|^INGRESS_PRIVKEY_B64=.*|INGRESS_PRIVKEY_B64=${ing_priv_b64}|" "$path"
-    else
-        printf 'INGRESS_PRIVKEY_B64=%s\n' "$ing_priv_b64" >>"$path"
-    fi
+    set_or_append_kv "$path" WG_PEER_PUBLIC_KEY "$ing_pub"
+    set_or_append_kv "$path" INGRESS_PRIVKEY_B64 "$ing_priv_b64"
     load_profile "$id"
     apply_profile_configs
     # 关键：apply_profile_configs 只重写 conf 文件，不会动正在运行的接口。轮换换掉了
@@ -3537,7 +3601,7 @@ Wants=network-online.target
 Type=oneshot
 ExecStart=${WM_BIN} autoswitch %i
 EOF
-    install -m 644 "$tmp" "$SYSTEMD_AUTOSWITCH_SERVICE"
+    write_generated_config "$SYSTEMD_AUTOSWITCH_SERVICE" 644 cat "$tmp"
     cat >"$tmp" <<'EOF'
 [Unit]
 Description=wg-mimic-fabric autoswitch timer %i
@@ -3549,7 +3613,7 @@ OnUnitActiveSec=5min
 [Install]
 WantedBy=timers.target
 EOF
-    install -m 644 "$tmp" "$SYSTEMD_AUTOSWITCH_TIMER"
+    write_generated_config "$SYSTEMD_AUTOSWITCH_TIMER" 644 cat "$tmp"
     rm -f "$tmp"
     systemctl daemon-reload 2>/dev/null || true
 }
@@ -3577,7 +3641,7 @@ set_profile_mtu() {
     validate_mtu "$mtu"
     require_root
     load_profile "$id"
-    sed -i "s/^WG_MTU=.*/WG_MTU=${mtu}/" "$(profile_env_path "$id")"
+    set_or_append_kv "$(profile_env_path "$id")" WG_MTU "$mtu"
     load_profile "$id"
     apply_profile_configs
     if systemctl is-active --quiet "wg-mimic-tunnel@${PROFILE_ID}.service" 2>/dev/null; then
@@ -3663,13 +3727,9 @@ set_profile_xdp_mode() {
     load_profile "$id"
     if [[ -n "$mode" ]]; then
         [[ "$mode" == "skb" || "$mode" == "native" ]] || die "xdp_mode 只能是 skb 或 native"
-        if grep -q '^MIMIC_XDP_MODE=' "$(profile_env_path "$id")"; then
-            sed -i "s/^MIMIC_XDP_MODE=.*/MIMIC_XDP_MODE=${mode}/" "$(profile_env_path "$id")"
-        else
-            echo "MIMIC_XDP_MODE=${mode}" >>"$(profile_env_path "$id")"
-        fi
+        set_or_append_kv "$(profile_env_path "$id")" MIMIC_XDP_MODE "$mode"
     else
-        sed -i '/^MIMIC_XDP_MODE=/d' "$(profile_env_path "$id")"
+        with_nft_lock sed -i '/^MIMIC_XDP_MODE=/d' "$(profile_env_path "$id")"
     fi
     load_profile "$id"
     apply_profile_configs
@@ -4142,13 +4202,12 @@ uninstall_wm_core() {
         fi
     done
     if [[ "$remove_configs" == "true" ]]; then
-        if nft list table inet "$NFT_TABLE" >/dev/null 2>&1; then
-            nft delete table inet "$NFT_TABLE" 2>/dev/null || true
-        fi
-        rm -f "$NFT_FILE" "$SYSCTL_FILE"
+        with_nft_lock remove_nft_state
+        rm -f "$SYSCTL_FILE"
         # 清理本工具写入 /etc/mimic 的 .conf / .xdp（否则随后 dpkg purge mimic 会报「目录非空未删」）
         rm -f "${MIMIC_CONF_DIR}"/*.conf "${MIMIC_CONF_DIR}"/*.xdp 2>/dev/null || true
-        rm -rf "$CONFIG_DIR" "$LIBEXEC_DIR"
+        with_nft_lock rm -rf "$CONFIG_DIR"
+        rm -rf "$LIBEXEC_DIR"
     fi
     systemctl disable --now wg-mimic-ddns.timer 2>/dev/null || true
     systemctl disable wg-mimic-resume.service 2>/dev/null || true
@@ -4214,11 +4273,10 @@ refresh_installation() {
     install_runtime_packages
     ensure_dirs
     install -d -m 755 "$LIBEXEC_DIR"
-    cat >"$WM_BIN" <<'WRAP'
+    write_generated_config "$WM_BIN" 755 cat <<'WRAP'
 #!/usr/bin/env bash
 exec /usr/local/libexec/wg-mimic-fabric/install.sh "$@"
 WRAP
-    chmod 755 "$WM_BIN"
     ensure_cli_aliases
     install_systemd_units
     systemctl enable wg-mimic-nft.service
@@ -4231,7 +4289,7 @@ install_wm_cli() {
     ensure_dirs
     install -d -m 755 "$LIBEXEC_DIR"
     if [[ "$(readlink -f "$0")" != "$(readlink -f "$WM_CLI_INSTALL_SH" 2>/dev/null || printf '%s' "$WM_CLI_INSTALL_SH")" ]]; then
-        install -m 755 "$0" "$WM_CLI_INSTALL_SH"
+        write_generated_config "$WM_CLI_INSTALL_SH" 755 cat "$0"
     fi
     refresh_installation
     ok "已安装 wm 命令：$WM_BIN（含大写别名 WM）"
@@ -4286,7 +4344,7 @@ wg-mimic-fabric ${SCRIPT_VERSION} — 公网入口 ⇄ IX WireGuard 组网 + Mim
 架构: 客户端 → 公网入口:client_port → WG(Mimic 伪TCP) → IX 虚拟IP:transit_port → 落地
 
 环境变量:
-  WMF_TAG=v1.4.10                 安装/升级时指定版本
+  WMF_TAG=v1.4.11                 安装/升级时指定版本
   WMF_REPO=ike-sh/wg-mimic-fabric GitHub 仓库
   WMF_UPGRADE_YES=1               升级跳过确认
   WMF_PURGE_YES=1                 purge 跳过确认
@@ -4299,6 +4357,8 @@ wg-mimic-fabric ${SCRIPT_VERSION} — 公网入口 ⇄ IX WireGuard 组网 + Mim
   WMF_MIMIC_DKMS_SHA256=<sha256>   Mimic DKMS 包期望哈希
   WMF_GITHUB_MIRRORS=url,...       GitHub 镜像（必须同时提供对应 SHA256）
   WMF_SHOW_SECRETS=1               show-config 显示私钥（默认隐藏）
+  WMF_LOCK_TIMEOUT=30              全局状态锁等待秒数
+  WMF_NFT_LOCK_TIMEOUT=30          nft 事务锁等待秒数
 EOF
 }
 
@@ -4451,6 +4511,16 @@ MENU
 
 main() {
     local cmd="${1:-}"
+    # Only this exact, root-only operation may bypass the state lock. In
+    # particular, --internal is never a global flag and never sets WMF_LOCK_HELD.
+    if [[ "$cmd" == "apply-nft-all" ]]; then
+        if (( $# == 2 )) && [[ "$2" == "--internal" ]]; then
+            require_root
+            apply_nft_all
+            return
+        fi
+        (( $# == 1 )) || die "用法: wm apply-nft-all [--internal]"
+    fi
     if [[ "${WMF_LOCK_HELD:-}" != "1" ]]; then
         case "$cmd" in
             install-wm-cli|refresh-installation|install-mimic|update-mimic|install-all|resume|create-transit|import-code|create-exit|import-exit-code|\
