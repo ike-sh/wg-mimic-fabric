@@ -51,7 +51,7 @@ CI 在 Ubuntu 24.04 VM 单独执行该脚本。该测试不执行真实 reboot�
 
 分别在 Ubuntu 24.04、Debian 13 的测试虚拟机执行。准备至少两条有效线路，涵盖四种角色、Mimic/direct、IPv4/双栈；验证 MTU、接入码、客户端、DNAT/MASQUERADE 和对端连通性。下面的停止、失败注入、切换与重启会中断测试线路。
 
-先安装本分支的 `install.sh`（`sudo bash install.sh install-wm-cli`），确认 `wm --version` 为 `1.4.11`，`systemctl cat wg-mimic-nft.service` 包含 `apply-nft-all --internal`，tunnel 保留 Requires/After。以下命令在 root Bash 中执行：
+先安装本分支的 `install.sh`（`sudo bash install.sh install-wm-cli`），确认 `wm --version` 为 `1.4.12`，`systemctl cat wg-mimic-nft.service` 包含 `apply-nft-all --internal`，tunnel 保留 Requires/After。以下命令在 root Bash 中执行：
 
 ```bash
 ID=测试线路ID

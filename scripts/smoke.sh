@@ -866,13 +866,13 @@ test_upgrade_nft_unit() (
     install_systemd_units
     sed -i 's/apply-nft-all --internal/apply-nft-all/' "$SYSTEMD_NFT_SERVICE"
     install -m 755 "$WMF_TEST_DRIVER" "$WM_CLI_INSTALL_SH"
-    sed -i 's/^SCRIPT_VERSION="1.4.11"/SCRIPT_VERSION="1.4.10"/' "$WM_CLI_INSTALL_SH"
+    sed -i 's/^SCRIPT_VERSION="1.4.12"/SCRIPT_VERSION="1.4.10"/' "$WM_CLI_INSTALL_SH"
     # Restore the v1.4.10 upgrade body: its install command is the only
     # difference from the new upgrade_script function. Refresh runs new code.
     sed -i 's/write_generated_config "$WM_CLI_INSTALL_SH" 755 cat "$tmp"/install -m 755 "$tmp" "$WM_CLI_INSTALL_SH"/' "$WM_CLI_INSTALL_SH"
     : >"$WMF_TEST_ROOT/systemctl.calls"
     WMF_UPGRADE_YES=1 timeout 4 "$WM_CLI_INSTALL_SH" upgrade-script >/dev/null 2>&1
-    grep -qx 'SCRIPT_VERSION="1.4.11"' "$WM_CLI_INSTALL_SH" || fail "old version skipped upgrade"
+    grep -qx 'SCRIPT_VERSION="1.4.12"' "$WM_CLI_INSTALL_SH" || fail "old version skipped upgrade"
     grep -q '^ExecStart=.*/wm apply-nft-all --internal$' "$SYSTEMD_NFT_SERVICE" || fail "upgrade kept old nft entry"
     grep -qx 'Requires=wg-mimic-nft.service' "$SYSTEMD_TUNNEL_TEMPLATE" || fail "upgrade weakened nft dependency"
     grep -qx 'daemon-reload' "$WMF_TEST_ROOT/systemctl.calls" || fail "upgrade did not reload systemd"

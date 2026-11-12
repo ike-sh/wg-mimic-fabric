@@ -4,7 +4,7 @@
 
 | | |
 |------|------|
-| **版本** | `v1.4.11` |
+| **版本** | `v1.4.12` |
 | **仓库** | https://github.com/ike-sh/wg-mimic-fabric |
 | **许可** | MIT |
 
@@ -16,6 +16,12 @@
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/ike-sh/wg-mimic-fabric/main/scripts/bootstrap.sh | sudo bash
+```
+
+固定安装 `v1.4.12`：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/ike-sh/wg-mimic-fabric/v1.4.12/scripts/bootstrap.sh | sudo env WMF_TAG=v1.4.12 bash
 ```
 
 安装完成后运行 `wm` 进入交互菜单，按下文 [场景一：IX 中转组网](#场景一ix-中转组网) 或 [场景二：混淆全局出口](#场景二混淆全局出口) 操作；升级使用 `wm upgrade-script`。
@@ -375,7 +381,7 @@ wm health-all
 | 新增客户端不显示二维码 | v1.1.0 起自动安装 `qrencode`；非 apt 环境直接复制 `.conf` 文本导入 App |
 | IX 侧 mimic 不匹配（`mimic show <网卡>` 无连接） | NAT 机器的 `filter = local=` 须使用网卡真实内网 IP（脚本自动处理）；可通过 `MIMIC_LOCAL_IP` 覆盖 |
 | mimic 模块缺失 | 执行 `wm install-mimic`；Secure Boot 需入册 MOK；内核与头文件不匹配需 `reboot` |
-| nft 启动等待 30 秒，隧道报 `dependency` | 升级至 v1.4.11，按下面的步骤恢复 failed 单元；修复说明与验证见 [nft 锁回归验证](docs/testing-nft-locks.md) |
+| nft 启动等待 30 秒，隧道报 `dependency` | 升级至 v1.4.12，按下面的步骤恢复 failed 单元；修复说明与验证见 [nft 锁回归验证](docs/testing-nft-locks.md) |
 | MTU 异常 / 大包不通 | nft `forward` 链已自动对 MSS 进行钳制（跟随隧道 MTU）；仍异常时执行 `wm set-mtu <ID> 1380`（两端）或 `wm automtu <ID>` |
 
 诊断命令：`wm diagnose <ID>`（OS / 内核 / BTF / mimic / ip_forward 预检与 health）、`wm test <ID>`（隧道丢包）、`wg show`、`mimic show <网卡>`、`journalctl -u wg-mimic-mimic@<网卡>`。
@@ -384,7 +390,7 @@ wm health-all
 
 v1.4.11 修复 [Issue #1](https://github.com/ike-sh/wg-mimic-fabric/issues/1)：普通修改命令按「全局 state 锁 → nft 事务锁」执行；nft 服务仅用 root 内部入口获取 nft 锁。nft 锁在渲染、预检、持久化、加载及失败回滚全部结束后释放，随后才等待 systemd。隧道仍然强制依赖 nft 服务成功启动。
 
-以下命令在修复合入 `main` 后运行；发布 `v1.4.11` 标签后也可设置 `WMF_TAG=v1.4.11` 升级到该版本。旧版为 1.4.10，版本不同不会被「同版本跳过」挡住。
+以下命令升级到最新 `main`；也可设置 `WMF_TAG=v1.4.12` 固定升级到本次正式版本。同版本默认跳过，较旧版本会正常进入升级。
 
 ```bash
 sudo env WMF_UPGRADE_YES=1 wm upgrade-script
@@ -418,7 +424,7 @@ systemctl is-active wg-mimic-nft.service "wg-mimic-tunnel@${ID}.service"
 
 | 变量 | 说明 |
 |------|------|
-| `WMF_TAG=v1.4.11` | 安装 / 升级时指定版本 |
+| `WMF_TAG=v1.4.12` | 安装 / 升级时指定版本 |
 | `WMF_REPO` | GitHub 仓库（默认 `ike-sh/wg-mimic-fabric`） |
 | `WMF_SKIP_MIMIC=1` | 跳过 mimic 自动安装 |
 | `WMF_AUTO_MIMIC=0` | 执行 `install-wm-cli` 时不自动安装 mimic |

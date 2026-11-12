@@ -2,7 +2,7 @@
 # wg-mimic-fabric — WireGuard + Mimic tunnel orchestrator (MVP)
 set -Eeuo pipefail
 
-SCRIPT_VERSION="1.4.11"
+SCRIPT_VERSION="1.4.12"
 MIMIC_UPSTREAM_TAG="${MIMIC_UPSTREAM_TAG:-v0.7.0}"
 
 CONFIG_DIR="/etc/wg-mimic-fabric"
@@ -4344,7 +4344,7 @@ wg-mimic-fabric ${SCRIPT_VERSION} — 公网入口 ⇄ IX WireGuard 组网 + Mim
 架构: 客户端 → 公网入口:client_port → WG(Mimic 伪TCP) → IX 虚拟IP:transit_port → 落地
 
 环境变量:
-  WMF_TAG=v1.4.11                 安装/升级时指定版本
+  WMF_TAG=v1.4.12                 安装/升级时指定版本
   WMF_REPO=ike-sh/wg-mimic-fabric GitHub 仓库
   WMF_UPGRADE_YES=1               升级跳过确认
   WMF_PURGE_YES=1                 purge 跳过确认
