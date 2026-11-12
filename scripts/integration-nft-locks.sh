@@ -5,7 +5,7 @@ set -Eeuo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 [[ "$(id -u)" == 0 ]] || { echo 'Requires root' >&2; exit 77; }
-for cmd in nft systemctl systemd-analyze unshare nsenter flock timeout; do
+for cmd in nft systemctl systemd-analyze unshare nsenter flock timeout cmp; do
     command -v "$cmd" >/dev/null || { echo "Missing $cmd" >&2; exit 77; }
 done
 systemctl show --property=Version --value >/dev/null \
@@ -23,8 +23,20 @@ nft_bin="$(command -v nft)"
 cleanup() {
     local rc=$?
     trap - EXIT
-    systemctl disable --now "$resume_unit" "$tunnel_one" "$tunnel_two" "$nft_unit" >/dev/null 2>&1 || true
-    systemctl reset-failed "$resume_unit" "$tunnel_one" "$tunnel_two" "$nft_unit" >/dev/null 2>&1 || true
+    local unit
+    # resume removes its own unit. Handle names separately so that a missing
+    # resume file cannot make systemctl abort cleanup of the remaining units.
+    for unit in "$resume_unit" "$tunnel_one" "$tunnel_two" "$nft_unit"; do
+        systemctl stop "$unit" >/dev/null 2>&1 || true
+        if systemctl is-active --quiet "$unit"; then
+            echo "Could not stop test unit: $unit" >&2
+            rc=1
+        fi
+        systemctl disable "$unit" >/dev/null 2>&1 || true
+        systemctl reset-failed "$unit" >/dev/null 2>&1 || true
+        rm -f "/etc/systemd/system/multi-user.target.wants/$unit" \
+            "/run/systemd/system/multi-user.target.wants/$unit"
+    done
     rm -rf /run/systemd/system/"${prefix}"-*
     systemctl daemon-reload
     if [[ -n "$namespace_pid" ]]; then

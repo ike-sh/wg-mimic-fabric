@@ -26,6 +26,14 @@ install -d -m 700 "$PROFILES_DIR" "$CODES_DIR"
 
 fail() { printf 'FAIL: %s\n' "$1" >&2; exit 1; }
 
+# Python is a runtime dependency; minimal distro images may omit diffutils/cmp.
+files_equal() {
+    python3 - "$1" "$2" <<'PY'
+import pathlib, sys
+raise SystemExit(0 if pathlib.Path(sys.argv[1]).read_bytes() == pathlib.Path(sys.argv[2]).read_bytes() else 1)
+PY
+}
+
 seed_transit() {
     write_profile_kv "$(profile_env_path ix-nat)" \
         "PROFILE_ID=ix-nat" "PROFILE_NAME=ix-nat" "ROLE=nat-transit" "ENABLED=true" \
@@ -758,7 +766,7 @@ test_nft_serial() (
     [[ "$(cut -d' ' -f1 "$WMF_TEST_ROOT/events" | uniq | tr '\n' ' ')" == 'A B ' ]] || fail "nft transactions interleaved"
     grep -qx 'A cleanup' "$WMF_TEST_ROOT/events" || fail "first transaction did not clean up under lock"
     grep -qx 'B cleanup' "$WMF_TEST_ROOT/events" || fail "second transaction did not clean up under lock"
-    cmp "$NFT_FILE" "$WMF_TEST_ROOT/live.nft" || fail "persistent/live rules differ"
+    files_equal "$NFT_FILE" "$WMF_TEST_ROOT/live.nft" || fail "persistent/live rules differ"
     grep -q '^delete table inet ' "$WMF_TEST_ROOT/checked-B.nft" || fail "second transaction missed newly created table"
     echo "NFT SERIAL OK"
 )
@@ -800,8 +808,8 @@ test_nft_failures() (
         rc=$?
         set -e
         [[ "$rc" == "$expected" ]] || fail "$kind failure returned $rc instead of $expected"
-        cmp "$NFT_FILE" "$WMF_TEST_ROOT/old.nft" || fail "$kind failure changed persistent rules"
-        cmp "$WMF_TEST_ROOT/live.nft" "$WMF_TEST_ROOT/old.nft" || fail "$kind failure changed live rules"
+        files_equal "$NFT_FILE" "$WMF_TEST_ROOT/old.nft" || fail "$kind failure changed persistent rules"
+        files_equal "$WMF_TEST_ROOT/live.nft" "$WMF_TEST_ROOT/old.nft" || fail "$kind failure changed live rules"
         ! compgen -G "$NFT_DIR/.wg-mimic-fabric.*" >/dev/null || fail "$kind failure left nft temp files"
         [[ -z "$(ls -A "$TMPDIR")" ]] || fail "$kind failure left transaction temp files"
         flock -n "$NFT_LOCK_FILE" true || fail "$kind failure leaked nft lock"
@@ -869,8 +877,8 @@ test_upgrade_nft_unit() (
     grep -qx 'Requires=wg-mimic-nft.service' "$SYSTEMD_TUNNEL_TEMPLATE" || fail "upgrade weakened nft dependency"
     grep -qx 'daemon-reload' "$WMF_TEST_ROOT/systemctl.calls" || fail "upgrade did not reload systemd"
     compgen -G "$BACKUP_DIR/install.sh.bak.*" >/dev/null || fail "upgrade did not back up old script"
-    cmp "$(profile_env_path ex)" "$WMF_TEST_ROOT/profile.before" || fail "upgrade modified profile/private keys"
-    cmp "$NFT_FILE" "$WMF_TEST_ROOT/nft.before" || fail "upgrade modified persistent rules"
+    files_equal "$(profile_env_path ex)" "$WMF_TEST_ROOT/profile.before" || fail "upgrade modified profile/private keys"
+    files_equal "$NFT_FILE" "$WMF_TEST_ROOT/nft.before" || fail "upgrade modified persistent rules"
     : >"$WMF_TEST_ROOT/systemctl.calls"
     timeout 3 "$WM_CLI_INSTALL_SH" upgrade-script >/dev/null 2>&1
     [[ ! -s "$WMF_TEST_ROOT/systemctl.calls" ]] || fail "same-version upgrade no longer skips refresh"
@@ -905,7 +913,7 @@ test_nft_maintenance() (
     grep -qx 'ENABLED=true' "$(profile_env_path ing)" || fail "switch-line did not enable target"
     grep -q 'dnat to 10.88.0.2:40000' "$NFT_FILE" || fail "ingress DNAT lost after maintenance"
     grep -q 'dnat to 1.2.3.4:50000' "$NFT_FILE" || fail "transit DNAT lost after maintenance"
-    cmp "$NFT_FILE" "$WMF_TEST_ROOT/live.nft" || fail "maintenance left live/persistent nft mismatch"
+    files_equal "$NFT_FILE" "$WMF_TEST_ROOT/live.nft" || fail "maintenance left live/persistent nft mismatch"
     echo "DDNS/AUTOSWITCH/SWITCH-LINE OK"
 )
 

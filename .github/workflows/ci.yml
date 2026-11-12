@@ -58,6 +58,8 @@ jobs:
       - name: Verify direct-mode installation and lock regressions
         run: |
           docker run --rm -v "$PWD:/work:ro" -w /work "${{ matrix.image }}" bash -lc '
+            set -Eeuo pipefail
+            if command -v pacman >/dev/null; then pacman -Syu --noconfirm; fi
             systemctl() { return 0; }
             export -f systemctl
             WMF_SKIP_MIMIC=1 WMF_AUTO_MIMIC=0 bash install.sh install-all
